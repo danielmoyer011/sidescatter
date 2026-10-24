@@ -3,11 +3,25 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+import re
+
 import flowkit as fk
 
-# A sample with at least this many fluorescence detectors is treated as
-# full-spectrum data (Cytek Aurora has 38-64, Sony ID7000 up to 184).
+# Full-spectrum instruments have 20+ fluorescence detectors: Cytek Aurora and
+# Northern Lights 14-64 (1-5 lasers), BD FACSDiscover and Symphony A5 SE 48-78,
+# Sony ID7000 up to 184. Nothing below assumes a laser or detector count:
+# detectors are whatever fluorescence channels the file contains.
 SPECTRAL_MIN_DETECTORS = 20
+# Raw detector names: laser letter(s) plus a detector number (Cytek "UV7-A",
+# "YG3-A") or a centre wavelength (BD "B510-A", "UV379-A", Sony "405-450").
+# Unmixed or conventional files use fluorochrome names ("BV421-A", "PE-Cy7-A").
+_LASER = r"(UV|V|B|BL|YG|Y|G|R|RL|IR|NIR)"
+DETECTOR_NAME = re.compile(
+    rf"^({_LASER}\s?\d{{1,2}}|{_LASER}\s?\d{{3}}(/\d+)?|\d{{3}}[-_/ ]\d{{3}}(/\d+)?|CH\s?\d+)(-[AH])?$",
+    re.IGNORECASE)
+_SCATTER = ("FSC", "SSC", "BSC", "FS ", "SS ", "FS-", "SS-", "LIGHTLOSS", "LIGHT LOSS")
+_OTHER = ("EVENT", "WIDTH", "SORT", "INDEX", "SAMPLE", "TRIGGER", "BEAD", "GATE",
+          "LASER", "DROP", "WELL", "PLATE", "IMAGE", "DIAMETER")
 
 
 @dataclass(frozen=True)
@@ -26,8 +40,10 @@ def _channel_kind(pnn):
     name = pnn.upper()
     if name.startswith("TIME"):
         return "time"
-    if name.startswith(("FSC", "SSC")) or "SCATTER" in name:
+    if name.startswith(_SCATTER) or "SCATTER" in name:
         return "scatter"
+    if name.startswith(_OTHER) or name.endswith("-W"):
+        return "other"
     return "fluorescence"
 
 
@@ -64,7 +80,14 @@ def detector_channels(sample):
 
 
 def is_spectral(sample):
-    return len(detector_channels(sample)) >= SPECTRAL_MIN_DETECTORS
+    """Raw full-spectrum data (as opposed to conventional or already-unmixed files)."""
+    dets = detector_channels(sample)
+    if len(dets) < SPECTRAL_MIN_DETECTORS:
+        return False
+    named = sum(bool(DETECTOR_NAME.match(c.pnn)) for c in dets)
+    # Unknown naming schemes still count when there are clearly too many
+    # channels to be a fluorochrome panel exported after unmixing.
+    return named >= 0.8 * len(dets) or len(dets) >= 45
 
 
 def raw_events(sample, channel_list=None):

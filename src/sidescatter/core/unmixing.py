@@ -49,6 +49,18 @@ def _matching_unstained(spec, specs):
     return None
 
 
+def _detector_events(sample, detectors, label):
+    """Events for the named detectors, in that order, matched by name."""
+    by_name = {c.pnn: c for c in fcs.channels(sample)}
+    missing = [d for d in detectors if d not in by_name]
+    if missing:
+        more = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
+        raise ValueError(
+            f"{label} is missing detectors {', '.join(missing[:5])}{more}. Controls and "
+            "samples must come from the same instrument configuration.")
+    return fcs.raw_events(sample, [by_name[d] for d in detectors])
+
+
 @dataclass
 class ControlResult:
     spec: ControlSpec
@@ -78,11 +90,7 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     names = [c.pnn for c in detectors]
 
     def det_events(spec):
-        s = sample_for(spec.path)
-        chans = [c for c in fcs.channels(s) if c.pnn in names]
-        if [c.pnn for c in chans] != names:
-            raise ValueError(f"{spec.path.name} has different detectors from {specs[0].path.name}")
-        return fcs.raw_events(s, chans)
+        return _detector_events(sample_for(spec.path), names, spec.path.name)
 
     references, results = [], []
     for spec in specs:
@@ -129,11 +137,7 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
 def unmix_sample(sample, unmixer, keep_autofluorescence=True):
     """Return a new FlowKit Sample: scatter/time channels plus one channel per fluor."""
     chans = fcs.channels(sample)
-    by_name = {c.pnn: c for c in chans}
-    missing = [d for d in unmixer.detectors if d not in by_name]
-    if missing:
-        raise ValueError(f"sample is missing detectors: {missing[:5]}")
-    Y = fcs.raw_events(sample, [by_name[d] for d in unmixer.detectors])
+    Y = _detector_events(sample, unmixer.detectors, sample.id)
     A = unmixer.unmix(Y)
 
     keep = [c for c in chans if c.kind in ("time", "scatter")]
@@ -150,8 +154,7 @@ def unmix_sample(sample, unmixer, keep_autofluorescence=True):
 
 def unmixing_qc(sample, unmixer):
     """Quality numbers for one sample: residual size per detector and per event."""
-    by_name = {c.pnn: c for c in fcs.channels(sample)}
-    Y = fcs.raw_events(sample, [by_name[d] for d in unmixer.detectors])
+    Y = _detector_events(sample, unmixer.detectors, sample.id)
     A = unmixer.unmix(Y)
     R = spectral.residuals(Y, A, unmixer.matrix)
     scale = np.maximum(np.abs(Y).sum(axis=1), 1e-9)
