@@ -9,6 +9,7 @@ from .graph_view import BINS, PSEUDOCOLOR
 
 COLS = ["File", "Fluor / marker", "Type", "Carrier", "Negative", "Peak", "Positives"]
 ASINH_COFACTOR = 2000.0
+PREVIEW_EVENTS = 50_000
 PALETTE = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 103, 189),
            (140, 86, 75), (227, 119, 194), (127, 127, 127), (188, 189, 34), (23, 190, 207)]
 
@@ -245,7 +246,6 @@ class UnmixingDialog(QtWidgets.QDialog):
             self.table.item(row, 5).setText(r.peak_detector if r else "")
             self.table.item(row, 6).setText(f"{r.n_positive:,}" if r else "")
         self.table.blockSignals(False)
-        self._preview_cache.clear()
         self.unmix_btn.setEnabled(True)
         self._draw_signatures()
         self._draw_similarity()
@@ -353,10 +353,16 @@ class UnmixingDialog(QtWidgets.QDialog):
         if self.unmixer is None or sid is None:
             return
         sample = self.ws.samples[sid]
-        by_name = {c.pnn: c for c in fcs.channels(sample)}
-        if any(d not in by_name for d in self.unmixer.detectors):
-            return
-        Y = fcs.raw_events(sample, [by_name[d] for d in self.unmixer.detectors])
+        key = (sid, tuple(self.unmixer.detectors))
+        if key not in self._preview_cache:
+            by_name = {c.pnn: c for c in fcs.channels(sample)}
+            if any(d not in by_name for d in self.unmixer.detectors):
+                return
+            # A fixed random subset keeps the preview instant on large files.
+            raw = sample.get_events(source="raw")
+            rows = np.random.default_rng(0).choice(len(raw), min(len(raw), PREVIEW_EVENTS), replace=False)
+            self._preview_cache[key] = raw[np.sort(rows)][:, [by_name[d].index for d in self.unmixer.detectors]]
+        Y = self._preview_cache[key]
         A = self.unmixer.unmix(Y)
         xi, yi = self.preview_x.currentIndex(), self.preview_y.currentIndex()
         x, y = _asinh(A[:, xi]), _asinh(A[:, yi])

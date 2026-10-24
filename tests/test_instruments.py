@@ -119,3 +119,13 @@ def test_mismatched_detectors_give_a_clear_error(tmp_path):
     small = fcs.load_sample(tmp_path / "Sample.fcs")
     with pytest.raises(ValueError, match="same instrument configuration"):
         unmixing.unmix_sample(small, um5)
+
+
+def test_chunked_unmixing_matches_whole_file(tmp_path, monkeypatch):
+    controls, sample_path, _, _ = _make_experiment(tmp_path, INSTRUMENTS["Aurora 3L (V/B/R)"])
+    um, _ = unmixing.build_unmixer(unmixing.guess_controls(controls), method="wls")
+    sample = fcs.load_sample(sample_path)
+    whole = unmixing.unmix_sample(sample, um).get_events(source="raw")
+    monkeypatch.setattr(unmixing, "CHUNK", 777)
+    chunked = unmixing.unmix_sample(sample, um).get_events(source="raw")
+    np.testing.assert_allclose(chunked, whole)
