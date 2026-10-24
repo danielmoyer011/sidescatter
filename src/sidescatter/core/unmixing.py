@@ -49,16 +49,20 @@ def _matching_unstained(spec, specs):
     return None
 
 
-def _detector_events(sample, detectors, label):
-    """Events for the named detectors, in that order, matched by name."""
-    by_name = {c.pnn: c for c in fcs.channels(sample)}
+def _detector_index(sample, detectors, label=None):
+    """Column indices of the named detectors, matched by name, in that order."""
+    by_name = {c.pnn: c.index for c in fcs.channels(sample)}
     missing = [d for d in detectors if d not in by_name]
     if missing:
         more = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
         raise ValueError(
-            f"{label} is missing detectors {', '.join(missing[:5])}{more}. Controls and "
-            "samples must come from the same instrument configuration.")
-    return fcs.raw_events(sample, [by_name[d] for d in detectors])
+            f"{label or sample.id} is missing detectors {', '.join(missing[:5])}{more}. "
+            "Controls and samples must come from the same instrument configuration.")
+    return [by_name[d] for d in detectors]
+
+
+def _detector_events(sample, detectors, label=None):
+    return sample.get_events(source="raw")[:, _detector_index(sample, detectors, label)]
 
 
 @dataclass
@@ -134,27 +138,36 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     return unmixer, results
 
 
-def unmix_sample(sample, unmixer, keep_autofluorescence=True):
-    """Return a new FlowKit Sample: scatter/time channels plus one channel per fluor."""
-    chans = fcs.channels(sample)
-    Y = _detector_events(sample, unmixer.detectors, sample.id)
-    A = unmixer.unmix(Y)
+# Events per block when unmixing; bounds the extra memory to a few hundred MB
+# however many events a file has.
+CHUNK = 200_000
 
+
+def unmix_sample(sample, unmixer, keep_autofluorescence=True):
+    """Return a new FlowKit Sample: scatter/time channels plus one channel per fluor.
+
+    Works through the events in blocks so a multi-million-event, 64-detector
+    file never needs a second full copy of its detector data.
+    """
+    chans = fcs.channels(sample)
+    det_idx = _detector_index(sample, unmixer.detectors)
     keep = [c for c in chans if c.kind in ("time", "scatter")]
-    columns = [fcs.raw_events(sample, keep)]
-    labels = [c.pnn for c in keep]
-    for i, ref in enumerate(unmixer.references):
-        if ref.is_autofluorescence and not keep_autofluorescence:
-            continue
-        columns.append(A[:, i:i + 1])
-        labels.append(ref.name)
-    data = np.hstack(columns)
-    return fcs.load_sample(data, sample_id=f"{sample.id} (unmixed)", channel_labels=labels)
+    fluors = [i for i, r in enumerate(unmixer.references)
+              if keep_autofluorescence or not r.is_autofluorescence]
+    labels = [c.pnn for c in keep] + [unmixer.references[i].name for i in fluors]
+
+    raw = sample.get_events(source="raw")  # FlowKit returns its array, not a copy
+    out = np.empty((raw.shape[0], len(labels)))
+    out[:, :len(keep)] = raw[:, [c.index for c in keep]]
+    for start in range(0, raw.shape[0], CHUNK):
+        block = slice(start, start + CHUNK)
+        out[block, len(keep):] = unmixer.unmix(raw[block][:, det_idx])[:, fluors]
+    return fcs.load_sample(out, sample_id=f"{sample.id} (unmixed)", channel_labels=labels)
 
 
 def unmixing_qc(sample, unmixer):
     """Quality numbers for one sample: residual size per detector and per event."""
-    Y = _detector_events(sample, unmixer.detectors, sample.id)
+    Y = _detector_events(sample, unmixer.detectors)
     A = unmixer.unmix(Y)
     R = spectral.residuals(Y, A, unmixer.matrix)
     scale = np.maximum(np.abs(Y).sum(axis=1), 1e-9)
