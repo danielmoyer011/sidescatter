@@ -38,9 +38,20 @@ workflow familiar to FlowJo users.
 
 ## Install
 
-Download the build for your system from the Releases page. Builds are not
-code-signed yet: on macOS right-click the app and choose **Open** the first
-time; on Windows choose **More info › Run anyway**.
+Download the build for your system from the
+[Releases page](https://github.com/danielmoyer011/sidescatter/releases):
+`Sidescatter-windows.zip`, `Sidescatter-macos-arm64.dmg` (Apple silicon),
+`Sidescatter-macos-intel.dmg` or `Sidescatter-linux-x86_64.tar.gz`.
+
+Beta builds are not code-signed yet, so the first launch needs one extra step:
+
+- **Windows**: unzip, open `Sidescatter.exe`, and if SmartScreen warns, choose
+  **More info › Run anyway**.
+- **macOS**: drag Sidescatter to Applications and open it. When macOS says it
+  can't verify the developer, open **System Settings › Privacy & Security**,
+  scroll down and click **Open Anyway**. If macOS instead says the app is
+  damaged, run `xattr -dr com.apple.quarantine /Applications/Sidescatter.app`
+  in Terminal.
 
 From source (Python 3.10+):
 

@@ -20,7 +20,7 @@ jobs:
             artifact: Sidescatter-windows.zip
           - os: macos-latest
             artifact: Sidescatter-macos-arm64.dmg
-          - os: macos-13
+          - os: macos-15-intel
             artifact: Sidescatter-macos-intel.dmg
           - os: ubuntu-22.04
             artifact: Sidescatter-linux-x86_64.tar.gz
@@ -58,3 +58,4 @@ jobs:
         with:
           files: Sidescatter-*
           generate_release_notes: true
+          prerelease: true
