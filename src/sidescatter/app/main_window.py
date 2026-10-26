@@ -1,19 +1,28 @@
-"""Main window: workspace panel on the left, graph window on the right."""
+"""Main window, laid out like FlowJo 10: a ribbon on top and the workspace below.
 
+Double-clicking a sample or population opens it in its own graph window,
+where the gating tools sit right above the plot.
+"""
+
+import sys
 from pathlib import Path
 
 import flowkit as fk
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import __version__
-from ..core.workspace import Workspace
-from .graph_view import GraphView
+from ..core.fcs import find_fcs_files
+from ..core.workspace import ROOT, Workspace
+from . import icons
+from .graph_view import GraphWindow
+from .ribbon import Ribbon
 from .table_editor import TableEditor
 from .unmixing_dialog import UnmixingDialog
 from .workspace_panel import WorkspacePanel
 
 DEMO_DIR = Path(__file__).resolve().parents[1] / "demo_data" / "spectral"
 WORKSPACE_FILTER = "Sidescatter workspace (*.ssw)"
+WEBSITE = "https://github.com/danielmoyer011/sidescatter"
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -23,61 +32,136 @@ class MainWindow(QtWidgets.QMainWindow):
         self.path = None
         self.dirty = False
         self.ask_before_discard = True
+        self.graphs = []   # open GraphWindows
+        self.graph = None  # the GraphView used most recently
 
         self.panel = WorkspacePanel(self.ws)
-        self.graph = GraphView(self.ws)
-        self.panel.populationSelected.connect(self.graph.show_population)
+        self.panel.populationActivated.connect(self.open_graph)
         self.panel.changed.connect(self._changed)
-        self.graph.gatesChanged.connect(self._changed)
-
-        split = QtWidgets.QSplitter()
-        split.addWidget(self.panel)
-        split.addWidget(self.graph)
-        split.setSizes([420, 880])
-        self.setCentralWidget(split)
+        self.setCentralWidget(self.panel)
         self.resize(1320, 840)
 
+        self.setAcceptDrops(True)
         self._build_menus()
         self._build_toolbar()
-        self.statusBar().showMessage("Add FCS files, open a workspace, or try the demo spectral data.")
+        self.license_button = QtWidgets.QPushButton("License…")
+        self.license_button.setObjectName("LicenseButton")
+        self.license_button.clicked.connect(self.show_license)
+        self.statusBar().addPermanentWidget(self.license_button)
+        self.statusBar().showMessage(
+            "Add or drop FCS files, open a workspace, or try the demo spectral data.")
         self._update_title()
 
     # ----- UI construction -------------------------------------------------
 
+    def _action(self, text, icon, slot, shortcut=None, ribbon_text=None, tip=None):
+        a = QtGui.QAction(icons.icon(icon), text, self)
+        a.setIconText(ribbon_text or text.replace("&", "").replace("…", ""))
+        a.setToolTip(tip or text.replace("&", ""))
+        if shortcut:
+            a.setShortcut(QtGui.QKeySequence(shortcut))
+        a.triggered.connect(lambda checked=False: slot())
+        self.addAction(a)  # shortcuts work with or without a menu bar
+        return a
+
     def _build_menus(self):
-        m = self.menuBar().addMenu("&File")
-        m.addAction("&New workspace", self.new_workspace, QtGui.QKeySequence.New)
-        m.addAction("&Open workspace…", self.open_workspace, QtGui.QKeySequence.Open)
-        m.addAction("&Save", self.save, QtGui.QKeySequence.Save)
-        m.addAction("Save &as…", self.save_as, QtGui.QKeySequence.SaveAs)
-        m.addSeparator()
-        m.addAction("Add &samples (FCS)…", self.add_samples, "Ctrl+I")
-        m.addAction("Import &FlowJo 10 workspace…", self.import_flowjo)
-        m.addAction("Open &demo spectral data", self.open_demo)
-        m.addSeparator()
-        m.addAction("E&xport plot…", self.export_plot)
-        m.addSeparator()
-        m.addAction("&Quit", self.close, QtGui.QKeySequence.Quit)
-
-        m = self.menuBar().addMenu("&Analysis")
-        m.addAction("Spectral &unmixing…", self.open_unmixing, "Ctrl+U")
-        m.addAction("&Table editor…", self.open_table_editor, "Ctrl+T")
-        m.addAction("Axis &transform…", self.edit_transform)
-        m.addAction("Group samples by &keyword…", self.group_by_keyword)
-
-        m = self.menuBar().addMenu("&Help")
-        m.addAction("&About Sidescatter", self.about)
+        A = self._action
+        self.acts = acts = {
+            "new": A("&New workspace", "new_workspace", self.new_workspace, QtGui.QKeySequence.New,
+                     "New\nWorkspace"),
+            "open": A("&Open workspace…", "open", self.open_workspace, QtGui.QKeySequence.Open,
+                      "Open\nWorkspace"),
+            "save": A("&Save", "save", self.save, QtGui.QKeySequence.Save, "Save"),
+            "save_as": A("Save &as…", "save", self.save_as, QtGui.QKeySequence.SaveAs, "Save\nAs…"),
+            "add": A("Add &samples (FCS)…", "add_samples", self.add_samples, "Ctrl+I", "Add\nSamples…"),
+            "import": A("Import &FlowJo 10 workspace…", "import_flowjo", self.import_flowjo, None,
+                        "Import FlowJo\nWorkspace…"),
+            "demo": A("Open &demo spectral data", "demo", self.open_demo, None, "Demo\nData"),
+            "export": A("E&xport plot…", "export", self.export_plot, None, "Export\nPlot…"),
+            "quit": A("&Quit", "quit", self.close, QtGui.QKeySequence.Quit, "Quit"),
+            "group": A("&Create group…", "create_group", self.panel.create_group, "Ctrl+G",
+                       "Create\nGroup…"),
+            "keyword": A("Group samples by &keyword…", "keyword", self.group_by_keyword, None,
+                         "Group by\nKeyword…"),
+            "rename": A("&Rename population…", "rename", self.panel.rename_selected, "F2",
+                        "Rename\nPopulation…"),
+            "delete": A("&Delete gate", "delete", self.panel.delete_selected, None, "Delete\nGate"),
+            "remove": A("Re&move samples", "remove_sample", self.panel.remove_selected_samples, None,
+                        "Remove\nSamples"),
+            "graph": A("Open &graph window", "rectangle", self.open_selected_graph, "Ctrl+Return",
+                       "Graph\nWindow"),
+            "unmix": A("Spectral &unmixing…", "unmixing", self.open_unmixing, "Ctrl+U",
+                       "Spectral\nUnmixing…"),
+            "table": A("&Table editor…", "table_editor", self.open_table_editor, "Ctrl+T",
+                       "Table\nEditor"),
+            "transform": A("Axis &transform…", "transform", self.edit_transform, None,
+                           "Axis\nTransform…"),
+            "license": A("&License…", "license", self.show_license, None, "License"),
+            "about": A("&About Sidescatter", "about", self.about, None, "About"),
+            "website": A("Sidescatter on &GitHub", "website", self.open_website, None,
+                         "Project\nWebsite"),
+        }
+        menus = (
+            ("&File", ["new", "open", "save", "save_as", None, "add", "import", "demo", None,
+                       "export", None, "quit"]),
+            ("&Edit", ["rename", "delete", "remove"]),
+            ("&Workspace", ["add", "group", "keyword", None, "graph"]),
+            ("&Tools", ["unmix", "table", "transform"]),
+            ("&Help", ["about", "license", "website"]),
+        )
+        # FlowJo 10 has no menu bar on Windows: the ribbon replaces it. macOS keeps
+        # its global menu bar, so the same actions go there too.
+        if sys.platform == "darwin":
+            bar = self.menuBar()
+            for title, keys in menus:
+                m = bar.addMenu(title)
+                for k in keys:
+                    m.addSeparator() if k is None else m.addAction(acts[k])
 
     def _build_toolbar(self):
-        tb = self.addToolBar("Gates")
-        tb.setMovable(False)
-        tb.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        tb.addAction("Rectangle", lambda: self.graph.start_gate("rectangle"))
-        tb.addAction("Polygon", lambda: self.graph.start_gate("polygon"))
-        tb.addAction("Range", lambda: self.graph.start_gate("range"))
-        tb.addSeparator()
-        tb.addAction("Unmixing", self.open_unmixing)
-        tb.addAction("Table editor", self.open_table_editor)
+        acts = self.acts
+        self.ribbon = r = Ribbon()
+        r.app_button.setMenu(self._app_menu())
+        for k in ("save", "add", "group", "table", "unmix", "demo"):
+            r.add_quick(acts[k])
+        r.add_corner(acts["license"])
+        r.add_corner(acts["about"])
+
+        home = r.add_tab("Sidescatter")
+        home.add_group("Navigate", [acts["new"], acts["add"], acts["group"], acts["table"]])
+        home.add_group("Experiment", [acts["keyword"], acts["graph"], acts["demo"]])
+        home.add_group("Cytometry", [acts["unmix"], acts["transform"], acts["import"]])
+        home.add_group("Help", [acts["website"], acts["about"], acts["license"]])
+
+        page = r.add_tab("File")
+        page.add_group("Workspace", [acts["new"], acts["open"], acts["save"], acts["save_as"]])
+        page.add_group("Import", [acts["add"], acts["import"], acts["demo"]])
+        page.add_group("Export", [acts["export"]])
+        page.add_group("Application", [acts["quit"]])
+
+        page = r.add_tab("Edit")
+        page.add_group("Populations", [acts["rename"], acts["delete"]])
+        page.add_group("Samples", [acts["remove"]])
+
+        page = r.add_tab("Workspace")
+        page.add_group("Samples", [acts["add"], acts["demo"]])
+        page.add_group("Groups", [acts["group"], acts["keyword"]])
+        page.add_group("Graphs", [acts["graph"], acts["export"]])
+
+        page = r.add_tab("Tools")
+        page.add_group("Spectral", [acts["unmix"]])
+        page.add_group("Statistics", [acts["table"]])
+
+        page = r.add_tab("Configure")
+        page.add_group("Display", [acts["transform"]])
+        page.add_group("About", [acts["license"], acts["about"]])
+        self.setMenuWidget(r)
+
+    def _app_menu(self):
+        m = QtWidgets.QMenu(self)
+        for k in ("new", "open", "save", "save_as", None, "license", "about", None, "quit"):
+            m.addSeparator() if k is None else m.addAction(self.acts[k])
+        return m
 
     # ----- state -----------------------------------------------------------
 
@@ -85,6 +169,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dirty = True
         self.panel.rebuild_groups()
         self._update_title()
+        sender = self.sender()
+        for win in list(self.graphs):
+            if win.view is not sender:
+                QtCore.QTimer.singleShot(0, win.view.refresh)
 
     def _update_title(self):
         name = Path(self.path).name if self.path else "Untitled"
@@ -92,8 +180,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_workspace(self, ws, path=None):
         self.ws = ws
-        self.graph.ws = ws
-        self.graph.sample_id = None
+        for win in list(self.graphs):
+            win.close()
         self.panel.set_workspace(ws)
         self.path, self.dirty = path, False
         self._update_title()
@@ -105,11 +193,94 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Unsaved changes", "Discard unsaved changes to this workspace?")
         return answer == QtWidgets.QMessageBox.Yes
 
+    # ----- drag and drop ---------------------------------------------------
+
+    @staticmethod
+    def _local_paths(mime):
+        if not mime.hasUrls():
+            return []
+        return [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+
+    def dragEnterEvent(self, event):
+        if self._local_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        paths = self._local_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.add_dropped(paths)
+
+    def add_dropped(self, paths):
+        """Add dropped files and folders as samples; report anything that is not FCS."""
+        fcs_paths, skipped = find_fcs_files(paths)
+        if fcs_paths:
+            before = len(self.ws.samples)
+            self.add_samples(fcs_paths)
+            added = len(self.ws.samples) - before
+            self.statusBar().showMessage(f"Added {added} sample(s).", 6000)
+        if skipped:
+            shown = "\n".join(skipped[:10]) + (f"\n… and {len(skipped) - 10} more" if len(skipped) > 10 else "")
+            QtWidgets.QMessageBox.warning(
+                self, "Not FCS files",
+                f"Skipped {len(skipped)} item(s) that are not FCS files:\n\n{shown}")
+        elif not fcs_paths:
+            QtWidgets.QMessageBox.warning(self, "No FCS files", "No FCS files were found in what was dropped.")
+        return fcs_paths, skipped
+
     def closeEvent(self, event):
         if self._confirm_discard():
             event.accept()
         else:
             event.ignore()
+
+    # ----- graph windows ---------------------------------------------------
+
+    def open_graph(self, sample_id, name=None, parent_path=ROOT):
+        """Open a population in a graph window, or bring its window forward."""
+        parent_path = tuple(parent_path)
+        for win in self.graphs:
+            v = win.view
+            if v.sample_id == sample_id and v.population == (name, parent_path):
+                win.raise_()
+                win.activateWindow()
+                self.graph = v
+                return v
+        win = GraphWindow(self.ws, self)
+        v = win.view
+        v.group = self.panel.current_group()
+        v.gatesChanged.connect(self._changed)
+        v.transformRequested.connect(self.edit_transform)
+        v.populationShown.connect(lambda *_: setattr(self, "graph", v))
+        win.closed.connect(self._graph_closed)
+        self.graphs.append(win)
+        v.show_population(sample_id, name, parent_path)
+        offset = 28 * ((len(self.graphs) - 1) % 8)
+        top_left = self.mapToGlobal(QtCore.QPoint(self.width() // 3, 90))
+        win.move(top_left + QtCore.QPoint(offset, offset))
+        win.show()
+        self.graph = v
+        return v
+
+    def open_selected_graph(self):
+        sel = self.panel.selected()
+        if sel:
+            self.open_graph(*sel)
+        elif self.panel.tree.topLevelItemCount():
+            self.open_graph(*self.panel._key(self.panel.tree.topLevelItem(0)))
+
+    def _graph_closed(self, win):
+        if win in self.graphs:
+            self.graphs.remove(win)
+        if self.graph is win.view:
+            self.graph = self.graphs[-1].view if self.graphs else None
 
     # ----- file actions ----------------------------------------------------
 
@@ -165,7 +336,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.open_unmixing(controls)
 
     def export_plot(self):
-        if self.graph.sample_id is None:
+        if self.graph is None or self.graph.sample_id is None:
+            QtWidgets.QMessageBox.information(
+                self, "Export plot", "Open a graph window first (double-click a population).")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Export plot", "plot.png", "PNG image (*.png);;SVG vector (*.svg)")
@@ -181,11 +354,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _after_unmix(self, new_ids):
         self._changed()
-        i = self.panel.group_combo.findData("Unmixed")
-        if i >= 0:
-            self.panel.group_combo.setCurrentIndex(i)
+        self.panel.select_group("Unmixed")
         if new_ids:
-            self.graph.show_population(new_ids[0])
+            self.open_graph(new_ids[0])
         self.statusBar().showMessage(f"Unmixed {len(new_ids)} sample(s).", 6000)
 
     def open_table_editor(self):
@@ -195,14 +366,19 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         TableEditor(self.ws, samples, self).exec()
 
-    def edit_transform(self):
-        if self.graph.sample_id is None:
+    def edit_transform(self, view=None):
+        view = view or self.graph
+        if view is None or view.sample_id is None:
+            QtWidgets.QMessageBox.information(
+                self, "Axis transform", "Open a graph window first (double-click a population).")
             return
-        dlg = TransformDialog(self.ws, [self.graph.x_combo.currentData(),
-                                        self.graph.y_combo.currentData()], self)
+        channels = [view.x_combo.currentData()]
+        if not view.is_histogram:
+            channels.append(view.y_combo.currentData())
+        dlg = TransformDialog(self.ws, channels, self)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             self._changed()
-            self.graph.refresh()
+            view.refresh()
 
     def group_by_keyword(self):
         key, ok = QtWidgets.QInputDialog.getText(self, "Group by keyword", "FCS keyword (e.g. $CYT, TUBE NAME):")
@@ -217,6 +393,12 @@ class MainWindow(QtWidgets.QMainWindow):
             f"<b>Sidescatter {__version__}</b><p>Free, open-source flow cytometry analysis "
             "with spectral unmixing.</p><p>GPL-3.0-or-later. Built on FlowKit, PySide6 and "
             "pyqtgraph. Not affiliated with FlowJo or BD.</p>")
+
+    def show_license(self):
+        LicenseDialog(self).exec()
+
+    def open_website(self):
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(WEBSITE))
 
     # ----- helpers ---------------------------------------------------------
 
@@ -292,3 +474,46 @@ class TransformDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Transform", str(exc))
             return
         self.accept()
+
+
+class LicenseDialog(QtWidgets.QDialog):
+    """Where other cytometry software asks for a licence key."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("License")
+        badge = QtWidgets.QLabel()
+        badge.setPixmap(icons.icon("license", 56).pixmap(56, 56))
+        title = QtWidgets.QLabel("No License, No Problem")
+        title.setStyleSheet("font-size: 18pt; font-weight: 700;")
+        body = QtWidgets.QLabel(
+            "<p>Sidescatter doesn't do license keys, dongles, seat counts, activation servers "
+            "or renewal reminders. It also doesn't stop you at demonstration files.</p>"
+            "<p>Load any FCS file from any instrument, on as many computers as you like, for as "
+            "long as you like. It's free software under the GNU GPL (version 3 or later).</p>"
+            "<p style='color:#6A7187'>License status: <b>not required</b> · "
+            f"Version {__version__} · Expires: never</p>")
+        body.setWordWrap(True)
+        body.setTextFormat(QtCore.Qt.RichText)
+        body.setMinimumWidth(420)
+
+        buttons = QtWidgets.QDialogButtonBox()
+        read = buttons.addButton("Read the GPL", QtWidgets.QDialogButtonBox.HelpRole)
+        read.clicked.connect(lambda: QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl("https://www.gnu.org/licenses/gpl-3.0.html")))
+        ok = buttons.addButton("Nice", QtWidgets.QDialogButtonBox.AcceptRole)
+        ok.setDefault(True)
+        buttons.accepted.connect(self.accept)
+
+        text = QtWidgets.QVBoxLayout()
+        text.addWidget(title)
+        text.addWidget(body)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(badge, 0, QtCore.Qt.AlignTop)
+        row.addSpacing(10)
+        row.addLayout(text, 1)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 16)
+        layout.addLayout(row)
+        layout.addSpacing(8)
+        layout.addWidget(buttons)

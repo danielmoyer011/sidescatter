@@ -47,6 +47,28 @@ def _channel_kind(pnn):
     return "fluorescence"
 
 
+def find_fcs_files(paths):
+    """Expand dropped files and folders into FCS paths.
+
+    Folders are searched recursively. Returns (fcs_paths, skipped): FCS files
+    in a stable order with duplicates removed, and the names of anything else.
+    Hidden files (e.g. macOS "._" resource forks) inside folders are ignored.
+    """
+    found, skipped = [], []
+    for p in map(Path, paths):
+        if p.is_dir():
+            for f in sorted(p.rglob("*")):
+                rel = f.relative_to(p).parts
+                if f.is_file() and f.suffix.lower() == ".fcs" and not any(x.startswith(".") for x in rel):
+                    found.append(f)
+        elif p.is_file() and p.suffix.lower() == ".fcs":
+            found.append(p)
+        else:
+            skipped.append(p.name)
+    unique = list(dict.fromkeys(str(f.resolve()) for f in found))
+    return unique, skipped
+
+
 def load_sample(path_or_data, sample_id=None, channel_labels=None):
     """Load an FCS file (or an events array with channel_labels) as a FlowKit Sample.
 

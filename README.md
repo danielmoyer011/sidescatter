@@ -13,7 +13,9 @@ workflow familiar to FlowJo users.
 
 ## What works today
 
-- **FCS files**: FCS 2.0, 3.0 and 3.1, conventional and full-spectrum.
+- **FCS files**: FCS 2.0, 3.0 and 3.1, conventional and full-spectrum. Add them
+  with File › Add samples, or drag files or whole folders onto the window
+  (folders are searched recursively; anything that isn't FCS is skipped with a warning).
 - **Spectral unmixing workbench** (Analysis › Spectral unmixing):
   - add single-stain controls on **beads or cells** plus unstained controls;
     files are classified by name and each stain is paired with the unstained
@@ -24,7 +26,11 @@ workflow familiar to FlowJo users.
   - drag the positive gate on any control and see signatures, unmixed plots
     and per-detector residuals update live;
   - unmix any number of samples into new, gateable samples.
-- **Gating**: rectangle, polygon and range gates drawn on pseudocolor, dot,
+- **FlowJo 10 layout**: a ribbon, the group table above the
+  Name / Statistic / #Cells sample table, and graph windows that open when you
+  double-click a population.
+- **Gating**: rectangle, polygon, ellipse, quadrant, freehand, range and
+  bisector tools in a strip right above each plot, drawn on pseudocolor, dot,
   contour or histogram plots, nested to any depth, editable by dragging. Gates
   apply to every sample in the workspace, as FlowJo group gates do.
 - **Scales**: logicle (biexponential), arcsinh, log and linear per channel;

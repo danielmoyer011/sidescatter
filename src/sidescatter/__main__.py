@@ -15,11 +15,13 @@ def _load_main_window():
 def main():
     from PySide6 import QtWidgets
 
+    from .app import theme
     from .app.branding import SplashScreen, app_icon
 
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Sidescatter")
     app.setOrganizationName("Sidescatter")
+    theme.apply(app)
     app.setWindowIcon(app_icon())
     splash = SplashScreen()
     if "--no-splash" not in sys.argv:
@@ -28,7 +30,7 @@ def main():
     MainWindow = splash.run_while(_load_main_window)
     import pyqtgraph as pg
 
-    pg.setConfigOptions(antialias=True, foreground="k", background="w", imageAxisOrder="col-major")
+    pg.setConfigOptions(antialias=True, imageAxisOrder="col-major")
     window = MainWindow()
     window.show()
     splash.finish(window)
