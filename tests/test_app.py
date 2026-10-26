@@ -58,3 +58,64 @@ def test_gates_show_in_tree_and_table(window, qtbot):
     editor.stat_combo.setCurrentText("Freq. of Parent")
     editor._add_column()
     assert editor.table_df.iloc[0, 1] == pytest.approx(50.0, abs=0.1)
+
+
+def _drop(qtbot, target, paths):
+    from PySide6 import QtCore, QtGui, QtWidgets
+    mime = QtCore.QMimeData()
+    mime.setUrls([QtCore.QUrl.fromLocalFile(str(p)) for p in paths])
+    pos = QtCore.QPointF(target.rect().center())
+    enter = QtGui.QDragEnterEvent(pos.toPoint(), QtCore.Qt.CopyAction, mime,
+                                  QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)
+    QtWidgets.QApplication.sendEvent(target, enter)
+    assert enter.isAccepted()
+    drop = QtGui.QDropEvent(pos, QtCore.Qt.CopyAction, mime, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier)
+    QtWidgets.QApplication.sendEvent(target, drop)
+
+
+def test_drop_files_and_folders_adds_samples(window, qtbot, tmp_path, monkeypatch):
+    import shutil
+    from PySide6 import QtWidgets
+    warnings = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
+
+    folder = tmp_path / "plate" / "row A"
+    folder.mkdir(parents=True)
+    controls = sorted((DEMO_DIR / "controls").glob("*.fcs"))[:2]
+    shutil.copy(controls[0], folder / "a.fcs")
+    shutil.copy(controls[1], folder / "b.FCS")
+    (folder / "notes.txt").write_text("not data")
+    loose = tmp_path / "loose.fcs"
+    shutil.copy(controls[0], loose)
+    other = tmp_path / "readme.csv"
+    other.write_text("x")
+
+    before = len(window.ws.samples)
+    _drop(qtbot, window, [tmp_path / "plate", loose, other])
+    assert len(window.ws.samples) == before + 3
+    assert {"a.fcs", "b.FCS", "loose.fcs"} <= set(window.ws.samples)
+    assert window.dirty
+    assert len(warnings) == 1 and "readme.csv" in warnings[0]
+
+
+def test_drop_on_plot_reaches_window(window, qtbot, tmp_path, monkeypatch):
+    import shutil
+    from PySide6 import QtWidgets
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: None)
+    f = tmp_path / "one.fcs"
+    shutil.copy(sorted((DEMO_DIR / "controls").glob("*.fcs"))[0], f)
+    before = len(window.ws.samples)
+    target = window.graph.plot.viewport()  # QGraphicsView accepts drops itself, then passes them up
+    assert target.acceptDrops()
+    _drop(qtbot, target, [f])
+    assert len(window.ws.samples) == before + 1
+
+
+def test_drop_without_fcs_only_warns(window, qtbot, tmp_path, monkeypatch):
+    from PySide6 import QtWidgets
+    warnings = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: warnings.append(a[1]))
+    (tmp_path / "empty").mkdir()
+    before = len(window.ws.samples)
+    window.add_dropped([tmp_path / "empty"])
+    assert len(window.ws.samples) == before and warnings == ["No FCS files"]

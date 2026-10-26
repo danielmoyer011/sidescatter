@@ -1,4 +1,5 @@
 import csv
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -104,3 +105,15 @@ def test_unmix_full_panel(spectral_dir):
     assert "PE_X" in unmixed.pnn_labels and "Autofluorescence" in unmixed.pnn_labels
     qc = unmixing.unmixing_qc(full, um)
     assert qc["relative_residual_median"] < 0.1
+
+
+def test_find_fcs_files(tmp_path):
+    from sidescatter.core.fcs import find_fcs_files
+    (tmp_path / "d" / "sub").mkdir(parents=True)
+    for name in ("d/x.fcs", "d/sub/y.FCS", "d/._x.fcs", "d/z.txt", "top.fcs", "img.png"):
+        (tmp_path / name).write_bytes(b"")
+    found, skipped = find_fcs_files([tmp_path / "d", tmp_path / "top.fcs", tmp_path / "img.png",
+                                     tmp_path / "d" / "x.fcs"])
+    names = [Path(p).name for p in found]
+    assert names == ["y.FCS", "x.fcs", "top.fcs"] or names == ["x.fcs", "y.FCS", "top.fcs"]
+    assert skipped == ["img.png"]

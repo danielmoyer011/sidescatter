@@ -6,6 +6,7 @@ import flowkit as fk
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import __version__
+from ..core.fcs import find_fcs_files
 from ..core.workspace import Workspace
 from .graph_view import GraphView
 from .table_editor import TableEditor
@@ -37,9 +38,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(split)
         self.resize(1320, 840)
 
+        self.setAcceptDrops(True)
         self._build_menus()
         self._build_toolbar()
-        self.statusBar().showMessage("Add FCS files, open a workspace, or try the demo spectral data.")
+        self.statusBar().showMessage(
+            "Add or drop FCS files, open a workspace, or try the demo spectral data.")
         self._update_title()
 
     # ----- UI construction -------------------------------------------------
@@ -104,6 +107,48 @@ class MainWindow(QtWidgets.QMainWindow):
         answer = QtWidgets.QMessageBox.question(
             self, "Unsaved changes", "Discard unsaved changes to this workspace?")
         return answer == QtWidgets.QMessageBox.Yes
+
+    # ----- drag and drop ---------------------------------------------------
+
+    @staticmethod
+    def _local_paths(mime):
+        if not mime.hasUrls():
+            return []
+        return [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+
+    def dragEnterEvent(self, event):
+        if self._local_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        paths = self._local_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.add_dropped(paths)
+
+    def add_dropped(self, paths):
+        """Add dropped files and folders as samples; report anything that is not FCS."""
+        fcs_paths, skipped = find_fcs_files(paths)
+        if fcs_paths:
+            before = len(self.ws.samples)
+            self.add_samples(fcs_paths)
+            added = len(self.ws.samples) - before
+            self.statusBar().showMessage(f"Added {added} sample(s).", 6000)
+        if skipped:
+            shown = "\n".join(skipped[:10]) + (f"\n… and {len(skipped) - 10} more" if len(skipped) > 10 else "")
+            QtWidgets.QMessageBox.warning(
+                self, "Not FCS files",
+                f"Skipped {len(skipped)} item(s) that are not FCS files:\n\n{shown}")
+        elif not fcs_paths:
+            QtWidgets.QMessageBox.warning(self, "No FCS files", "No FCS files were found in what was dropped.")
+        return fcs_paths, skipped
 
     def closeEvent(self, event):
         if self._confirm_discard():
