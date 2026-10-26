@@ -1,3 +1,5 @@
+<img src="src/sidescatter/resources/icons/sidescatter-128.png" width="96" alt="Sidescatter icon: a laser beam hits a cell and scatters light in the five Aurora laser colours">
+
 # Sidescatter
 
 Free, open-source flow cytometry analysis for Windows, macOS and Linux, built
@@ -87,13 +89,16 @@ machines; clone [FlowKit](https://github.com/whitews/FlowKit) into
   spectral unmixing, workspace and gating, statistics, file formats). Usable
   from Python scripts and notebooks.
 - `src/sidescatter/app`: the PySide6 desktop interface.
+- `src/sidescatter/resources`: app icon and bundled font. Regenerate the icon
+  files with `python scripts/make_icons.py`.
 - `packaging/`: PyInstaller build script used by the release workflow.
 
 ## Licence
 
 GPL-3.0-or-later. Built on [FlowKit](https://github.com/whitews/FlowKit)
 (BSD-3), PySide6 (LGPL-3) and pyqtgraph (MIT). Demo data from
-[flowSpecs](https://github.com/jtheorell/flowSpecs) (MIT).
+[flowSpecs](https://github.com/jtheorell/flowSpecs) (MIT). The Sora typeface
+used in the logo and splash screen is under the SIL Open Font License 1.1.
 
 Sidescatter is not affiliated with FlowJo, LLC, BD, or Cytek Biosciences.
 FlowJo is a trademark of Becton, Dickinson and Company.
