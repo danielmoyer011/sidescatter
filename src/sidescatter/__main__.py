@@ -10,7 +10,7 @@ def main():
     from .app import theme
     from .app.main_window import MainWindow
 
-    pg.setConfigOptions(imageAxisOrder="col-major")
+    pg.setConfigOptions(antialias=True, imageAxisOrder="col-major")
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Sidescatter")
     app.setOrganizationName("Sidescatter")

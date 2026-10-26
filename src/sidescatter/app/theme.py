@@ -7,7 +7,6 @@ surfaces, iris as the main accent, teal and coral as supporting accents.
 import tempfile
 from pathlib import Path
 
-import pyqtgraph as pg
 from PySide6 import QtGui, QtWidgets
 
 # ----- palette ---------------------------------------------------------------
@@ -27,11 +26,13 @@ TEAL = "#14A3A3"
 CORAL = "#F26D5B"        # "add" marks on icons
 GATE = "#1D2130"         # gate outlines: dark ink reads on every density colour
 
-# Density ramp for pseudocolour plots: the usual blue -> green -> yellow -> red
-# order cytometrists expect, in softer, evenly bright steps.
-PSEUDOCOLOR = pg.ColorMap(
-    [0.0, 0.2, 0.45, 0.7, 0.88, 1.0],
-    [(64, 70, 196), (40, 150, 230), (30, 190, 150), (170, 215, 60), (250, 190, 50), (232, 72, 64)],
+# Density ramp for pseudocolour plots (graph_view turns it into a colour map):
+# the usual blue -> green -> yellow -> red order cytometrists expect, in softer,
+# evenly bright steps. Kept as plain numbers so this module never imports
+# pyqtgraph and can style the app before the heavy imports load.
+PSEUDOCOLOR_STOPS = (
+    (0.0, (64, 70, 196)), (0.2, (40, 150, 230)), (0.45, (30, 190, 150)),
+    (0.7, (170, 215, 60)), (0.88, (250, 190, 50)), (1.0, (232, 72, 64)),
 )
 
 
@@ -304,7 +305,6 @@ def apply(app):
     pal.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, QtGui.QColor(FAINT))
     app.setPalette(pal)
     app.setStyleSheet(STYLESHEET.replace("@ARROW@", _arrow_file()))
-    pg.setConfigOptions(antialias=True, foreground=MUTED, background=SURFACE)
 
 
 def _arrow_file():

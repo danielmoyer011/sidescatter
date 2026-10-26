@@ -17,7 +17,7 @@ from ..core.workspace import ALL_SAMPLES, ROOT
 from .axes import TransformAxis
 
 BINS = 256
-PSEUDOCOLOR = theme.PSEUDOCOLOR
+PSEUDOCOLOR = pg.ColorMap(*zip(*theme.PSEUDOCOLOR_STOPS))
 GATE_PEN = pg.mkPen(theme.GATE, width=1.6)
 GATE_PEN_HOVER = pg.mkPen(theme.ACCENT, width=2.2)
 DRAW_PEN = pg.mkPen(theme.ACCENT, width=1.6, style=QtCore.Qt.DashLine)
