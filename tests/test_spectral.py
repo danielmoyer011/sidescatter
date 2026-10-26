@@ -1,4 +1,5 @@
 import csv
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -113,6 +114,6 @@ def test_find_fcs_files(tmp_path):
         (tmp_path / name).write_bytes(b"")
     found, skipped = find_fcs_files([tmp_path / "d", tmp_path / "top.fcs", tmp_path / "img.png",
                                      tmp_path / "d" / "x.fcs"])
-    names = [p.split("/")[-1] for p in found]
+    names = [Path(p).name for p in found]
     assert names == ["y.FCS", "x.fcs", "top.fcs"] or names == ["x.fcs", "y.FCS", "top.fcs"]
     assert skipped == ["img.png"]
