@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sidescatter
+GenericName=Flow cytometry analysis
+Comment=Free spectral flow cytometry analysis
+# Point Exec at the Sidescatter executable after unpacking, e.g. /opt/Sidescatter/Sidescatter
+Exec=Sidescatter %F
+Icon=sidescatter
+Terminal=false
+Categories=Science;Biology;Education;
+MimeType=application/vnd.isac.fcs;
