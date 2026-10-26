@@ -37,7 +37,15 @@ jobs:
         run: Compress-Archive -Path dist/Sidescatter -DestinationPath ${{ matrix.artifact }}
       - name: Package (macOS)
         if: runner.os == 'macOS'
-        run: hdiutil create -volname Sidescatter -srcfolder dist/Sidescatter.app -ov -format UDZO ${{ matrix.artifact }}
+        # hdiutil sometimes fails with "Resource busy" on GitHub's Mac runners
+        # while a background process holds the disk image, so retry it.
+        run: |
+          for attempt in 1 2 3 4 5; do
+            hdiutil create -volname Sidescatter -srcfolder dist/Sidescatter.app -ov -format UDZO ${{ matrix.artifact }} && exit 0
+            echo "hdiutil failed (attempt $attempt of 5), retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+          done
+          exit 1
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: tar -czf ${{ matrix.artifact }} -C dist Sidescatter
