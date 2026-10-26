@@ -48,7 +48,7 @@ def test_gates_show_in_tree_and_table(window, qtbot):
              for i in range(window.panel.tree.topLevelItem(0).childCount())]
     assert names == ["Big"]
 
-    window.graph.show_population(sid, None)
+    window.open_graph(sid)
     window.graph.set_axes("FSC-A", "SSC-A")
     assert window.graph._rois  # the gate is drawn
 
@@ -105,6 +105,7 @@ def test_drop_on_plot_reaches_window(window, qtbot, tmp_path, monkeypatch):
     f = tmp_path / "one.fcs"
     shutil.copy(sorted((DEMO_DIR / "controls").glob("*.fcs"))[0], f)
     before = len(window.ws.samples)
+    window.open_graph("PBMC_full_panel.fcs")
     target = window.graph.plot.viewport()  # QGraphicsView accepts drops itself, then passes them up
     assert target.acceptDrops()
     _drop(qtbot, target, [f])

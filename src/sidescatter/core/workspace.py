@@ -137,6 +137,18 @@ class Workspace:
                     if dim.transformation_ref == channel:
                         for v in gate.vertices:
                             v[i] = _remap(v[i], old, new)
+            if isinstance(gate, fk.gates.EllipsoidGate):
+                # Scales aren't linear, so move the centre and stretch the
+                # ellipse by the local slope of the new scale.
+                cov = np.asarray(gate.covariance_matrix, dtype=float)
+                for i, dim in enumerate(gate.dimensions):
+                    if dim.transformation_ref == channel:
+                        c, h = float(gate.coordinates[i]), 1e-3
+                        slope = (_remap(c + h, old, new) - _remap(c - h, old, new)) / (2 * h)
+                        gate.coordinates[i] = _remap(c, old, new)
+                        cov[i, :] *= slope
+                        cov[:, i] *= slope
+                gate.covariance_matrix = cov.tolist()
         self.strategy.transformations[channel] = new
         self.invalidate()
 

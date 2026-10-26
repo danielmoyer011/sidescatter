@@ -24,7 +24,11 @@ workflow familiar to FlowJo users.
   - drag the positive gate on any control and see signatures, unmixed plots
     and per-detector residuals update live;
   - unmix any number of samples into new, gateable samples.
-- **Gating**: rectangle, polygon and range gates drawn on pseudocolor, dot,
+- **FlowJo 10 layout**: a ribbon, the group table above the
+  Name / Statistic / #Cells sample table, and graph windows that open when you
+  double-click a population.
+- **Gating**: rectangle, polygon, ellipse, quadrant, freehand, range and
+  bisector tools in a strip right above each plot, drawn on pseudocolor, dot,
   contour or histogram plots, nested to any depth, editable by dragging. Gates
   apply to every sample in the workspace, as FlowJo group gates do.
 - **Scales**: logicle (biexponential), arcsinh, log and linear per channel;

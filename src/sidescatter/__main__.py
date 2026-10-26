@@ -7,12 +7,14 @@ def main():
     import pyqtgraph as pg
     from PySide6 import QtWidgets
 
+    from .app import theme
     from .app.main_window import MainWindow
 
-    pg.setConfigOptions(antialias=True, foreground="k", background="w", imageAxisOrder="col-major")
+    pg.setConfigOptions(antialias=True, imageAxisOrder="col-major")
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Sidescatter")
     app.setOrganizationName("Sidescatter")
+    theme.apply(app)
     window = MainWindow()
     window.show()
     for path in sys.argv[1:]:
