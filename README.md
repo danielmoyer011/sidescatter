@@ -11,7 +11,9 @@ workflow familiar to FlowJo users.
 
 ## What works today
 
-- **FCS files**: FCS 2.0, 3.0 and 3.1, conventional and full-spectrum.
+- **FCS files**: FCS 2.0, 3.0 and 3.1, conventional and full-spectrum. Add them
+  with File › Add samples, or drag files or whole folders onto the window
+  (folders are searched recursively; anything that isn't FCS is skipped with a warning).
 - **Spectral unmixing workbench** (Analysis › Spectral unmixing):
   - add single-stain controls on **beads or cells** plus unstained controls;
     files are classified by name and each stain is paired with the unstained
