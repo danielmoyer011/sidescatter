@@ -38,6 +38,14 @@ workflow familiar to FlowJo users.
 - **Statistics**: count, frequency of parent/grandparent/total, mean, median,
   geometric mean, SD, rSD, CV, rCV and percentiles, in a table editor that
   exports CSV or Excel.
+- **Layout Editor** (Sidescatter › Layout Editor, Ctrl+L): drag populations
+  from the sample table onto Letter or A4 pages to build figures from
+  pseudocolor, dot, contour and histogram plots plus text boxes (with
+  `{sample}`, `{population}`, `{count}` and `{freq}` fields). Plots stay linked
+  to the gates. Align, distribute, same size, snap to grid, undo/redo. Batch
+  repeats a layout for every sample in a group, in rows or columns. Export to
+  multi-page PDF, SVG, PNG or TIFF at any DPI, or print. Layouts are saved in
+  the workspace.
 - **FlowJo 10 workspaces**: open a `.wsp` with its FCS files to bring in
   samples, groups, compensation, scales and gates.
 - **Workspaces** saved as `.ssw` (a zip holding readable JSON).

@@ -14,6 +14,7 @@ import flowkit as fk
 import numpy as np
 
 from . import fcs, serialize, stats
+from .layout import Layout, rename_population
 from .spectral import Unmixer
 
 ROOT = ("root",)
@@ -39,6 +40,8 @@ class Workspace:
         self.groups = {ALL_SAMPLES: []}
         self.unmixers = {}       # name -> Unmixer
         self.compensation = {}   # sample_id -> "FCS" (acquisition spillover) or "uncompensated"
+        self.layouts = []        # Layout Editor pages (core.layout.Layout)
+        self.revision = 0        # bumped whenever gating results may have changed
         self._results = {}       # sample_id -> fk GatingResults
         self._display_cache = {}
 
@@ -180,6 +183,7 @@ class Workspace:
 
     def rename_gate(self, name, new_name, parent_path):
         self.strategy.rename_gate(name, new_name, gate_path=tuple(parent_path))
+        rename_population(self.layouts, parent_path, name, new_name)
         self.invalidate()
 
     def get_gate(self, name, parent_path, sample_id=None):
@@ -208,6 +212,7 @@ class Workspace:
         return out
 
     def invalidate(self, sample_id=None):
+        self.revision += 1
         if sample_id is None:
             self._results.clear()
         else:
@@ -376,6 +381,7 @@ class Workspace:
             "gates": [serialize.gate_to_dict(self.get_gate(n, p), p)
                       for n, p in self.population_paths()],
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
+            "layouts": [lay.to_dict() for lay in self.layouts],
         }
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("workspace.json", json.dumps(doc, indent=1))
@@ -413,6 +419,7 @@ class Workspace:
         ws.groups = {k: list(v) for k, v in doc["groups"].items()}
         for g in doc["gates"]:
             ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]))
+        ws.layouts = [Layout.from_dict(d) for d in doc.get("layouts", [])]
         return ws
 
     # ----- FlowJo import ---------------------------------------------------

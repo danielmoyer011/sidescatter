@@ -410,6 +410,251 @@ def _(p):
     p.drawLine(QtCore.QPointF(16, 7), QtCore.QPointF(16, 26))
 
 
+# ----- layout editor -----------------------------------------------------------
+
+def _page(p, x=6, y=3, w=20, h=26):
+    _pen(p, theme.INK, 1.8)
+    _fill(p, theme.SURFACE)
+    p.drawRoundedRect(QtCore.QRectF(x, y, w, h), 2, 2)
+
+
+def _mini_plot(p, x, y, w, h, color=theme.ACCENT):
+    p.setPen(QtCore.Qt.NoPen)
+    _fill(p, color, 45)
+    p.drawRect(QtCore.QRectF(x, y, w, h))
+    _pen(p, color, 1.4)
+    p.drawPolyline([QtCore.QPointF(x, y), QtCore.QPointF(x, y + h), QtCore.QPointF(x + w, y + h)])
+
+
+@_register("layout_editor")
+def _(p):
+    _page(p, 4, 3, 24, 26)
+    _mini_plot(p, 7, 7, 8, 7, theme.ACCENT)
+    _mini_plot(p, 17, 7, 8, 7, theme.TEAL)
+    _mini_plot(p, 7, 17, 8, 7, theme.TEAL)
+    _pen(p, theme.MUTED, 1.6)
+    for y in (18, 21.5, 25):
+        p.drawLine(QtCore.QPointF(17, y), QtCore.QPointF(25, y))
+
+
+@_register("new_layout")
+def _(p):
+    _page(p, 6, 3, 20, 26)
+    _mini_plot(p, 9, 7, 9, 8, theme.TEAL)
+    _plus(p, 20, 22, 4.5)
+
+
+@_register("duplicate")
+def _(p):
+    _page(p, 4, 3, 16, 20)
+    _page(p, 12, 9, 16, 20)
+    _mini_plot(p, 15, 13, 9, 8, theme.ACCENT)
+
+
+@_register("text")
+def _(p):
+    _pen(p, theme.INK, 2.6)
+    p.drawLine(QtCore.QPointF(7, 7), QtCore.QPointF(25, 7))
+    p.drawLine(QtCore.QPointF(16, 7), QtCore.QPointF(16, 26))
+    _pen(p, theme.ACCENT, 1.6)
+    p.drawLine(QtCore.QPointF(12, 26), QtCore.QPointF(20, 26))
+
+
+@_register("add_plot")
+def _(p):
+    _axes(p)
+    _scatter(p, _CLOUD)
+    _plus(p, 24, 8, 4.5)
+
+
+@_register("batch")
+def _(p):
+    for i, color in enumerate((theme.ACCENT, theme.TEAL, theme.CORAL)):
+        y = 4 + i * 9
+        _pen(p, theme.INK, 1.4)
+        _fill(p, theme.SURFACE)
+        p.drawRect(QtCore.QRectF(4, y, 24, 7))
+        _mini_plot(p, 6, y + 1.5, 6, 4, color)
+        _mini_plot(p, 15, y + 1.5, 6, 4, color)
+
+
+@_register("page_setup")
+def _(p):
+    _page(p, 6, 3, 20, 26)
+    _pen(p, theme.ACCENT, 1.4)
+    p.setBrush(QtCore.Qt.NoBrush)
+    pen = p.pen()
+    pen.setStyle(QtCore.Qt.DashLine)
+    p.setPen(pen)
+    p.drawRect(QtCore.QRectF(9.5, 6.5, 13, 19))
+
+
+@_register("grid")
+def _(p):
+    _pen(p, theme.MUTED, 1.2)
+    for v in (6, 12, 18, 24):
+        p.drawLine(QtCore.QPointF(v, 4), QtCore.QPointF(v, 28))
+        p.drawLine(QtCore.QPointF(4, v + 2), QtCore.QPointF(28, v + 2))
+    _pen(p, theme.ACCENT, 1.8)
+    _fill(p, theme.ACCENT, 50)
+    p.drawRect(QtCore.QRectF(12, 14, 12, 6))
+
+
+@_register("print")
+def _(p):
+    _pen(p, theme.INK, 1.8)
+    _fill(p, theme.SURFACE)
+    p.drawRect(QtCore.QRectF(9, 4, 14, 8))
+    _fill(p, theme.ACCENT, 40)
+    p.drawRoundedRect(QtCore.QRectF(4, 11, 24, 11), 2, 2)
+    _fill(p, theme.SURFACE)
+    p.drawRect(QtCore.QRectF(9, 18, 14, 10))
+    _pen(p, theme.MUTED, 1.2)
+    for y in (22, 25):
+        p.drawLine(QtCore.QPointF(11, y), QtCore.QPointF(21, y))
+
+
+def _align(p, vertical, edge):
+    """Two boxes lined up against a guide line."""
+    _pen(p, theme.CORAL, 2.0)
+    if vertical:
+        x = 5 if edge == "start" else 27
+        p.drawLine(QtCore.QPointF(x, 3), QtCore.QPointF(x, 29))
+        boxes = ((7, 6, 16, 7), (7, 18, 10, 7)) if edge == "start" else ((9, 6, 16, 7), (15, 18, 10, 7))
+    else:
+        y = 5 if edge == "start" else 27
+        p.drawLine(QtCore.QPointF(3, y), QtCore.QPointF(29, y))
+        boxes = ((6, 7, 7, 16), (18, 7, 7, 10)) if edge == "start" else ((6, 9, 7, 16), (18, 15, 7, 10))
+    _pen(p, theme.INK, 1.6)
+    _fill(p, theme.ACCENT, 45)
+    for b in boxes:
+        p.drawRect(QtCore.QRectF(*b))
+
+
+@_register("align_left")
+def _(p):
+    _align(p, True, "start")
+
+
+@_register("align_right")
+def _(p):
+    _align(p, True, "end")
+
+
+@_register("align_top")
+def _(p):
+    _align(p, False, "start")
+
+
+@_register("align_bottom")
+def _(p):
+    _align(p, False, "end")
+
+
+@_register("distribute_h")
+def _(p):
+    _pen(p, theme.INK, 1.6)
+    _fill(p, theme.ACCENT, 45)
+    for x in (3, 13, 23):
+        p.drawRect(QtCore.QRectF(x, 10, 6, 12))
+    _pen(p, theme.CORAL, 1.6)
+    for x in (9.5, 19.5):
+        p.drawLine(QtCore.QPointF(x, 16), QtCore.QPointF(x + 3, 16))
+
+
+@_register("distribute_v")
+def _(p):
+    _pen(p, theme.INK, 1.6)
+    _fill(p, theme.ACCENT, 45)
+    for y in (3, 13, 23):
+        p.drawRect(QtCore.QRectF(10, y, 12, 6))
+    _pen(p, theme.CORAL, 1.6)
+    for y in (9.5, 19.5):
+        p.drawLine(QtCore.QPointF(16, y), QtCore.QPointF(16, y + 3))
+
+
+@_register("same_size")
+def _(p):
+    _pen(p, theme.INK, 1.6)
+    _fill(p, theme.ACCENT, 45)
+    p.drawRect(QtCore.QRectF(4, 9, 11, 14))
+    _fill(p, theme.TEAL, 45)
+    p.drawRect(QtCore.QRectF(18, 9, 11, 14))
+    _pen(p, theme.CORAL, 1.6)
+    p.drawLine(QtCore.QPointF(4, 27), QtCore.QPointF(29, 27))
+
+
+@_register("bring_front")
+def _(p):
+    _pen(p, theme.INK, 1.4)
+    _fill(p, theme.SURFACE)
+    p.drawRect(QtCore.QRectF(4, 4, 14, 14))
+    _fill(p, theme.ACCENT, 160)
+    p.drawRect(QtCore.QRectF(12, 12, 15, 15))
+
+
+@_register("send_back")
+def _(p):
+    _pen(p, theme.INK, 1.4)
+    _fill(p, theme.ACCENT, 160)
+    p.drawRect(QtCore.QRectF(4, 4, 14, 14))
+    _fill(p, theme.SURFACE)
+    p.drawRect(QtCore.QRectF(12, 12, 15, 15))
+
+
+def _magnifier(p):
+    _pen(p, theme.INK, 2.0)
+    _fill(p, theme.SURFACE)
+    p.drawEllipse(QtCore.QPointF(13, 13), 8.5, 8.5)
+    _pen(p, theme.INK, 3.0)
+    p.drawLine(QtCore.QPointF(19.5, 19.5), QtCore.QPointF(27, 27))
+
+
+@_register("zoom_in")
+def _(p):
+    _magnifier(p)
+    _plus(p, 13, 13, 4, theme.ACCENT)
+
+
+@_register("zoom_out")
+def _(p):
+    _magnifier(p)
+    _pen(p, theme.ACCENT, 2.6)
+    p.drawLine(QtCore.QPointF(9, 13), QtCore.QPointF(17, 13))
+
+
+@_register("zoom_fit")
+def _(p):
+    _page(p, 8, 5, 16, 22)
+    _pen(p, theme.ACCENT, 2.0)
+    for (x, y), (dx, dy) in (((3, 3), (1, 1)), ((29, 3), (-1, 1)), ((3, 29), (1, -1)), ((29, 29), (-1, -1))):
+        p.drawPolyline([QtCore.QPointF(x + 5 * dx, y), QtCore.QPointF(x, y), QtCore.QPointF(x, y + 5 * dy)])
+
+
+def _curved_arrow(p, mirror):
+    p.save()
+    if mirror:
+        p.translate(32, 0)
+        p.scale(-1, 1)
+    _pen(p, theme.INK, 2.4)
+    path = QtGui.QPainterPath()
+    path.moveTo(9, 13)
+    path.cubicTo(16, 6, 28, 10, 26, 22)
+    p.drawPath(path)
+    p.drawPolyline([QtCore.QPointF(10, 6), QtCore.QPointF(8, 13.5), QtCore.QPointF(15, 15)])
+    p.restore()
+
+
+@_register("undo")
+def _(p):
+    _curved_arrow(p, False)
+
+
+@_register("redo")
+def _(p):
+    _curved_arrow(p, True)
+
+
 @_register("app")
 def _(p):
     """Fallback app badge for the ribbon (replaced by the window icon when one is set)."""
