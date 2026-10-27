@@ -18,14 +18,21 @@ workflow familiar to FlowJo users.
   (folders are searched recursively; anything that isn't FCS is skipped with a warning).
 - **Spectral unmixing workbench** (Analysis › Spectral unmixing):
   - add single-stain controls on **beads or cells** plus unstained controls;
-    files are classified by name and each stain is paired with the unstained
-    control of the same kind, or with its own dim events;
+    files are classified from their folder (a SpectroFlo "Reference Group"),
+    name (fluor, marker, beads/cells, unstained), FCS keywords, or the events
+    themselves, and each stain is paired with the unstained control of the
+    same kind, or with its own dim events;
   - signature viewer, similarity matrix and complexity index;
   - ordinary or weighted least squares, with one or more autofluorescence
     signatures from unstained cells;
   - drag the positive gate on any control and see signatures, unmixed plots
     and per-detector residuals update live;
-  - unmix any number of samples into new, gateable samples.
+  - unmix any number of samples into new, gateable samples, with channels
+    named like SpectroFlo's (`BV421-A`, marker as the description, `AF-A`);
+  - export the experiment as a SpectroFlo-style package: `Raw/` and
+    `Unmixed/` trees with `Reference Group/` and `Samples/` folders and the
+    same file names in both, plus the unmixing matrix, a file manifest, a QC
+    report and a Sidescatter workspace of the unmixed files.
 - **FlowJo 10 layout**: a ribbon, the group table above the
   Name / Statistic / #Cells sample table, and graph windows that open when you
   double-click a population.

@@ -1,11 +1,12 @@
 """Loading FCS files and describing their channels."""
 
+import io
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
-import re
-
 import flowkit as fk
+import numpy as np
 
 # Full-spectrum instruments have 20+ fluorescence detectors: Cytek Aurora and
 # Northern Lights 14-64 (1-5 lasers), BD FACSDiscover and Symphony A5 SE 48-78,
@@ -69,10 +70,12 @@ def find_fcs_files(paths):
     return unique, skipped
 
 
-def load_sample(path_or_data, sample_id=None, channel_labels=None):
+def load_sample(path_or_data, sample_id=None, channel_labels=None, pns_labels=None, keywords=None):
     """Load an FCS file (or an events array with channel_labels) as a FlowKit Sample.
 
     Full-resolution events are kept; subsampling is only used for plotting.
+    An array goes through an in-memory FCS file, which keeps $PnS descriptions
+    and keywords and avoids FlowKit's slow list conversion.
     """
     if isinstance(path_or_data, (str, Path)):
         path = Path(path_or_data)
@@ -82,9 +85,10 @@ def load_sample(path_or_data, sample_id=None, channel_labels=None):
             ignore_offset_error=True,
             subsample=20000,
         )
-    return fk.Sample(
-        path_or_data, sample_id=sample_id, channel_labels=channel_labels, subsample=20000
-    )
+    fh = io.BytesIO()
+    write_fcs(fh, path_or_data, channel_labels, pns_labels, keywords)
+    fh.seek(0)
+    return fk.Sample(fh, sample_id=sample_id, subsample=20000)
 
 
 def channels(sample):
@@ -122,3 +126,84 @@ def raw_events(sample, channel_list=None):
 
 def keywords(sample):
     return dict(sample.get_metadata())
+
+
+# Keywords that describe the file's own layout; write_fcs sets these itself.
+_LAYOUT_KEYWORDS = re.compile(
+    r"^\$?(BEGIN|END)(ANALYSIS|DATA|STEXT)$|^\$?(BYTEORD|DATATYPE|MODE|NEXTDATA|PAR|TOT)$"
+    r"|^\$?P\d+[A-Z]+$|^\$?(SPILL|SPILLOVER|COMP)$|^\$?FIL$", re.IGNORECASE)
+_BLOCK = 100_000
+
+
+def write_fcs(target, events, pnn, pns=None, keywords=None, ranges=None):
+    """Write an FCS 3.1 file of 32-bit float events.
+
+    target: a path or a binary file handle. keywords: extra TEXT keywords
+    (for example the source file's $DATE and $CYT); layout keywords in it are
+    ignored. ranges: optional $PnR per channel (default 262144).
+    Events are written in blocks, so a large array is never copied whole.
+    """
+    events = np.asarray(events)
+    n, k = events.shape
+    if len(pnn) != k:
+        raise ValueError(f"{len(pnn)} channel names for {k} columns")
+    pns = list(pns) if pns is not None else [""] * k
+    ranges = list(ranges) if ranges is not None else [262144] * k
+
+    text = {}
+    for key, value in (keywords or {}).items():
+        key = str(key).upper()
+        key = key if key.startswith("$") or not _is_standard(key) else "$" + key
+        if not _LAYOUT_KEYWORDS.match(key) and str(value) != "":
+            text[key] = str(value)
+    for i in range(k):
+        text[f"$P{i + 1}N"] = pnn[i]
+        text[f"$P{i + 1}B"] = "32"
+        text[f"$P{i + 1}E"] = "0,0"
+        text[f"$P{i + 1}R"] = str(int(ranges[i]))
+        if pns[i]:
+            text[f"$P{i + 1}S"] = pns[i]
+    text.update({"$BYTEORD": "1,2,3,4", "$DATATYPE": "F", "$MODE": "L", "$NEXTDATA": "0",
+                 "$PAR": str(k), "$TOT": str(n), "$BEGINANALYSIS": "0", "$ENDANALYSIS": "0",
+                 "$BEGINSTEXT": "0", "$ENDSTEXT": "0"})
+
+    # The delimiter is a character no keyword or value uses. FCS allows doubling
+    # it inside values, but not every reader undoes that.
+    used = set("".join(text) + "".join(text.values()))
+    delim = next((c for c in "|/\\\x0c\x1e" if c not in used), "|")
+
+    def body(begin, end):
+        pairs = dict(text, **{"$BEGINDATA": f"{begin:020d}", "$ENDDATA": f"{end:020d}"})
+        esc = lambda v: v.replace(delim, delim * 2)  # noqa: E731
+        return (delim + "".join(f"{esc(a)}{delim}{esc(b)}{delim}" for a, b in pairs.items())).encode("utf-8")
+
+    text_start = 58
+    text_len = len(body(0, 0))  # the offsets are fixed width, so the length is known now
+    data_start = text_start + text_len
+    data_end = data_start + 4 * n * k - 1 if n * k else data_start
+    header = b"FCS3.1    " + b"".join(f"{v:>8}".encode() for v in (
+        text_start, data_start - 1,
+        data_start if data_end <= 99_999_999 else 0, data_end if data_end <= 99_999_999 else 0,
+        0, 0))
+
+    def write(fh):
+        fh.write(header)
+        fh.write(body(data_start, data_end))
+        for start in range(0, n, _BLOCK):
+            fh.write(np.ascontiguousarray(events[start:start + _BLOCK], dtype="<f4").tobytes())
+
+    if isinstance(target, (str, Path)):
+        with open(target, "wb") as fh:
+            write(fh)
+    else:
+        write(target)
+
+
+_STANDARD = {"DATE", "CYT", "CYTSN", "BTIM", "ETIM", "TIMESTEP", "OP", "SRC", "SMNO", "INST",
+             "PROJ", "CELLS", "COM", "EXP", "FIL", "LAST_MODIFIED", "LAST_MODIFIER", "ORIGINALITY",
+             "PLATEID", "PLATENAME", "WELLID", "VOL", "SYS", "ABRT", "LOST", "FLOWRATE"}
+
+
+def _is_standard(key):
+    """FlowKit drops the '$' from keywords; put it back on the standard FCS ones."""
+    return key in _STANDARD or bool(re.match(r"^P\d+[A-Z]+$", key))

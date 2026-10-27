@@ -41,9 +41,9 @@ def unmixed_ws(spectral_dir):
 
 def test_rectangle_gate_counts_match_numpy(unmixed_ws):
     ws, sid = unmixed_ws
-    x = ws.display_values(sid, "PB_CD3")
+    x = ws.display_values(sid, "PB-A")
     lo, hi = np.quantile(x, [0.5, 0.99])
-    gate = fk.gates.RectangleGate("CD3+", [ws.make_dimension(sid, "PB_CD3", lo, hi)])
+    gate = fk.gates.RectangleGate("CD3+", [ws.make_dimension(sid, "PB-A", lo, hi)])
     ws.add_gate(gate)
     assert ws.count(sid, "CD3+") == int(((x >= lo) & (x < hi)).sum())
 
@@ -65,17 +65,17 @@ def test_nested_gates_and_frequencies(unmixed_ws):
 
 def test_changing_transform_keeps_gate_selection(unmixed_ws):
     ws, sid = unmixed_ws
-    x = ws.display_values(sid, "PE_X")
-    ws.add_gate(fk.gates.RectangleGate("PE+", [ws.make_dimension(sid, "PE_X", np.quantile(x, 0.7), None)]))
+    x = ws.display_values(sid, "PE-A")
+    ws.add_gate(fk.gates.RectangleGate("PE+", [ws.make_dimension(sid, "PE-A", np.quantile(x, 0.7), None)]))
     before = ws.count(sid, "PE+")
-    ws.set_transform("PE_X", fk.transforms.AsinhTransform(param_t=4194304, param_m=5, param_a=0))
+    ws.set_transform("PE-A", fk.transforms.AsinhTransform(param_t=4194304, param_m=5, param_a=0))
     assert ws.count(sid, "PE+") == before
 
 
 def test_save_and_load_roundtrip(unmixed_ws, tmp_path):
     ws, sid = unmixed_ws
-    x = ws.display_values(sid, "PB_CD3")
-    ws.add_gate(fk.gates.RectangleGate("CD3+", [ws.make_dimension(sid, "PB_CD3", np.median(x), None)]))
+    x = ws.display_values(sid, "PB-A")
+    ws.add_gate(fk.gates.RectangleGate("CD3+", [ws.make_dimension(sid, "PB-A", np.median(x), None)]))
     ws.add_group("Stained", [sid])
     path = tmp_path / "test.ssw"
     ws.save(path)
@@ -89,11 +89,11 @@ def test_statistics_table(unmixed_ws):
     ws, sid = unmixed_ws
     table = ws.statistics_table([sid], [
         {"stat": "Count"},
-        {"stat": "Median", "channel": "PB_CD3"},
+        {"stat": "Median", "channel": "PB-A"},
     ])
     assert table.loc[0, "All events | Count"] == ws.samples[sid].event_count
-    assert table.loc[0, "All events | Median (PB_CD3)"] == pytest.approx(
-        np.median(ws.scale_values(sid, "PB_CD3")))
+    assert table.loc[0, "All events | Median (PB-A)"] == pytest.approx(
+        np.median(ws.scale_values(sid, "PB-A")))
 
 
 def test_channel_stats():

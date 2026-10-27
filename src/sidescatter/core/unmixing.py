@@ -7,38 +7,87 @@ inside the control itself. Unstained cells also supply autofluorescence.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from . import fcs, spectral
+from . import classify, fcs, spectral
 
-UNSTAINED_PATTERN = re.compile(r"unstain|unstained|\bUS\b|negative|blank", re.IGNORECASE)
-BEAD_PATTERN = re.compile(r"bead", re.IGNORECASE)
 
 
 @dataclass
 class ControlSpec:
+    """One raw file in an unmixing experiment and what it is used for."""
+
     path: Path
     name: str                       # fluor label shown to the user, e.g. "PE-Cy7"
-    role: str = "single_stain"      # "single_stain" or "unstained"
+    role: str = "single_stain"      # "single_stain", "unstained", "sample" or "exclude"
     carrier: str = "cells"          # "beads" or "cells"
     negative: str = "auto"          # "auto", "internal", or a path to an unstained file
     positive_mask: np.ndarray = None  # manual gates override the automatic ones
     negative_mask: np.ndarray = None
+    marker: str = ""                # antigen, e.g. "CD3"
+    reasons: list = field(default_factory=list)  # why the role was guessed
+    guessed_by: str = ""            # strongest evidence: folder, name, keywords, data, default
+
+    @property
+    def is_reference(self):
+        return self.role in ("single_stain", "unstained")
 
 
-def guess_controls(paths):
-    """Classify control files by name: unstained vs single stain, beads vs cells."""
-    specs = []
-    for p in map(Path, paths):
-        stem = p.stem
-        role = "unstained" if UNSTAINED_PATTERN.search(stem) else "single_stain"
-        carrier = "beads" if BEAD_PATTERN.search(stem) else "cells"
-        name = re.sub(r"^(beads?|cells?|pbmc|dead)[_\- ]+", "", stem, flags=re.IGNORECASE)
-        specs.append(ControlSpec(p, name or stem, role, carrier))
+FileSpec = ControlSpec
+
+
+def _legacy_name(stem):
+    return re.sub(r"^(beads?|cells?|pbmc|dead)[_\- ]+", "", stem, flags=re.IGNORECASE) or stem
+
+
+def guess_files(paths, samples=None, use_data=True):
+    """Classify every file of an experiment: references (single stain or
+    unstained, on beads or cells), multicolor samples, or files to leave out.
+    """
+    paths = [Path(p) for p in paths]
+    guesses = classify.classify_files(paths, samples, use_data)
+    return [ControlSpec(p, g.fluor or _legacy_name(p.stem), g.role, g.carrier, marker=g.marker,
+                        reasons=g.reasons, guessed_by=g.source)
+            for p, g in zip(paths, guesses)]
+
+
+def guess_controls(paths, samples=None):
+    """Classify files known to be controls: unstained vs single stain, beads vs cells."""
+    specs = guess_files(paths, samples)
+    for spec in specs:
+        if not spec.is_reference:
+            spec.role = "single_stain"
     return specs
+
+
+def check_specs(specs):
+    """Problems that stop or weaken unmixing, as (level, message); level is "error" or "warning"."""
+    problems = []
+    singles = [s for s in specs if s.role == "single_stain"]
+    if not singles:
+        problems.append(("error", "No single-stain reference controls."))
+    seen = {}
+    for s in singles:
+        key = s.name.strip().upper()
+        if not key:
+            problems.append(("error", f"{s.path.name} has no fluor name."))
+        elif key in seen:
+            problems.append(("error", f"Two single-stain controls for {s.name}: {seen[key]} and "
+                                      f"{s.path.name}. Set one of them to Exclude."))
+        else:
+            seen[key] = s.path.name
+    for carrier in sorted({s.carrier for s in singles}):
+        if not any(u.role == "unstained" and u.carrier == carrier for u in specs):
+            problems.append(("warning", f"No unstained {carrier}: {carrier} single stains will use "
+                                        "their own dim events as the negative."))
+    if not any(s.role == "unstained" and s.carrier == "cells" for s in specs):
+        problems.append(("warning", "No unstained cells, so no autofluorescence signature."))
+    if not any(s.role == "sample" for s in specs):
+        problems.append(("warning", "No multicolor samples to unmix."))
+    return problems
 
 
 def _matching_unstained(spec, specs):
@@ -119,7 +168,7 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
             neg_events = events[internal_neg]
 
         sig = spectral.extract_signature(events[pos_mask], neg_events)
-        references.append(spectral.Reference(spec.name, sig, source=spec.path.name))
+        references.append(spectral.Reference(spec.name, sig, source=spec.path.name, marker=spec.marker))
         results.append(ControlResult(spec, sig, names[peak], pos_mask, neg_source,
                                      int(pos_mask.sum()), len(neg_events)))
 
@@ -147,22 +196,39 @@ def unmix_sample(sample, unmixer, keep_autofluorescence=True):
     """Return a new FlowKit Sample: scatter/time channels plus one channel per fluor.
 
     Works through the events in blocks so a multi-million-event, 64-detector
-    file never needs a second full copy of its detector data.
+    file never needs a second full copy of its detector data. The source
+    file's keywords (date, cytometer, tube name...) are carried over.
     """
+    events, pnn, pns, ranges, meta = unmixed_events(sample, unmixer, keep_autofluorescence)
+    return fcs.load_sample(events, sample_id=f"{sample.id} (unmixed)", channel_labels=pnn,
+                           pns_labels=pns, keywords=meta)
+
+
+def unmixed_events(sample, unmixer, keep_autofluorescence=True):
+    """Unmixed events plus what an FCS file of them needs: (events, PnN, PnS, PnR, keywords)."""
     chans = fcs.channels(sample)
     det_idx = _detector_index(sample, unmixer.detectors)
     keep = [c for c in chans if c.kind in ("time", "scatter")]
     fluors = [i for i, r in enumerate(unmixer.references)
               if keep_autofluorescence or not r.is_autofluorescence]
-    labels = [c.pnn for c in keep] + [unmixer.references[i].name for i in fluors]
+    labels = unmixer.channel_labels()
+    pnn = [c.pnn for c in keep] + [labels[i][0] for i in fluors]
+    pns = [c.pns for c in keep] + [labels[i][1] for i in fluors]
 
     raw = sample.get_events(source="raw")  # FlowKit returns its array, not a copy
-    out = np.empty((raw.shape[0], len(labels)))
+    out = np.empty((raw.shape[0], len(pnn)), dtype=np.float32)
     out[:, :len(keep)] = raw[:, [c.index for c in keep]]
     for start in range(0, raw.shape[0], CHUNK):
         block = slice(start, start + CHUNK)
         out[block, len(keep):] = unmixer.unmix(raw[block][:, det_idx])[:, fluors]
-    return fcs.load_sample(out, sample_id=f"{sample.id} (unmixed)", channel_labels=labels)
+
+    pnr = sample.channels["pnr"].tolist()
+    det_range = max((pnr[i] for i in det_idx), default=262144)
+    ranges = [pnr[c.index] for c in keep] + [det_range] * len(fluors)
+    meta = {k: v for k, v in fcs.keywords(sample).items()
+            if not re.match(r"^p\d+[a-z]+$", k)}
+    meta["SIDESCATTER_UNMIXING"] = f"{unmixer.method.upper()}, {len(unmixer.references)} components"
+    return out, pnn, pns, ranges, meta
 
 
 def unmixing_qc(sample, unmixer):

@@ -488,6 +488,10 @@ def _column_label(col):
 
 def _find_file(original, search_dirs):
     p = Path(original)
+    if not p.is_absolute():  # relative to the workspace, as in exported experiments
+        for d in search_dirs:
+            if (Path(d) / p).exists():
+                return Path(d) / p
     if p.exists():
         return p
     for d in search_dirs:

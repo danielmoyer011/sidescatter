@@ -72,7 +72,10 @@ def test_guess_controls_classifies_files(spectral_dir):
     assert specs["Beads_unstained.fcs"].role == "unstained"
     assert specs["Beads_unstained.fcs"].carrier == "beads"
     assert specs["PBMC_unstained.fcs"].carrier == "cells"
-    assert specs["Beads_PE_X.fcs"].name == "PE_X"
+    assert specs["Beads_PE_X.fcs"].name == "PE"
+    assert specs["Beads_PE_X.fcs"].marker == "X"
+    assert specs["Beads_PECy7_CD45RA.fcs"].name == "PE-Cy7"
+    assert specs["Dead_PO_DCM.fcs"].carrier == "cells"
 
 
 def test_aurora_signatures_match_flowspecs(spectral_dir):
@@ -86,14 +89,14 @@ def test_aurora_signatures_match_flowspecs(spectral_dir):
     for ref in um.references:
         if ref.is_autofluorescence:
             continue
-        theirs = reference[ref.name]
+        theirs = reference[f"{ref.name.replace('-', '')}_{ref.marker}"]
         cos = ref.signature @ theirs / np.linalg.norm(ref.signature) / np.linalg.norm(theirs)
         assert cos > 0.995, ref.name
     # beads use the unstained beads as negative, the dead-cell stain uses unstained cells
     by_name = {r.spec.name: r for r in results}
-    assert by_name["PE_X"].negative_source == "Beads_unstained.fcs"
-    assert by_name["PO_DCM"].negative_source.endswith("unstained.fcs")
-    assert "Bead" not in by_name["PO_DCM"].negative_source
+    assert by_name["PE"].negative_source == "Beads_unstained.fcs"
+    assert by_name["PO"].negative_source.endswith("unstained.fcs")
+    assert "Bead" not in by_name["PO"].negative_source
 
 
 def test_unmix_full_panel(spectral_dir):
@@ -102,7 +105,9 @@ def test_unmix_full_panel(spectral_dir):
     full = fcs.load_sample(spectral_dir / "PBMC_full_panel.fcs")
     unmixed = unmixing.unmix_sample(full, um)
     assert unmixed.event_count == full.event_count
-    assert "PE_X" in unmixed.pnn_labels and "Autofluorescence" in unmixed.pnn_labels
+    assert "PE-A" in unmixed.pnn_labels and "AF-A" in unmixed.pnn_labels
+    assert unmixed.pns_labels[unmixed.pnn_labels.index("PE-Cy7-A")] == "CD45RA"
+    assert unmixed.get_metadata()["cyt"] == "Aurora"
     qc = unmixing.unmixing_qc(full, um)
     assert qc["relative_residual_median"] < 0.1
 
