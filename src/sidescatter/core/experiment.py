@@ -26,7 +26,7 @@ import re
 import shutil
 import tempfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -243,3 +243,32 @@ def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
 
     n_ref = sum(s.is_reference for s in included)
     return ExportResult(final, n_ref, len(included) - n_ref, warnings)
+
+
+@dataclass
+class Setup:
+    """An unmixing experiment as the Unmixing tab edits it: files and settings."""
+
+    name: str
+    specs: list = field(default_factory=list)
+    method: str = "wls"
+    autofluorescence: bool = True
+    n_autofluorescence: int = 1
+
+    def to_dict(self):
+        return {
+            "name": self.name, "method": self.method, "autofluorescence": self.autofluorescence,
+            "n_autofluorescence": self.n_autofluorescence,
+            "files": [{"path": str(s.path), "name": s.name, "role": s.role, "carrier": s.carrier,
+                       "negative": s.negative, "marker": s.marker, "reasons": list(s.reasons),
+                       "guessed_by": s.guessed_by} for s in self.specs],
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        specs = [unmixing.ControlSpec(Path(f["path"]), f["name"], f["role"], f["carrier"], f["negative"],
+                                      marker=f.get("marker", ""), reasons=f.get("reasons", []),
+                                      guessed_by=f.get("guessed_by", ""))
+                 for f in d["files"]]
+        return cls(d["name"], specs, d.get("method", "wls"), d.get("autofluorescence", True),
+                   d.get("n_autofluorescence", 1))

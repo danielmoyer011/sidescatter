@@ -8,7 +8,8 @@ pytest.importorskip("pytestqt")
 
 from sidescatter.app.main_window import DEMO_DIR, MainWindow  # noqa: E402
 from sidescatter.app.table_editor import TableEditor  # noqa: E402
-from sidescatter.app.unmixing_dialog import UnmixingDialog  # noqa: E402
+from sidescatter.app.unmixing_tab import ROLE_CHOICES, UnmixingTab  # noqa: E402
+from sidescatter.core.workspace import Workspace  # noqa: E402
 
 
 @pytest.fixture
@@ -20,21 +21,91 @@ def window(qtbot):
     return w
 
 
-def test_unmixing_dialog_builds_and_unmixes(window, qtbot):
-    controls = sorted(str(p) for p in (DEMO_DIR / "controls").glob("*.fcs"))
-    dlg = UnmixingDialog(window.ws, window, control_paths=controls)
-    qtbot.addWidget(dlg)
-    assert dlg.unmixer is not None and len(dlg.unmixer.names) == 13
-    assert "Complexity index" in dlg.complexity.text()
+def _demo_files():
+    return sorted(str(p) for p in (DEMO_DIR / "controls").glob("*.fcs")) + [str(DEMO_DIR / "PBMC_full_panel.fcs")]
 
-    dlg.method.setCurrentIndex(dlg.method.findData("ols"))
-    assert dlg.unmixer.method == "ols"
 
-    window.ws.add_unmixer("Unmixing 1", dlg.unmixer)
-    sid = window.ws.unmix("PBMC_full_panel.fcs", "Unmixing 1", group="Unmixed")
-    window._after_unmix([sid])
+def _role_of(tab, name):
+    row = next(i for i, s in enumerate(tab.specs) if s.path.name == name)
+    return tab.table.cellWidget(row, 1).currentText()
+
+
+def test_unmixing_tab_classifies_unmixes_and_exports(window, qtbot, tmp_path, monkeypatch):
+    from PySide6 import QtWidgets
+    monkeypatch.setattr(QtWidgets.QMessageBox, "show", lambda self: None)
+    window.open_demo()
+    tab = window.unmix_tab
+    assert window.pages.currentWidget() is tab
+    assert _role_of(tab, "PBMC_full_panel.fcs") == "Multicolor sample"
+    assert _role_of(tab, "Beads_unstained.fcs") == "Unstained (beads)"
+    assert _role_of(tab, "Beads_PE_X.fcs") == "Single color (beads)"
+    assert tab.unmixer is not None and len(tab.unmixer.names) == 13
+    assert "Complexity index" in tab.status.text()
+    assert tab.preview_sample.currentText() == "PBMC_full_panel.fcs"
+
+    tab.method.setCurrentIndex(tab.method.findData("ols"))
+    assert tab.unmixer.method == "ols" and tab.setup.method == "ols"
+
+    ids = tab.unmix_into_workspace()
+    assert window.pages.currentWidget() is window.panel
     assert window.panel.current_group() == "Unmixed"
-    assert window.graph.sample_id == sid
+    assert window.ws.groups["Unmixed"] == ["PBMC_full_panel.fcs (unmixed)"]
+    assert len(window.ws.groups["Reference Group"]) == 15 and len(ids) == 16
+    assert window.graph.sample_id == ids[0] or window.graph.sample_id in ids
+
+    result = tab.export(tmp_path, "Demo", True)
+    assert result.path == tmp_path / "Demo.zip" and result.n_samples == 1
+
+    # The setup and the unmixed samples survive saving and reopening the workspace.
+    path = tmp_path / "ws.ssw"
+    window.path = str(path)
+    window.save()
+    back = Workspace.load(path)
+    assert back.experiments[0]["files"][0]["path"].endswith(".fcs")
+    assert "PBMC_full_panel.fcs (unmixed)" in back.samples
+
+
+def test_changing_roles_on_several_rows(qtbot):
+    tab = UnmixingTab(Workspace())
+    qtbot.addWidget(tab)
+    tab.add_files(_demo_files())
+    rows = [i for i, s in enumerate(tab.specs) if s.path.name.startswith("Beads_B")]
+    tab._select_rows(rows)
+    exclude = [label for label, _, _ in ROLE_CHOICES].index("Exclude")
+    tab.table.cellWidget(rows[0], 1).setCurrentIndex(exclude)
+    assert all(tab.specs[r].role == "exclude" for r in rows)
+    assert len(tab.unmixer.names) == 13 - len(rows)
+    assert all(tab.table.cellWidget(r, 1).currentText() == "Exclude" for r in rows)
+    other = next(i for i, s in enumerate(tab.specs) if s.path.name == "Beads_PE_X.fcs")
+    assert tab.specs[other].role == "single_stain"
+
+    # Giving two controls the same fluor blocks unmixing until it's fixed.
+    tab.table.item(other, 2).setText("FITC")
+    assert tab.unmixer is None and not tab.export_btn.isEnabled()
+    assert "Two single-stain controls for FITC" in tab.status.text()
+    tab.table.item(other, 2).setText("PE")
+    assert tab.unmixer is not None
+
+
+def test_drop_on_unmixing_tab_adds_files(window, qtbot, tmp_path):
+    window.open_unmixing()
+    before = len(window.ws.samples)
+    target = window.unmix_tab.table.viewport()
+    _drop(qtbot, target, [DEMO_DIR / "controls"])
+    assert len(window.unmix_tab.specs) == 15
+    assert len(window.ws.samples) == before  # raw files stay in the tab
+
+
+def test_several_experiments(qtbot):
+    tab = UnmixingTab(Workspace())
+    qtbot.addWidget(tab)
+    tab.add_files(_demo_files()[:3])
+    tab.new_setup("Panel B")
+    assert tab.specs == [] and tab.exp_combo.count() == 2
+    tab.add_files(_demo_files()[3:5])
+    tab.exp_combo.setCurrentIndex(0)
+    assert len(tab.specs) == 3
+    assert [d["name"] for d in tab.ws.experiments] == ["Experiment 1", "Panel B"]
 
 
 def test_gates_show_in_tree_and_table(window, qtbot):

@@ -16,8 +16,13 @@ workflow familiar to FlowJo users.
 - **FCS files**: FCS 2.0, 3.0 and 3.1, conventional and full-spectrum. Add them
   with File › Add samples, or drag files or whole folders onto the window
   (folders are searched recursively; anything that isn't FCS is skipped with a warning).
-- **Spectral unmixing workbench** (Analysis › Spectral unmixing):
-  - add single-stain controls on **beads or cells** plus unstained controls;
+- **Unmixing tab**, next to the workspace:
+  - add or drop every raw file of an experiment (files or whole folders); each
+    is shown as Unstained or Single color (beads or cells), Multicolor sample,
+    or Exclude, with the reason, and any role can be changed (for many rows
+    at once by selecting them first);
+  - several experiments per workspace, saved with it;
+  - single-stain controls on **beads or cells** plus unstained controls;
     files are classified from their folder (a SpectroFlo "Reference Group"),
     name (fluor, marker, beads/cells, unstained), FCS keywords, or the events
     themselves, and each stain is paired with the unstained control of the

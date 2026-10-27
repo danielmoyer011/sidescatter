@@ -36,9 +36,12 @@ class Workspace:
     def __init__(self):
         self.strategy = fk.GatingStrategy()
         self.samples = {}        # sample_id -> fk.Sample
-        self.sources = {}        # sample_id -> {"path": str} or {"unmixed_from": id, "unmixer": name}
+        # sample_id -> {"path": str}, {"unmixed_from": id, "unmixer": name}, or
+        # {"unmixed_from_path": raw file not in the workspace, "unmixer": name}
+        self.sources = {}
         self.groups = {ALL_SAMPLES: []}
         self.unmixers = {}       # name -> Unmixer
+        self.experiments = []    # Unmixing tab setups, as experiment.Setup.to_dict() dicts
         self.compensation = {}   # sample_id -> "FCS" (acquisition spillover) or "uncompensated"
         self.layouts = []        # Layout Editor pages (core.layout.Layout)
         self.revision = 0        # bumped whenever gating results may have changed
@@ -353,13 +356,33 @@ class Workspace:
         self.add_sample(unmixed, {"unmixed_from": sample_id, "unmixer": unmixer_name}, group)
         return new_id
 
+    def unmix_file(self, path, unmixer_name, group=None, raw_sample=None):
+        """Unmix a raw file that stays out of the workspace (the Unmixing tab's files).
+
+        Only the unmixed sample is added; reopening the workspace unmixes the
+        raw file again from its path.
+        """
+        from .unmixing import unmix_sample
+
+        path = Path(path)
+        raw = raw_sample if raw_sample is not None else fcs.load_sample(path)
+        unmixed = unmix_sample(raw, self.unmixers[unmixer_name])
+        unmixed.id = self._unique_id(f"{path.name} (unmixed)")
+        return self.add_sample(unmixed, {"unmixed_from_path": str(path.resolve()), "unmixer": unmixer_name},
+                               group)
+
+    def _raw_for(self, src, search_dirs=()):
+        if "unmixed_from" in src:
+            return self.samples[src["unmixed_from"]]
+        return fcs.load_sample(_find_file(src["unmixed_from_path"], search_dirs))
+
     def reunmix(self, unmixer_name):
         """Recompute every sample unmixed with this unmixer (after controls change)."""
         from .unmixing import unmix_sample
 
         for sid, src in list(self.sources.items()):
             if src.get("unmixer") == unmixer_name:
-                fresh = unmix_sample(self.samples[src["unmixed_from"]], self.unmixers[unmixer_name])
+                fresh = unmix_sample(self._raw_for(src), self.unmixers[unmixer_name])
                 fresh.id = sid
                 self.samples[sid] = fresh
                 self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sid}
@@ -382,6 +405,7 @@ class Workspace:
                       for n, p in self.population_paths()],
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
             "layouts": [lay.to_dict() for lay in self.layouts],
+            "experiments": self.experiments,
         }
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("workspace.json", json.dumps(doc, indent=1))
@@ -412,11 +436,13 @@ class Workspace:
             from .unmixing import unmix_sample
 
             src = s["source"]
-            sample = unmix_sample(ws.samples[src["unmixed_from"]], ws.unmixers[src["unmixer"]])
+            raw = ws._raw_for(src, [Path(path).parent, *map(Path, search_dirs)])
+            sample = unmix_sample(raw, ws.unmixers[src["unmixer"]])
             sample.id = s["id"]
             ws.add_sample(sample, src)
 
         ws.groups = {k: list(v) for k, v in doc["groups"].items()}
+        ws.experiments = doc.get("experiments", [])
         for g in doc["gates"]:
             ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]))
         ws.layouts = [Layout.from_dict(d) for d in doc.get("layouts", [])]
