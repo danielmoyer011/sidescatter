@@ -666,3 +666,24 @@ def _(p):
     p.drawEllipse(QtCore.QPointF(16, 16), 14, 14)
     _scatter(p, [(10, 20), (13, 17), (12, 22), (16, 14), (19, 12), (17, 18), (21, 15), (22, 10)],
              theme.SURFACE, 1.6)
+
+
+@_register("suggest")
+def _(p):
+    """Suggestion box: a speech bubble with a spark of an idea inside."""
+    bubble = QtGui.QPainterPath()
+    bubble.addRoundedRect(QtCore.QRectF(3, 4, 26, 18), 6, 6)
+    tail = QtGui.QPainterPath()
+    tail.moveTo(9, 20)
+    tail.lineTo(8, 28)
+    tail.lineTo(16, 21)
+    tail.closeSubpath()
+    _pen(p, theme.ACCENT, 2.0)
+    _fill(p, theme.ACCENT_SOFT)
+    p.drawPath(bubble.united(tail))
+    spark = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in
+                             ((18, 6.5), (11.5, 14), (15.5, 14), (13.5, 19.5), (20.5, 11.5),
+                              (16.5, 11.5))])
+    p.setPen(QtCore.Qt.NoPen)
+    _fill(p, theme.CORAL)
+    p.drawPolygon(spark)
