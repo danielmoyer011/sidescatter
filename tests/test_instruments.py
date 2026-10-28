@@ -89,7 +89,7 @@ def test_unmixing_any_instrument(tmp_path, instrument):
         assert cos > 0.99, (instrument, ref.name, cos)
 
     unmixed = unmixing.unmix_sample(sample, um)
-    got = np.column_stack([unmixed.get_channel_events(unmixed.get_channel_index(f"F{i}") + 1, source="raw")
+    got = np.column_stack([unmixed.get_channel_events(unmixed.get_channel_index(f"F{i}-A") + 1, source="raw")
                            for i in range(M.shape[0])])
     # Abundances come back to within a few percent of the brightest signal.
     assert np.median(np.abs(got - true)) < 0.03 * true.max(), instrument

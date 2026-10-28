@@ -170,6 +170,7 @@ class Reference:
     signature: np.ndarray
     is_autofluorescence: bool = False
     source: str = ""  # file the signature came from
+    marker: str = ""  # antigen or target, written as the unmixed channel's $PnS
 
 
 @dataclass
@@ -179,10 +180,34 @@ class Unmixer:
     method: str = "ols"  # "ols" or "wls"
     background_var: np.ndarray = None
     fine_tune: np.ndarray = None
+    # "spectroflo": unmixed channels are named like SpectroFlo's ("BV421-A",
+    # autofluorescence "AF-A") with the marker as the description. "name":
+    # channels are the bare reference names, as in workspaces saved before.
+    channel_style: str = "spectroflo"
 
     @property
     def names(self):
         return [r.name for r in self.references]
+
+    def channel_labels(self):
+        """(PnN, PnS) of each unmixed channel, one per reference, never repeated."""
+        n_af = sum(r.is_autofluorescence for r in self.references)
+        labels, seen, af = [], set(), 0
+        for r in self.references:
+            if self.channel_style != "spectroflo":
+                pnn, pns = r.name, r.marker
+            elif r.is_autofluorescence:
+                af += 1
+                pnn, pns = ("AF-A" if n_af == 1 else f"AF{af}-A"), r.marker
+            else:
+                pnn = r.name if r.name.upper().endswith("-A") else f"{r.name}-A"
+                pns = r.marker
+            base, k = pnn, 2
+            while pnn in seen:
+                pnn, k = f"{base} {k}", k + 1
+            seen.add(pnn)
+            labels.append((pnn, pns))
+        return labels
 
     @property
     def matrix(self):
@@ -206,12 +231,14 @@ class Unmixer:
             "method": self.method,
             "references": [
                 {"name": r.name, "signature": r.signature.tolist(),
-                 "is_autofluorescence": r.is_autofluorescence, "source": r.source}
+                 "is_autofluorescence": r.is_autofluorescence, "source": r.source,
+                 "marker": r.marker}
                 for r in self.references
             ],
             "background_var": None if self.background_var is None
             else np.asarray(self.background_var).tolist(),
             "fine_tune": None if self.fine_tune is None else self.fine_tune.tolist(),
+            "channel_style": self.channel_style,
         }
 
     @classmethod
@@ -221,10 +248,12 @@ class Unmixer:
             method=d["method"],
             references=[
                 Reference(r["name"], np.asarray(r["signature"]),
-                          r.get("is_autofluorescence", False), r.get("source", ""))
+                          r.get("is_autofluorescence", False), r.get("source", ""),
+                          r.get("marker", ""))
                 for r in d["references"]
             ],
             background_var=None if d.get("background_var") is None
             else np.asarray(d["background_var"]),
             fine_tune=None if d.get("fine_tune") is None else np.asarray(d["fine_tune"]),
+            channel_style=d.get("channel_style", "name"),
         )
