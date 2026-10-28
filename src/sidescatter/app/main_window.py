@@ -20,7 +20,7 @@ from .layout_editor import LayoutWindow
 from .ribbon import Ribbon
 from .suggestion_box import SuggestionDialog
 from .table_editor import TableEditor
-from .unmixing_dialog import UnmixingDialog
+from .unmixing_tab import UnmixingTab
 from .workspace_panel import WorkspacePanel
 
 DEMO_DIR = Path(__file__).resolve().parents[1] / "demo_data" / "spectral"
@@ -42,7 +42,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel = WorkspacePanel(self.ws)
         self.panel.populationActivated.connect(self.open_graph)
         self.panel.changed.connect(self._changed)
-        self.setCentralWidget(self.panel)
+        self.unmix_tab = UnmixingTab(self.ws)
+        self.unmix_tab.unmixed.connect(self._after_unmix)
+        self.unmix_tab.changed.connect(self._changed)
+        self.pages = QtWidgets.QTabWidget()
+        self.pages.setObjectName("Pages")
+        self.pages.setDocumentMode(True)
+        self.pages.addTab(self.panel, icons.icon("new_workspace"), "Workspace")
+        self.pages.addTab(self.unmix_tab, icons.icon("unmixing"), "Unmixing")
+        self.setCentralWidget(self.pages)
         self.resize(1320, 840)
 
         self.setAcceptDrops(True)
@@ -96,8 +104,11 @@ class MainWindow(QtWidgets.QMainWindow):
                        "Graph\nWindow"),
             "layout": A("&Layout editor…", "layout_editor", self.open_layout_editor, "Ctrl+L",
                         "Layout\nEditor"),
-            "unmix": A("Spectral &unmixing…", "unmixing", self.open_unmixing, "Ctrl+U",
-                       "Spectral\nUnmixing…"),
+            "unmix": A("Spectral &unmixing", "unmixing", self.open_unmixing, "Ctrl+U",
+                       "Spectral\nUnmixing", tip="Open the Unmixing tab"),
+            "export_exp": A("Export &experiment…", "export", lambda: self.unmix_tab.export(), None,
+                            "Export\nExperiment…",
+                            tip="Write a zipped experiment with Raw and Unmixed folders, like SpectroFlo"),
             "table": A("&Table editor…", "table_editor", self.open_table_editor, "Ctrl+T",
                        "Table\nEditor"),
             "transform": A("Axis &transform…", "transform", self.edit_transform, None,
@@ -114,7 +125,7 @@ class MainWindow(QtWidgets.QMainWindow):
                        "export", None, "quit"]),
             ("&Edit", ["rename", "delete", "remove"]),
             ("&Workspace", ["add", "group", "keyword", None, "graph", "layout"]),
-            ("&Tools", ["unmix", "table", "transform"]),
+            ("&Tools", ["unmix", "export_exp", "table", "transform"]),
             ("&Help", ["suggest", None, "about", "license", "website"]),
         )
         # FlowJo 10 has no menu bar on Windows: the ribbon replaces it. macOS keeps
@@ -145,7 +156,7 @@ class MainWindow(QtWidgets.QMainWindow):
         page = r.add_tab("File")
         page.add_group("Workspace", [acts["new"], acts["open"], acts["save"], acts["save_as"]])
         page.add_group("Import", [acts["add"], acts["import"], acts["demo"]])
-        page.add_group("Export", [acts["export"]])
+        page.add_group("Export", [acts["export"], acts["export_exp"]])
         page.add_group("Application", [acts["quit"]])
 
         page = r.add_tab("Edit")
@@ -158,7 +169,7 @@ class MainWindow(QtWidgets.QMainWindow):
         page.add_group("Graphs", [acts["graph"], acts["layout"], acts["export"]])
 
         page = r.add_tab("Tools")
-        page.add_group("Spectral", [acts["unmix"]])
+        page.add_group("Spectral", [acts["unmix"], acts["export_exp"]])
         page.add_group("Statistics", [acts["table"]])
         page.add_group("Figures", [acts["layout"]])
 
@@ -201,6 +212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.set_workspace(ws)
         if self.layout_window is not None:
             self.layout_window.set_workspace(ws)
+        self.unmix_tab.set_workspace(ws)
         self.path, self.dirty = path, False
         self._update_title()
 
@@ -234,6 +246,12 @@ class MainWindow(QtWidgets.QMainWindow):
             event.ignore()
             return
         event.acceptProposedAction()
+        if self.pages.currentWidget() is self.unmix_tab:
+            skipped = self.unmix_tab.add_files(paths)
+            if skipped:
+                QtWidgets.QMessageBox.warning(
+                    self, "Not FCS files", f"Skipped {len(skipped)} item(s):\n\n" + "\n".join(skipped[:10]))
+            return
         self.add_dropped(paths)
 
     def add_dropped(self, paths):
@@ -341,6 +359,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def save(self):
         if self.path is None:
             return self.save_as()
+        self.unmix_tab.store()
         self._run(lambda: self.ws.save(self.path), "Saving")
         self.dirty = False
         self._update_title()
@@ -374,9 +393,14 @@ class MainWindow(QtWidgets.QMainWindow):
                       "Importing FlowJo workspace")
 
     def open_demo(self):
-        self.add_samples([str(DEMO_DIR / "PBMC_full_panel.fcs")])
-        controls = sorted(str(p) for p in (DEMO_DIR / "controls").glob("*.fcs"))
-        self.open_unmixing(controls)
+        """Load the demo controls and sample into a new experiment on the Unmixing tab."""
+        files = sorted(str(p) for p in (DEMO_DIR / "controls").glob("*.fcs"))
+        files.append(str(DEMO_DIR / "PBMC_full_panel.fcs"))
+        tab = self.unmix_tab
+        if tab.specs:
+            tab.new_setup("Demo")
+        tab.add_files(files)
+        self.open_unmixing()
 
     def export_plot(self):
         if self.graph is None or self.graph.sample_id is None:
@@ -390,12 +414,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ----- analysis actions ------------------------------------------------
 
-    def open_unmixing(self, control_paths=()):
-        dlg = UnmixingDialog(self.ws, self, control_paths=control_paths or ())
-        dlg.unmixed.connect(self._after_unmix)
-        dlg.exec()
+    def open_unmixing(self, paths=()):
+        self.pages.setCurrentWidget(self.unmix_tab)
+        if paths:
+            self.unmix_tab.add_files(paths)
 
     def _after_unmix(self, new_ids):
+        self.pages.setCurrentWidget(self.panel)
         self._changed()
         self.panel.select_group("Unmixed")
         if new_ids:

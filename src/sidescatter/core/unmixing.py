@@ -125,13 +125,15 @@ class ControlResult:
     n_negative: int
 
 
-def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True):
+def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None):
     """Build an Unmixer from control specs.
 
     Returns (unmixer, results) where results describes how each signature was
     derived so the UI can show it and let the user correct the gates.
+    samples: optional {path: loaded Sample}, filled in as files are loaded.
     """
-    samples = {}
+    specs = [s for s in specs if s.is_reference]
+    samples = {} if samples is None else samples
 
     def sample_for(path):
         if path not in samples:
