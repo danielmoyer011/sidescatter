@@ -18,6 +18,7 @@ from . import icons
 from .graph_view import GraphWindow
 from .layout_editor import LayoutWindow
 from .ribbon import Ribbon
+from .suggestion_box import SuggestionDialog
 from .table_editor import TableEditor
 from .unmixing_dialog import UnmixingDialog
 from .workspace_panel import WorkspacePanel
@@ -103,6 +104,8 @@ class MainWindow(QtWidgets.QMainWindow):
                            "Axis\nTransform…"),
             "license": A("&License…", "license", self.show_license, None, "License"),
             "about": A("&About Sidescatter", "about", self.about, None, "About"),
+            "suggest": A("&Suggestion box…", "suggest", self.open_suggestions, None,
+                         "Suggest an\nIdea…", "Send an idea or report a bug"),
             "website": A("Sidescatter on &GitHub", "website", self.open_website, None,
                          "Project\nWebsite"),
         }
@@ -112,7 +115,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("&Edit", ["rename", "delete", "remove"]),
             ("&Workspace", ["add", "group", "keyword", None, "graph", "layout"]),
             ("&Tools", ["unmix", "table", "transform"]),
-            ("&Help", ["about", "license", "website"]),
+            ("&Help", ["suggest", None, "about", "license", "website"]),
         )
         # FlowJo 10 has no menu bar on Windows: the ribbon replaces it. macOS keeps
         # its global menu bar, so the same actions go there too.
@@ -129,6 +132,7 @@ class MainWindow(QtWidgets.QMainWindow):
         r.app_button.setMenu(self._app_menu())
         for k in ("save", "add", "group", "table", "layout", "unmix", "demo"):
             r.add_quick(acts[k])
+        r.add_corner(acts["suggest"])
         r.add_corner(acts["license"])
         r.add_corner(acts["about"])
 
@@ -136,7 +140,7 @@ class MainWindow(QtWidgets.QMainWindow):
         home.add_group("Navigate", [acts["new"], acts["add"], acts["group"], acts["table"]])
         home.add_group("Experiment", [acts["keyword"], acts["graph"], acts["layout"], acts["demo"]])
         home.add_group("Cytometry", [acts["unmix"], acts["transform"], acts["import"]])
-        home.add_group("Help", [acts["website"], acts["about"], acts["license"]])
+        home.add_group("Help", [acts["suggest"], acts["website"], acts["about"], acts["license"]])
 
         page = r.add_tab("File")
         page.add_group("Workspace", [acts["new"], acts["open"], acts["save"], acts["save_as"]])
@@ -435,6 +439,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def show_license(self):
         LicenseDialog(self).exec()
+
+    def open_suggestions(self):
+        SuggestionDialog(self).exec()
 
     def open_website(self):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(WEBSITE))
