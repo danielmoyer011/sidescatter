@@ -89,3 +89,48 @@ class TransformAxis(pg.AxisItem):
         if self.xform is None:
             return super().tickStrings(values, scale, spacing)
         return [self._labels.get(round(v, 9), "") for v in values]
+
+
+def nice_step(span, target=5):
+    """A 1/2/5 x 10^n step that cuts span into about target pieces."""
+    if span <= 0 or not np.isfinite(span):
+        return 1.0
+    raw = span / target
+    mag = 10.0 ** np.floor(np.log10(raw))
+    for m in (1, 2, 5, 10):
+        if raw <= m * mag:
+            return float(m * mag)
+    return float(10 * mag)
+
+
+def ticks(xform, lo=0.0, hi=1.0):
+    """Ticks for a static plot axis: ([(display, label)], [minor display values]).
+
+    Same placement as TransformAxis: decades on log-like scales, round data
+    values on linear ones. xform None means the axis is already in data units
+    (histogram counts), running from lo to hi.
+    """
+    if xform is None or isinstance(xform, fk.transforms.LinearTransform):
+        rlo, rhi = (lo, hi) if xform is None else to_raw(xform, [lo, hi])
+        step = nice_step(rhi - rlo)
+        raws = np.arange(np.ceil(rlo / step) * step, rhi + step * 1e-6, step)
+        ds = raws if xform is None else to_display(xform, raws)
+        return [(float(d), _si_label(round(float(r), 9))) for d, r in zip(ds, raws)], []
+    majors, minors = [], []
+    for exp in range(0, 9):
+        for sign in (1, -1):
+            raw = sign * 10.0 ** exp if exp else 0.0
+            d = float(to_display(xform, [raw])[0])
+            if lo <= d <= hi and np.isfinite(d):
+                majors.append((d, _decade_label(raw)))
+            if exp:
+                for m in range(2, 10):
+                    dm = float(to_display(xform, [sign * m * 10.0 ** exp])[0])
+                    if lo <= dm <= hi and np.isfinite(dm):
+                        minors.append(dm)
+    majors.sort()
+    spaced = []
+    for d, label in majors:
+        if not spaced or d - spaced[-1][0] >= (hi - lo) * 0.035:
+            spaced.append((d, label))
+    return spaced, minors

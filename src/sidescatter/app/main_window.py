@@ -1,7 +1,8 @@
 """Main window, laid out like FlowJo 10: a ribbon on top and the workspace below.
 
 Double-clicking a sample or population opens it in its own graph window,
-where the gating tools sit right above the plot.
+where the gating tools sit right above the plot. The Layout Editor arranges
+plots into printable figures.
 """
 
 import sys
@@ -15,6 +16,7 @@ from ..core.fcs import find_fcs_files
 from ..core.workspace import ROOT, Workspace
 from . import icons
 from .graph_view import GraphWindow
+from .layout_editor import LayoutWindow
 from .ribbon import Ribbon
 from .table_editor import TableEditor
 from .unmixing_dialog import UnmixingDialog
@@ -34,6 +36,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ask_before_discard = True
         self.graphs = []   # open GraphWindows
         self.graph = None  # the GraphView used most recently
+        self.layout_window = None
 
         self.panel = WorkspacePanel(self.ws)
         self.panel.populationActivated.connect(self.open_graph)
@@ -90,6 +93,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Remove\nSamples"),
             "graph": A("Open &graph window", "rectangle", self.open_selected_graph, "Ctrl+Return",
                        "Graph\nWindow"),
+            "layout": A("&Layout editor…", "layout_editor", self.open_layout_editor, "Ctrl+L",
+                        "Layout\nEditor"),
             "unmix": A("Spectral &unmixing…", "unmixing", self.open_unmixing, "Ctrl+U",
                        "Spectral\nUnmixing…"),
             "table": A("&Table editor…", "table_editor", self.open_table_editor, "Ctrl+T",
@@ -105,7 +110,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("&File", ["new", "open", "save", "save_as", None, "add", "import", "demo", None,
                        "export", None, "quit"]),
             ("&Edit", ["rename", "delete", "remove"]),
-            ("&Workspace", ["add", "group", "keyword", None, "graph"]),
+            ("&Workspace", ["add", "group", "keyword", None, "graph", "layout"]),
             ("&Tools", ["unmix", "table", "transform"]),
             ("&Help", ["about", "license", "website"]),
         )
@@ -122,14 +127,14 @@ class MainWindow(QtWidgets.QMainWindow):
         acts = self.acts
         self.ribbon = r = Ribbon()
         r.app_button.setMenu(self._app_menu())
-        for k in ("save", "add", "group", "table", "unmix", "demo"):
+        for k in ("save", "add", "group", "table", "layout", "unmix", "demo"):
             r.add_quick(acts[k])
         r.add_corner(acts["license"])
         r.add_corner(acts["about"])
 
         home = r.add_tab("Sidescatter")
         home.add_group("Navigate", [acts["new"], acts["add"], acts["group"], acts["table"]])
-        home.add_group("Experiment", [acts["keyword"], acts["graph"], acts["demo"]])
+        home.add_group("Experiment", [acts["keyword"], acts["graph"], acts["layout"], acts["demo"]])
         home.add_group("Cytometry", [acts["unmix"], acts["transform"], acts["import"]])
         home.add_group("Help", [acts["website"], acts["about"], acts["license"]])
 
@@ -146,11 +151,12 @@ class MainWindow(QtWidgets.QMainWindow):
         page = r.add_tab("Workspace")
         page.add_group("Samples", [acts["add"], acts["demo"]])
         page.add_group("Groups", [acts["group"], acts["keyword"]])
-        page.add_group("Graphs", [acts["graph"], acts["export"]])
+        page.add_group("Graphs", [acts["graph"], acts["layout"], acts["export"]])
 
         page = r.add_tab("Tools")
         page.add_group("Spectral", [acts["unmix"]])
         page.add_group("Statistics", [acts["table"]])
+        page.add_group("Figures", [acts["layout"]])
 
         page = r.add_tab("Configure")
         page.add_group("Display", [acts["transform"]])
@@ -173,6 +179,12 @@ class MainWindow(QtWidgets.QMainWindow):
         for win in list(self.graphs):
             if win.view is not sender:
                 QtCore.QTimer.singleShot(0, win.view.refresh)
+        if self.layout_window is not None and sender is not self.layout_window:
+            QtCore.QTimer.singleShot(0, self.layout_window.refresh)
+
+    def _layouts_changed(self):
+        self.dirty = True
+        self._update_title()
 
     def _update_title(self):
         name = Path(self.path).name if self.path else "Untitled"
@@ -183,6 +195,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for win in list(self.graphs):
             win.close()
         self.panel.set_workspace(ws)
+        if self.layout_window is not None:
+            self.layout_window.set_workspace(ws)
         self.path, self.dirty = path, False
         self._update_title()
 
@@ -281,6 +295,31 @@ class MainWindow(QtWidgets.QMainWindow):
             self.graphs.remove(win)
         if self.graph is win.view:
             self.graph = self.graphs[-1].view if self.graphs else None
+
+    # ----- layout editor ---------------------------------------------------
+
+    def open_layout_editor(self):
+        """Open the Layout Editor (one per workspace window), or bring it forward."""
+        if self.layout_window is None:
+            win = LayoutWindow(self.ws, self, current_population=self.panel.selected,
+                               current_group=self.panel.current_group)
+            win.axes_for = self._graph_axes
+            win.changed.connect(self._layouts_changed)
+            win.graphRequested.connect(self.open_graph)
+            self.layout_window = win
+        win = self.layout_window
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        return win
+
+    def _graph_axes(self, sample_id, name, parent_path):
+        """(x, y, plot type) of an open graph window showing this population, if any."""
+        for win in self.graphs:
+            v = win.view
+            if v.sample_id == sample_id and v.population == (name, tuple(parent_path)):
+                return v.x_combo.currentData(), v.y_combo.currentData(), v.type_combo.currentText()
+        return None
 
     # ----- file actions ----------------------------------------------------
 

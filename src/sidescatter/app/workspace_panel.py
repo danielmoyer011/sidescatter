@@ -4,12 +4,17 @@ Laid out like FlowJo 10's workspace window: Group | Size | Role, then
 Name | Statistic | #Cells, with a splitter between the two.
 """
 
+import json
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import theme
 from ..core.workspace import ALL_SAMPLES, ROOT
 
 ROLE = QtCore.Qt.UserRole
+# Dragging populations from the sample table (e.g. onto a layout) carries this JSON:
+# a list of {"sample_id": ..., "population": [full gate path from "root"]}.
+POPULATION_MIME = "application/x-sidescatter-populations"
 
 
 class WorkspacePanel(QtWidgets.QWidget):
@@ -41,6 +46,7 @@ class WorkspacePanel(QtWidgets.QWidget):
         self.tree.setUniformRowHeights(True)
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.tree.setDragDropMode(QtWidgets.QAbstractItemView.DragOnly)
         header = self.tree.header()
         header.setStretchLastSection(False)
         header.setDefaultAlignment(QtCore.Qt.AlignCenter)
@@ -252,6 +258,19 @@ class SampleTree(QtWidgets.QTreeWidget):
     """The sample table, with Sidescatter's answer to FlowJo's licence watermark."""
 
     WATERMARK = ("No License, No Problem:", "Use Any Files You Like")
+
+    def mimeTypes(self):
+        return [POPULATION_MIME]
+
+    def mimeData(self, items):
+        pops = []
+        for it in items:
+            sid, name, parent = it.data(0, ROLE)
+            path = list(parent) + ([name] if name is not None else [])
+            pops.append({"sample_id": sid, "population": path})
+        mime = QtCore.QMimeData()
+        mime.setData(POPULATION_MIME, json.dumps(pops).encode())
+        return mime
 
     def paintEvent(self, event):
         super().paintEvent(event)

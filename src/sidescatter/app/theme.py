@@ -24,6 +24,7 @@ ACCENT_DARK = "#4646B8"
 ACCENT_SOFT = "#ECECFB"  # selected rows, hovered buttons
 TEAL = "#14A3A3"
 CORAL = "#F26D5B"        # "add" marks on icons
+CANVAS = "#E4E7EF"       # grey desk behind the pages in the Layout Editor
 GATE = "#1D2130"         # gate outlines: dark ink reads on every density colour
 
 # Density ramp for pseudocolour plots (graph_view turns it into a colour map):
@@ -99,6 +100,10 @@ QToolTip {{
 }}
 #RibbonButton:pressed, #QuickButton:pressed {{
     background: #DCDCF7;
+}}
+#RibbonButton:checked, #QuickButton:checked {{
+    background: {ACCENT_SOFT};
+    border-color: {ACCENT};
 }}
 #RibbonButton:disabled {{
     color: {FAINT};
@@ -246,6 +251,18 @@ QPushButton:disabled {{
 #GraphHint {{
     color: {MUTED};
     font-size: 9pt;
+}}
+
+/* ----- layout editor ----- */
+#PanelCaption {{
+    color: {MUTED};
+    font-size: 9pt;
+    font-weight: 600;
+    background: {WINDOW};
+}}
+#LayoutInspector {{
+    background: {SURFACE};
+    border-left: 1px solid {BORDER};
 }}
 
 /* ----- status bar ----- */
