@@ -166,3 +166,86 @@ def test_changing_scale_keeps_ellipse_on_same_events(window, view):
     before = window.ws.count(SID, "Oval")
     window.ws.set_transform("FSC-A", fk.transforms.LinearTransform(param_t=262144 * 16, param_a=0))
     assert window.ws.count(SID, "Oval") == pytest.approx(before, rel=0.02)
+
+
+@pytest.fixture
+def drawing(window, view, qtbot, monkeypatch):
+    """Start a polygon on a shown graph window; returns (at, viewport)."""
+    from PySide6 import QtWidgets
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getText", lambda *a, **k: ("Poly", True))
+    view.parentWidget().show()
+    qtbot.waitExposed(view.parentWidget())
+    view.start_gate("polygon")
+    vb = view.plot.getViewBox()
+
+    def at(x, y):
+        return view.plot.mapFromScene(vb.mapViewToScene(QtCore.QPointF(x, y)))
+
+    return at, view.plot.viewport()
+
+
+def _hover(vp, pos):
+    """Send a plain mouse move; qtbot.mouseMove is unreliable once another test's window closed."""
+    from PySide6 import QtGui, QtWidgets
+    pos = QtCore.QPointF(pos)
+    ev = QtGui.QMouseEvent(QtCore.QEvent.MouseMove, pos, vp.mapToGlobal(pos), QtCore.Qt.NoButton,
+                           QtCore.Qt.NoButton, QtCore.Qt.NoModifier)
+    QtWidgets.QApplication.sendEvent(vp, ev)
+
+
+def _corners(qtbot, vp, at, pts):
+    for x, y in pts:
+        _hover(vp, at(x, y))
+        qtbot.mouseClick(vp, QtCore.Qt.LeftButton, pos=at(x, y))
+
+
+TRIANGLE = [(0.2, 0.2), (0.7, 0.2), (0.45, 0.7)]
+
+
+def test_polygon_closes_on_a_click_near_the_first_corner(window, view, qtbot, drawing):
+    at, vp = drawing
+    _corners(qtbot, vp, at, TRIANGLE)
+    near = at(*TRIANGLE[0]) + QtCore.QPoint(6, -5)  # inside the snap radius, not on the corner
+    _hover(vp, near)
+    assert len(view._snap_ring.data) == 1
+    qtbot.mouseClick(vp, QtCore.Qt.LeftButton, pos=near)
+    gate = window.ws.get_gate("Poly", ROOT)
+    assert len(gate.vertices) == 3
+    assert view._draw_mode is None
+
+
+def test_click_outside_snap_radius_adds_a_corner(window, view, qtbot, drawing):
+    at, vp = drawing
+    _corners(qtbot, vp, at, TRIANGLE + [(0.25, 0.4)])
+    assert view._draw_mode == "polygon" and len(view._points) == 4
+
+
+def test_right_click_closes_polygon_but_cancels_when_too_few_corners(window, view, qtbot,
+                                                                     drawing):
+    at, vp = drawing
+    _corners(qtbot, vp, at, TRIANGLE[:2])
+    qtbot.mouseClick(vp, QtCore.Qt.RightButton, pos=at(0.5, 0.5))
+    assert view._draw_mode is None and window.ws.children(ROOT) == []
+    view.start_gate("polygon")
+    _corners(qtbot, vp, at, TRIANGLE)
+    qtbot.mouseClick(vp, QtCore.Qt.RightButton, pos=at(0.9, 0.9))
+    assert len(window.ws.get_gate("Poly", ROOT).vertices) == 3
+
+
+def test_enter_closes_and_backspace_removes_last_corner(window, view, qtbot, drawing):
+    at, vp = drawing
+    _corners(qtbot, vp, at, TRIANGLE + [(0.9, 0.9)])
+    qtbot.keyClick(view, QtCore.Qt.Key_Backspace)
+    assert len(view._points) == 3
+    qtbot.keyClick(view, QtCore.Qt.Key_Return)
+    gate = window.ws.get_gate("Poly", ROOT)
+    assert [v[0] for v in gate.vertices] == pytest.approx([p[0] for p in TRIANGLE], abs=0.02)
+
+
+def test_closing_edge_preview_follows_the_mouse(view, qtbot, drawing):
+    at, vp = drawing
+    _corners(qtbot, vp, at, TRIANGLE[:2])
+    _hover(vp, at(0.5, 0.8))
+    xs, ys = view._close_preview.getData()
+    assert xs[-1] == pytest.approx(0.2, abs=0.02) and ys[-1] == pytest.approx(0.2, abs=0.02)
+    assert len(view._snap_ring.data) == 0

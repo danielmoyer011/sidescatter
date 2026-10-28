@@ -6,6 +6,7 @@ picker running up the left axis and the X picker under the plot.
 """
 
 import math
+import time
 
 import flowkit as fk
 import numpy as np
@@ -21,13 +22,18 @@ PSEUDOCOLOR = pg.ColorMap(*zip(*theme.PSEUDOCOLOR_STOPS))
 GATE_PEN = pg.mkPen(theme.GATE, width=1.6)
 GATE_PEN_HOVER = pg.mkPen(theme.ACCENT, width=2.2)
 DRAW_PEN = pg.mkPen(theme.ACCENT, width=1.6, style=QtCore.Qt.DashLine)
+CLOSE_PEN = pg.mkPen(QtGui.QColor(theme.ACCENT).lighter(150), width=1.2, style=QtCore.Qt.DotLine)
+SNAP_RADIUS_PX = 10  # a click this close to a polygon's first corner closes it
+SNAP_FILL = QtGui.QColor(theme.ACCENT)
+SNAP_FILL.setAlpha(60)
 PLOT_TYPES = ("Pseudocolor", "Dot plot", "Contour", "Histogram")
 
 # (mode, tooltip, needs a histogram). None separates the 2D and 1D tools.
 GATE_TOOLS = (
     ("pointer", "Select and edit gates (Esc)", None),
     ("rectangle", "Rectangle gate: drag a box", False),
-    ("polygon", "Polygon gate: click the corners, double-click to close", False),
+    ("polygon", "Polygon gate: click the corners, then click the first corner, "
+                "double-click, right-click or press Enter to close", False),
     ("ellipse", "Ellipse gate: drag its bounding box, then rotate with the handle", False),
     ("quadrant", "Quadrant gate: click where the quadrants meet", False),
     ("freehand", "Freehand gate: hold the mouse button and trace around the cells", False),
@@ -39,7 +45,8 @@ HINTS = {
     "pointer": "Pick a gating tool above the plot. Drag a gate to move it, double-click inside "
                "a gate to open that population, right-click a gate to rename or delete it.",
     "rectangle": "Drag a box around the population.",
-    "polygon": "Click to add corners; double-click to close the polygon. Esc cancels.",
+    "polygon": "Click to add corners. Close it by clicking the first corner, double-clicking, "
+               "right-clicking or pressing Enter. Backspace removes the last corner; Esc cancels.",
     "ellipse": "Drag the ellipse's bounding box. Rotate it afterwards with its round handle.",
     "quadrant": "Click where the four quadrants should meet.",
     "freehand": "Hold the mouse button down and trace around the population.",
@@ -64,6 +71,10 @@ class GraphView(QtWidgets.QWidget):
         self._rois = []
         self._points = []
         self._preview = None
+        self._close_preview = None  # dotted edge from the mouse back to the first corner
+        self._snap_ring = None      # ring on the first corner while a click would close
+        self._mouse_pt = None
+        self._closed_at = 0.0
         self._dragging = False
         self._draw_mode = None
 
@@ -180,6 +191,14 @@ class GraphView(QtWidgets.QWidget):
         layout.addWidget(self.status)
 
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self, self.cancel_gate)
+        # Only live while a polygon is being drawn, so they never steal keys from text fields.
+        self._polygon_keys = [
+            QtGui.QShortcut(QtGui.QKeySequence(key), self, slot)
+            for key, slot in ((QtCore.Qt.Key_Return, self.close_polygon),
+                              (QtCore.Qt.Key_Enter, self.close_polygon),
+                              (QtCore.Qt.Key_Backspace, self.undo_polygon_point))]
+        for sc in self._polygon_keys:
+            sc.setEnabled(False)
 
     def _nav_button(self, text, tip, step):
         b = QtWidgets.QToolButton()
@@ -248,7 +267,7 @@ class GraphView(QtWidgets.QWidget):
     def refresh(self):
         self.plot.clear()
         self._rois = []
-        self._preview = None
+        self._preview = self._close_preview = self._snap_ring = None
         if self.sample_id is not None and self.sample_id not in self.ws.samples:
             self.sample_id = None
             self.title.setText("")
@@ -563,6 +582,8 @@ class GraphView(QtWidgets.QWidget):
         'freehand', 'range' or 'bisector'. 'pointer' stops drawing."""
         self._clear_preview()
         self._points, self._dragging = [], False
+        for sc in self._polygon_keys:
+            sc.setEnabled(mode == "polygon" and self.sample_id is not None)
         if mode == "pointer" or self.sample_id is None:
             self._draw_mode = None
             self.tools["pointer"].setChecked(True)
@@ -585,6 +606,31 @@ class GraphView(QtWidgets.QWidget):
         if self._draw_mode is not None:
             self.start_gate("pointer")
 
+    def close_polygon(self):
+        """Join the last corner to the first and make the gate. Needs 3 or more corners."""
+        if self._draw_mode == "polygon" and len(self._points) >= 3:
+            self._closed_at = time.monotonic()
+            self.create_gate("polygon", self._points)
+            return True
+        return False
+
+    def undo_polygon_point(self):
+        if self._draw_mode != "polygon" or not self._points:
+            return
+        self._points.pop()
+        if self._points and self._mouse_pt is not None:
+            self._update_preview(self._mouse_pt)
+        else:
+            self._clear_preview()
+
+    def _near_first_point(self, widget_pos):
+        """True when the mouse is within SNAP_RADIUS_PX screen pixels of the first corner."""
+        if len(self._points) < 3:
+            return False
+        vb = self.plot.getViewBox()
+        first = self.plot.mapFromScene(vb.mapViewToScene(QtCore.QPointF(*self._points[0])))
+        return math.hypot(widget_pos.x() - first.x(), widget_pos.y() - first.y()) <= SNAP_RADIUS_PX
+
     def _set_rois_enabled(self, on):
         for roi in self._rois:
             roi.setAcceptedMouseButtons(QtCore.Qt.LeftButton if on else QtCore.Qt.NoButton)
@@ -596,17 +642,23 @@ class GraphView(QtWidgets.QWidget):
         return [float(np.clip(p.x(), 0, 1)), float(np.clip(p.y(), 0, 1))]
 
     def eventFilter(self, obj, event):
-        if obj is not self.plot.viewport() or self._draw_mode is None:
+        if obj is not self.plot.viewport():
             return super().eventFilter(obj, event)
         t = event.type()
+        if (t == QtCore.QEvent.MouseButtonDblClick and self._draw_mode is None and time.monotonic()
+                - self._closed_at < QtWidgets.QApplication.doubleClickInterval() / 1000):
+            return True  # the second half of a click that closed a polygon; don't open the gate
+        if self._draw_mode is None:
+            return super().eventFilter(obj, event)
         mode = self._draw_mode
         if t == QtCore.QEvent.MouseButtonDblClick and event.button() == QtCore.Qt.LeftButton:
-            if mode == "polygon" and len(self._points) >= 3:
-                self.create_gate("polygon", self._points)
+            if mode == "polygon":
+                self.close_polygon()
             return True
         if t == QtCore.QEvent.MouseButtonPress:
             if event.button() == QtCore.Qt.RightButton:
-                self.cancel_gate()
+                if not (mode == "polygon" and self.close_polygon()):
+                    self.cancel_gate()
                 return True
             if event.button() != QtCore.Qt.LeftButton:
                 return True
@@ -614,9 +666,12 @@ class GraphView(QtWidgets.QWidget):
             if mode in ("quadrant", "bisector"):
                 self.create_gate(mode, [pt])
             elif mode == "polygon":
+                if self._near_first_point(event.position()):
+                    self.close_polygon()
+                    return True
                 if not self._points or self._points[-1] != pt:
                     self._points.append(pt)
-                self._update_preview(pt)
+                self._update_preview(pt, event.position())
             else:
                 self._points, self._dragging = [pt], True
             return True
@@ -624,8 +679,9 @@ class GraphView(QtWidgets.QWidget):
             pt = self._view_point(event.position())
             if self._dragging and mode == "freehand":
                 self._points.append(pt)
+            self._mouse_pt = pt
             if self._dragging or (mode == "polygon" and self._points):
-                self._update_preview(pt)
+                self._update_preview(pt, event.position())
             return True
         if t == QtCore.QEvent.MouseButtonRelease and event.button() == QtCore.Qt.LeftButton:
             if not self._dragging:
@@ -647,13 +703,33 @@ class GraphView(QtWidgets.QWidget):
         return super().eventFilter(obj, event)
 
     def _clear_preview(self):
-        if self._preview is not None:
-            self.plot.removeItem(self._preview)
-            self._preview = None
+        for attr in ("_preview", "_close_preview", "_snap_ring"):
+            item = getattr(self, attr)
+            if item is not None:
+                self.plot.removeItem(item)
+                setattr(self, attr, None)
 
-    def _update_preview(self, pt):
+    def _update_polygon_extras(self, pt, widget_pos):
+        """The dotted closing edge and, when a click would close, the ring on the first corner."""
+        if self._close_preview is None:
+            self._close_preview = pg.PlotDataItem(pen=CLOSE_PEN)
+            self._snap_ring = pg.ScatterPlotItem(size=2 * SNAP_RADIUS_PX, symbol="o",
+                                                 pen=pg.mkPen(theme.ACCENT, width=2),
+                                                 brush=pg.mkBrush(SNAP_FILL))
+            self.plot.addItem(self._close_preview)
+            self.plot.addItem(self._snap_ring)
+        first = self._points[0]
+        snap = widget_pos is not None and self._near_first_point(widget_pos)
+        if len(self._points) >= 2 and not snap:
+            self._close_preview.setData([pt[0], first[0]], [pt[1], first[1]])
+        else:
+            self._close_preview.setData([], [])
+        self._snap_ring.setData([first[0]] if snap else [], [first[1]] if snap else [])
+
+    def _update_preview(self, pt, widget_pos=None):
         mode, pts = self._draw_mode, self._points
         if mode == "polygon":
+            self._update_polygon_extras(pt, widget_pos)
             xs, ys = zip(*(pts + [pt]))
         elif mode == "freehand":
             xs, ys = zip(*pts)
