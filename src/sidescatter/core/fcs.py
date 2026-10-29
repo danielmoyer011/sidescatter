@@ -7,6 +7,7 @@ from pathlib import Path
 
 import flowkit as fk
 import numpy as np
+import pandas as pd
 
 # Full-spectrum instruments have 20+ fluorescence detectors: Cytek Aurora and
 # Northern Lights 14-64 (1-5 lasers), BD FACSDiscover and Symphony A5 SE 48-78,
@@ -21,6 +22,8 @@ DETECTOR_NAME = re.compile(
     rf"^({_LASER}\s?\d{{1,2}}|{_LASER}\s?\d{{3}}(/\d+)?|\d{{3}}[-_/ ]\d{{3}}(/\d+)?|CH\s?\d+)(-[AH])?$",
     re.IGNORECASE)
 _SCATTER = ("FSC", "SSC", "BSC", "FS ", "SS ", "FS-", "SS-", "LIGHTLOSS", "LIGHT LOSS")
+# Channels Sidescatter computes itself (UMAP, tSNE, PCA, FlowSOM); see core.highdim.
+DERIVED_PREFIXES = ("UMAP-", "TSNE-", "PCA-", "FLOWSOM")
 _OTHER = ("EVENT", "WIDTH", "SORT", "INDEX", "SAMPLE", "TRIGGER", "BEAD", "GATE",
           "LASER", "DROP", "WELL", "PLATE", "IMAGE", "DIAMETER")
 
@@ -30,7 +33,7 @@ class Channel:
     index: int
     pnn: str
     pns: str
-    kind: str  # "time", "scatter", "fluorescence"
+    kind: str  # "time", "scatter", "fluorescence", "derived" or "other"
 
     @property
     def label(self):
@@ -41,6 +44,8 @@ def _channel_kind(pnn):
     name = pnn.upper()
     if name.startswith("TIME"):
         return "time"
+    if name.startswith(DERIVED_PREFIXES):
+        return "derived"
     if name.startswith(_SCATTER) or "SCATTER" in name:
         return "scatter"
     if name.startswith(_OTHER) or name.endswith("-W"):
@@ -135,6 +140,46 @@ def raw_events(sample, channel_list=None):
     if channel_list is None:
         return events
     return events[:, [c.index for c in channel_list]]
+
+
+def append_channels(sample, names, columns, pns=None):
+    """Add computed channels to a loaded sample, in place.
+
+    columns: one array of sample.event_count values per name. The values go
+    into the raw events and, when the sample is compensated, the compensated
+    events too (computed channels are never compensated).
+    """
+    pns = list(pns) if pns is not None else [""] * len(names)
+    block = np.column_stack([np.asarray(c, dtype=np.float64) for c in columns])
+    sample._raw_events = np.hstack([sample._raw_events, block])
+    if sample._comp_events is not None:
+        sample._comp_events = np.hstack([sample._comp_events, block])
+    sample._transformed_events = None
+    start = len(sample.pnn_labels)
+    rows = [{"channel_number": start + i + 1, "pnn": n, "pns": s, "pne": (0.0, 0.0), "png": 1.0,
+             "pnr": float(np.nanmax(np.abs(c))) if np.isfinite(c).any() else 1.0}
+            for i, (n, s, c) in enumerate(zip(names, pns, block.T))]
+    sample.channels = pd.concat([sample.channels, pd.DataFrame(rows, index=range(start, start + len(rows)))])
+    sample.pnn_labels = list(sample.pnn_labels) + list(names)
+    sample.pns_labels = list(sample.pns_labels) + list(pns)
+
+
+def drop_channels(sample, names):
+    """Remove channels (added by append_channels) from a loaded sample, in place."""
+    drop = [i for i, n in enumerate(sample.pnn_labels) if n in set(names)]
+    if not drop:
+        return
+    if any(_channel_kind(sample.pnn_labels[i]) != "derived" for i in drop):
+        raise ValueError("only computed channels can be removed")
+    keep = [i for i in range(len(sample.pnn_labels)) if i not in drop]
+    sample._raw_events = sample._raw_events[:, keep]
+    if sample._comp_events is not None:
+        sample._comp_events = sample._comp_events[:, keep]
+    sample._transformed_events = None
+    sample.channels = sample.channels.iloc[keep].reset_index(drop=True)
+    sample.channels["channel_number"] = range(1, len(keep) + 1)
+    sample.pnn_labels = [sample.pnn_labels[i] for i in keep]
+    sample.pns_labels = [sample.pns_labels[i] for i in keep]
 
 
 def keywords(sample):

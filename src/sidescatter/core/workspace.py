@@ -15,7 +15,7 @@ from pathlib import Path
 import flowkit as fk
 import numpy as np
 
-from . import fcs, serialize, stats
+from . import fcs, highdim, serialize, stats
 from .layout import Layout, rename_population
 from .spectral import Unmixer
 
@@ -46,6 +46,7 @@ class Workspace:
         self.experiments = []    # Unmixing tab setups, as experiment.Setup.to_dict() dicts
         self.compensation = {}   # sample_id -> "FCS" (acquisition spillover) or "uncompensated"
         self.layouts = []        # Layout Editor pages (core.layout.Layout)
+        self.analyses = []       # UMAP/tSNE/FlowSOM runs (core.highdim.Analysis)
         self.revision = 0        # bumped whenever gating results may have changed
         self._results = {}       # sample_id -> fk GatingResults
         self._display_cache = {}
@@ -559,13 +560,136 @@ class Workspace:
                 fresh.id = sid
                 with self._lock:
                     self.samples[sid] = fresh
+                    self._attach_derived(sid)
                     self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sid}
                 self.invalidate(sid)
+
+    # ----- UMAP, tSNE, PCA and FlowSOM --------------------------------------
+
+    def new_analysis_settings(self, population=None, parent_path=ROOT, samples=()):
+        """Settings for a new analysis with a unique name and channel names."""
+        n = len(self.analyses) + 1
+        names = {a.settings.name for a in self.analyses}
+        while f"Analysis {n}" in names:
+            n += 1
+        taken = {c for a in self.analyses for c in a.settings.all_output_channels()}
+        st = highdim.Settings(name=f"Analysis {n}", population=population,
+                              parent_path=tuple(parent_path), samples=list(samples))
+        k = 1
+        while taken & set(highdim.Settings(suffix=st.suffix, methods=list(highdim.METHODS))
+                           .all_output_channels()):
+            k += 1
+            st.suffix = f" ({k})"
+        if st.samples:
+            st.channels = highdim.default_channels(self.channels(st.samples[0]))
+        return st
+
+    def analysis(self, name):
+        return next((a for a in self.analyses if a.settings.name == name), None)
+
+    def add_analysis(self, result):
+        """Add a finished analysis: channels on each sample, metacluster gates, and
+        a concatenated sample of the events the map was built from.
+
+        Re-running an analysis (same name) replaces it.
+        """
+        st = result.settings
+        if self.analysis(st.name) is not None:
+            self.remove_analysis(st.name)
+        record = highdim.Analysis(st, result.values, result.sampled, result.meta_medians,
+                                  result.meta_counts)
+        self.analyses.append(record)
+        for name, xform in record.transforms().items():
+            self.strategy.transformations[name] = xform
+        for sid in st.samples:
+            self._attach_derived(sid)
+        if st.meta_channel:
+            for k in range(1, st.n_meta + 1):
+                self.strategy.add_gate(record.metacluster_gate(k, self.transform(st.meta_channel)),
+                                       st.population_path)
+        self._add_concatenated(record)
+        self.add_group(st.name, [*st.samples, record.concatenated_id])
+        self.invalidate()
+        return record
+
+    def remove_analysis(self, name):
+        """Remove an analysis with its channels, gates (and anything gated under them),
+        concatenated sample and group."""
+        record = self.analysis(name)
+        if record is None:
+            return
+        st = record.settings
+        added = set(st.all_output_channels())
+        for gname, parent in reversed(self.population_paths()):
+            try:
+                gate = self.get_gate(gname, parent)
+            except Exception:
+                continue  # removed with its parent already
+            if _gate_channels(gate) & added:
+                self.strategy.remove_gate(gname, gate_path=parent)
+        if record.concatenated_id in self.samples:
+            self.remove_sample(record.concatenated_id)
+        for sid in st.samples:
+            if sid in self.samples:
+                fcs.drop_channels(self.samples[sid], added)
+                self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sid}
+        for ch in added:
+            self.strategy.transformations.pop(ch, None)
+        if self.groups.get(name) is not None:
+            del self.groups[name]
+        self.analyses.remove(record)
+        self.invalidate()
+
+    def _attach_derived(self, sample_id):
+        """Put every analysis's channels on a (re)loaded sample."""
+        sample = self.samples[sample_id]
+        for record in self.analyses:
+            cols = record.values.get(sample_id)
+            if not cols:
+                continue
+            names = [n for n in cols if n not in sample.pnn_labels]
+            if names and len(cols[names[0]]) == sample.event_count:
+                fcs.append_channels(sample, names, [cols[n] for n in names])
+        self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sample_id}
+
+    def _add_concatenated(self, record):
+        """A sample of the events each map was built from, with a Sample ID channel."""
+        st = record.settings
+        sids = [s for s in st.samples if s in self.samples]
+        if not sids:
+            return
+        first = self.samples[sids[0]]
+        common = [c for c in first.pnn_labels
+                  if all(c in self.samples[s].pnn_labels for s in sids)]
+        derived = set(st.all_output_channels())
+        common = [c for c in common if c not in derived and fcs._channel_kind(c) != "derived"]
+        blocks = []
+        for i, sid in enumerate(sids):
+            sample = self.samples[sid]
+            rows = record.sampled[sid]
+            ev = self.compensated_events(sid)
+            cols = [ev[rows, sample.get_channel_index(c)] for c in common]
+            cols.append(np.full(len(rows), i + 1, dtype=float))
+            cols += [record.values[sid][c][rows] for c in st.all_output_channels()]
+            blocks.append(np.column_stack(cols))
+        pns = dict(zip(first.pnn_labels, first.pns_labels))
+        names = common + [highdim.SAMPLE_ID] + st.all_output_channels()
+        keywords = {k: v for k, v in first.get_metadata().items() if k.lower() not in ("spill", "spillover")}
+        keywords["$FIL"] = record.concatenated_id
+        sample = fcs.load_sample(np.vstack(blocks), record.concatenated_id, names,
+                                 [pns.get(n, "") for n in common] + ["; ".join(sids)[:200]] +
+                                 [""] * len(st.all_output_channels()), keywords)
+        # Values are compensated already, and the gates' "FCS" compensation
+        # means "none" for a file without a spillover keyword.
+        self.strategy.transformations.setdefault(
+            highdim.SAMPLE_ID, fk.transforms.LinearTransform(param_t=len(sids) + 1, param_a=0.0))
+        self.add_sample(sample, {"concatenated": st.name})
+        self.compensation[sample.id] = "uncompensated"
 
     # ----- save / load -----------------------------------------------------
 
     def save(self, path):
-        write_document(path, self.to_document())
+        write_document(path, self.to_document(), self.analyses)
 
     def to_document(self):
         """Everything a workspace file holds, as plain JSON-ready data. Quick, and a
@@ -585,6 +709,7 @@ class Workspace:
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
             "layouts": [lay.to_dict() for lay in self.layouts],
             "experiments": self.experiments,
+            "analyses": [a.to_dict() for a in self.analyses],
         })
 
     @classmethod
@@ -601,12 +726,14 @@ class Workspace:
             ws.strategy.add_transform(name, serialize.transform_from_dict(d))
         ws.unmixers = {k: Unmixer.from_dict(v) for k, v in doc["unmixers"].items()}
 
-        pending = []
+        pending, concatenated = [], []
         total = max(len(doc["samples"]), 1)
         step = 0
         for s in doc["samples"]:
             src = s["source"]
-            if "path" in src:
+            if "concatenated" in src:
+                concatenated.append(s)
+            elif "path" in src:
                 if progress:
                     progress(step / total, f"Loading {Path(src['path']).name}")
                 step += 1
@@ -628,6 +755,15 @@ class Workspace:
             sample.id = s["id"]
             ws.add_sample(sample, src)
 
+        with zipfile.ZipFile(path) as zf:
+            ws.analyses = [highdim.Analysis.from_dict(d, zf.read(f"analyses/{i}.npz"))
+                           for i, d in enumerate(doc.get("analyses", []))]
+        for sid in ws.samples:
+            ws._attach_derived(sid)
+        for s in concatenated:
+            record = ws.analysis(s["source"]["concatenated"])
+            if record is not None:
+                ws._add_concatenated(record)
         ws.groups = {k: list(v) for k, v in doc["groups"].items()}
         ws.experiments = doc.get("experiments", [])
         for g in doc["gates"]:
@@ -772,11 +908,13 @@ def _unique(name, taken):
     return out
 
 
-def write_document(path, doc):
-    """Write a workspace document (from Workspace.to_document) to a .ssw file.
-    Touches no workspace, so it can run on a worker thread."""
+def write_document(path, doc, analyses=()):
+    """Write a workspace document (from Workspace.to_document) and its analyses'
+    arrays to a .ssw file. Touches no workspace, so it can run on a worker thread."""
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("workspace.json", json.dumps(doc, indent=1))
+        for i, a in enumerate(analyses):
+            zf.writestr(f"analyses/{i}.npz", a.arrays_bytes())
 
 
 def default_tops(sample):

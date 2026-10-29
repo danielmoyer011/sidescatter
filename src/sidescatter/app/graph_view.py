@@ -32,6 +32,9 @@ SNAP_RADIUS_PX = 10  # a click this close to a polygon's first corner closes it
 SNAP_FILL = QtGui.QColor(theme.ACCENT)
 SNAP_FILL.setAlpha(60)
 PLOT_TYPES = ("Pseudocolor", "Dot plot", "Contour", "Histogram", "Spectrum")
+DENSITY = "Density"
+# Colour scale for "colour by channel" (low to high), as on FlowSOM/UMAP heat plots.
+HEAT = pg.ColorMap([0.0, 0.35, 0.65, 1.0], ["#2B2D6E", "#3E7FC1", "#7CCBA2", "#F8E16C"])
 
 # (mode, tooltip, needs a histogram). None separates the 2D and 1D tools.
 GATE_TOOLS = (
@@ -103,6 +106,11 @@ class GraphView(QtWidgets.QWidget):
         self.transform_button.setIconSize(QtCore.QSize(20, 20))
         self.transform_button.setToolTip("Axis transform (biexponential, log, linear…)")
         self.transform_button.clicked.connect(lambda: self.transformRequested.emit(self))
+        self.colour_combo = QtWidgets.QComboBox()
+        self.colour_combo.setToolTip("Colour events by density, or by another channel's intensity "
+                                     "(median on its display scale), as on a UMAP heat plot")
+        self.colour_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.colour_combo.setMinimumContentsLength(8)
 
         header = QtWidgets.QWidget()
         header.setObjectName("GraphHeader")
@@ -117,6 +125,7 @@ class GraphView(QtWidgets.QWidget):
         hl.addWidget(self.count_label)
         hl.addStretch()
         hl.addWidget(self.transform_button)
+        hl.addWidget(self.colour_combo)
         hl.addWidget(self.type_combo)
 
         # ----- gating tools, right above the plot ---------------------------
@@ -158,7 +167,7 @@ class GraphView(QtWidgets.QWidget):
         for combo in (self.x_combo, self.y_combo):
             combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
             combo.setMinimumContentsLength(10)
-        for combo in (self.x_combo, self.y_combo, self.type_combo):
+        for combo in (self.x_combo, self.y_combo, self.type_combo, self.colour_combo):
             combo.currentIndexChanged.connect(self.refresh)
 
         self.x_axis = TransformAxis("bottom")
@@ -266,6 +275,14 @@ class GraphView(QtWidgets.QWidget):
     def _fill_channel_combos(self):
         chans = self.ws.channels(self.sample_id)
         keep_x, keep_y = self.x_combo.currentData(), self.y_combo.currentData()
+        keep_colour = self.colour_combo.currentData()
+        self.colour_combo.blockSignals(True)
+        self.colour_combo.clear()
+        self.colour_combo.addItem(DENSITY, None)
+        for c in chans:
+            self.colour_combo.addItem(c.label, c.pnn)
+        self.colour_combo.setCurrentIndex(max(0, self.colour_combo.findData(keep_colour)))
+        self.colour_combo.blockSignals(False)
         for combo in (self.x_combo, self.y_combo):
             combo.blockSignals(True)
             combo.clear()
@@ -279,6 +296,10 @@ class GraphView(QtWidgets.QWidget):
         self.y_combo.setCurrentIndex(names.index(y))
         for combo in (self.x_combo, self.y_combo):
             combo.blockSignals(False)
+
+    def set_colour(self, channel):
+        """Colour by a channel's intensity; None for density."""
+        self.colour_combo.setCurrentIndex(max(0, self.colour_combo.findData(channel)))
 
     def set_axes(self, x, y):
         for combo, ch in ((self.x_combo, x), (self.y_combo, y)):
@@ -329,6 +350,7 @@ class GraphView(QtWidgets.QWidget):
         self.plot.setVisible(not spectral)
         self.spectrum.setVisible(spectral)
         self.transform_button.setEnabled(not spectral)
+        self.colour_combo.setVisible(self.type_combo.currentText() in ("Pseudocolor", "Dot plot"))
         for mode, b in self.tools.items():
             needs_hist = next(s[2] for s in GATE_TOOLS if s and s[0] == mode)
             b.setEnabled(needs_hist is None or (not spectral and needs_hist == self.is_histogram))
@@ -355,9 +377,19 @@ class GraphView(QtWidgets.QWidget):
             before = list(self.plot.getPlotItem().items)
             x = self.ws.display_values(self.sample_id, xch, mask)
             if self.is_histogram:
-                self._draw_histogram(x)
+                self._draw_histogram(x[np.isfinite(x)])
             else:
-                self._draw_bivariate(x, self.ws.display_values(self.sample_id, ych, mask))
+                y = self.ws.display_values(self.sample_id, ych, mask)
+                colour = self.colour_combo.currentData() if self.colour_combo.isVisible() else None
+                c = self.ws.display_values(self.sample_id, colour, mask) if colour else None
+                # Computed channels (UMAP...) are empty outside the population they were run on.
+                ok = np.isfinite(x) & np.isfinite(y)
+                if not ok.all():
+                    x, y, c = x[ok], y[ok], (None if c is None else c[ok])
+                if c is not None:
+                    self._draw_colour_by(x, y, c)
+                else:
+                    self._draw_bivariate(x, y)
             self._data_items = [it for it in self.plot.getPlotItem().items if it not in before]
         else:
             self.count_label.setText("… events")
@@ -439,6 +471,37 @@ class GraphView(QtWidgets.QWidget):
         density = density / (density.max() or 1)
         rgba = PSEUDOCOLOR.map(density, mode="byte")
         rgba[h == 0] = (0, 0, 0, 0)
+        img = pg.ImageItem(rgba, axisOrder="col-major")
+        img.setRect(QtCore.QRectF(0, 0, 1, 1))
+        self.plot.addItem(img)
+
+    def _draw_colour_by(self, x, y, c):
+        """Each bin (or dot) coloured by the median of another channel."""
+        good = np.isfinite(c)
+        x, y, c = x[good], y[good], np.clip(c[good], 0, 1)
+        if self.type_combo.currentText() == "Dot plot":
+            n = min(len(x), 50_000)
+            idx = np.random.default_rng(0).choice(len(x), n, replace=False) if len(x) > n else slice(None)
+            lo, hi = (np.percentile(c, [1, 99]) if len(c) else (0, 1))
+            colours = HEAT.map((c[idx] - lo) / ((hi - lo) or 1), mode="qcolor")
+            self.plot.addItem(pg.ScatterPlotItem(x[idx], y[idx], size=2.5, pen=None, brush=colours))
+            return
+        bins = BINS // 2  # coarser bins keep the median steady
+        ix = np.clip((x * bins).astype(int), 0, bins - 1)
+        iy = np.clip((y * bins).astype(int), 0, bins - 1)
+        cell = ix * bins + iy
+        order = np.argsort(cell, kind="stable")
+        cell, cs = cell[order], c[order]
+        starts = np.flatnonzero(np.r_[True, cell[1:] != cell[:-1]])
+        medians = np.array([np.median(part) for part in np.split(cs, starts[1:])]) if len(cs) else []
+        grid = np.full(bins * bins, np.nan)
+        if len(cs):
+            grid[cell[starts]] = medians
+        grid = grid.reshape(bins, bins)
+        finite = grid[np.isfinite(grid)]
+        lo, hi = (np.percentile(finite, [1, 99]) if finite.size else (0, 1))
+        rgba = HEAT.map(np.nan_to_num((grid - lo) / ((hi - lo) or 1)).clip(0, 1), mode="byte")
+        rgba[~np.isfinite(grid)] = (0, 0, 0, 0)
         img = pg.ImageItem(rgba, axisOrder="col-major")
         img.setRect(QtCore.QRectF(0, 0, 1, 1))
         self.plot.addItem(img)
