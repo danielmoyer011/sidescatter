@@ -13,6 +13,7 @@ from PySide6 import QtCore, QtGui
 
 from . import theme
 from .axes import ticks
+from .gating import service as gating
 from .graph_view import BINS, PSEUDOCOLOR, _bounds, _half_open, ellipse_shape
 from ..core.workspace import ROOT
 
@@ -57,8 +58,9 @@ def draw_text(p, rect, text, size, flags=QtCore.Qt.AlignCenter, color=theme.INK,
     p.restore()
 
 
-def fill_fields(text, ws, item):
-    """Replace {sample}, {population}, {count} and {freq} with values for the item."""
+def fill_fields(text, ws, item, lazy=False):
+    """Replace {sample}, {population}, {count} and {freq} with values for the item.
+    lazy: show "…" for numbers whose gating is still being worked out."""
     if "{" not in text:
         return text
     path = item.population_path
@@ -67,7 +69,9 @@ def fill_fields(text, ws, item):
               "count": "", "freq": ""}
     sid = item.sample_id
     wants_numbers = "{count}" in text or "{freq}" in text
-    if wants_numbers and sid in ws.samples and _population_ok(ws, sid, path):
+    if wants_numbers and lazy and sid in ws.samples and not gating().ensure(ws, [sid]):
+        values["count"] = values["freq"] = "…"
+    elif wants_numbers and sid in ws.samples and _population_ok(ws, sid, path):
         values["count"] = f"{ws.count(sid, name, path[:-1] if name else ROOT):,}"
         if name:
             values["freq"] = f"{ws.statistic(sid, 'Freq. of Parent', name, path[:-1]):.2f}%"
@@ -108,10 +112,15 @@ def resolve_channels(ws, item):
 
 
 class PlotCache:
-    """Binned plot data per item, recomputed only when the gating results change."""
+    """Binned plot data per item, recomputed only when the gating results change.
 
-    def __init__(self):
+    lazy (the editor's canvas): never gate on the UI thread; items whose samples
+    are still being gated in the background read "Calculating…" until they're in.
+    Exports aren't lazy, and run export_job, which gates everything first."""
+
+    def __init__(self, lazy=False):
         self._data = {}
+        self.lazy = lazy
 
     def clear(self):
         self._data.clear()
@@ -134,6 +143,8 @@ class PlotCache:
         if not _population_ok(ws, sid, path):
             self._data[key] = f"{path[-1]} doesn't apply to {sid}"
             return self._data[key]
+        if self.lazy and not gating().ensure(ws, [sid]):
+            return "Calculating…"
         name = path[-1] if len(path) > 1 else None
         mask = ws.membership(sid, name, tuple(path[:-1]) if name else ROOT)
         labels = {c.pnn: c.label for c in ws.channels(sid)}
@@ -195,7 +206,7 @@ def paint_plot(p, w, h, ws, item, cache):
     """Draw a plot item into the rectangle (0, 0, w, h)."""
     fs = item.font_size
     data = cache.get(ws, item)
-    title = fill_fields(item.title, ws, item).strip() if item.title else ""
+    title = fill_fields(item.title, ws, item, cache.lazy).strip() if item.title else ""
     top = 2.0
     if title:
         _, th = text_size(title, fs, bold=True)
@@ -388,9 +399,9 @@ def _gate_label(p, text, at, align, fs):
 
 # ----- text boxes ----------------------------------------------------------------
 
-def paint_text(p, w, h, ws, item):
+def paint_text(p, w, h, ws, item, lazy=False):
     flags = QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop | QtCore.Qt.TextWordWrap
-    draw_text(p, QtCore.QRectF(2, 2, w - 4, h - 4), fill_fields(item.text, ws, item), item.font_size,
+    draw_text(p, QtCore.QRectF(2, 2, w - 4, h - 4), fill_fields(item.text, ws, item, lazy), item.font_size,
               flags, bold=item.bold, italic=item.italic)
 
 
@@ -398,7 +409,7 @@ def paint_item(p, ws, item, cache):
     if item.kind == "plot":
         paint_plot(p, item.w, item.h, ws, item, cache)
     else:
-        paint_text(p, item.w, item.h, ws, item)
+        paint_text(p, item.w, item.h, ws, item, cache.lazy)
 
 
 # ----- whole pages (export and printing) ------------------------------------------
@@ -422,11 +433,20 @@ def render_page(p, layout, page, ws, cache, scale=1.0):
     p.restore()
 
 
+def export_job(layout, ws, path, dpi=300, on_done=None):
+    """Gate every sample on the layout in the background (with progress and
+    Cancel), then write the files. on_done(files) runs once they're written."""
+    sids = list(dict.fromkeys(it.sample_id for it in layout.items if it.sample_id))
+    return gating().prepare(ws, sids, f"Exporting {layout.name}",
+                            lambda: (on_done or (lambda files: None))(export(layout, ws, path, dpi)),
+                            key=("export-layout", id(layout)))
+
+
 def export(layout, ws, path, dpi=300, cache=None):
     """Write the layout to PDF (all pages), SVG or PNG (one file per page). Returns the files."""
     from pathlib import Path
 
-    cache = cache or PlotCache()
+    cache = _eager(cache)
     path = Path(path)
     suffix = path.suffix.lower()
     pages = layout.page_count()
@@ -478,6 +498,17 @@ def export(layout, ws, path, dpi=300, cache=None):
     return out
 
 
+def _eager(cache):
+    """A cache that gates on demand, sharing what a lazy (on-screen) cache already binned."""
+    if cache is None:
+        return PlotCache()
+    if not cache.lazy:
+        return cache
+    eager = PlotCache()
+    eager._data = cache._data
+    return eager
+
+
 def _page_layout(layout):
     size = QtGui.QPageSize(QtGui.QPageSize.Letter if layout.page_size == "Letter" else QtGui.QPageSize.A4)
     orient = QtGui.QPageLayout.Landscape if layout.landscape else QtGui.QPageLayout.Portrait
@@ -486,7 +517,7 @@ def _page_layout(layout):
 
 def print_layout(layout, ws, printer, cache=None):
     """Print every page through a QPrinter the user has set up."""
-    cache = cache or PlotCache()
+    cache = _eager(cache)
     printer.setPageLayout(_page_layout(layout))
     p = QtGui.QPainter(printer)
     rect = printer.pageLayout().paintRectPixels(printer.resolution())

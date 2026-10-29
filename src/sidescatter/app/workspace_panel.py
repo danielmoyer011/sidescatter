@@ -11,6 +11,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import icons, theme
 from ..core.workspace import ALL_SAMPLES, ROOT
 from .boolean_editor import BooleanDialog, confirm_delete
+from .gating import service as gating
 
 ROLE = QtCore.Qt.UserRole
 # Dragging populations from the sample table (e.g. onto a layout) carries this JSON:
@@ -73,6 +74,10 @@ class WorkspacePanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(split)
+        # counts fill in as background gating finishes; one rebuild per burst
+        self._rebuild_timer = QtCore.QTimer(self, singleShot=True, interval=60)
+        self._rebuild_timer.timeout.connect(self.rebuild)
+        gating().ready.connect(self._results_ready)
         self.rebuild_groups()
 
     def set_workspace(self, workspace):
@@ -144,13 +149,23 @@ class WorkspacePanel(QtWidgets.QWidget):
             if selected and key == selected:
                 it.setSelected(True)
 
+    def _results_ready(self, ws, sid):
+        if ws is self.ws and sid in self.ws.groups.get(self.current_group(), []):
+            self._rebuild_timer.start()
+
     def _add_children(self, parent_item, sid, path):
-        for name, parent in self.ws.children(path):
+        children = self.ws.children(path)
+        if children and path == ROOT:
+            gating().ensure(self.ws, [sid])
+        for name, parent in children:
             if not self.ws.applies_to(sid, name, parent):
                 continue
-            count = self.ws.count(sid, name, parent)
-            freq = self.ws.statistic(sid, "Freq. of Parent", name, parent)
-            item = QtWidgets.QTreeWidgetItem([name, f"{freq:.2f}", f"{count:,}"])
+            if self.ws.has_results(sid):
+                count = f"{self.ws.count(sid, name, parent):,}"
+                freq = f"{self.ws.statistic(sid, 'Freq. of Parent', name, parent):.2f}"
+            else:
+                count = freq = "…"
+            item = QtWidgets.QTreeWidgetItem([name, freq, count])
             item.setData(0, ROLE, (sid, name, parent))
             item.setTextAlignment(1, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             item.setTextAlignment(2, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)

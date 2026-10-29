@@ -4,6 +4,8 @@ from PySide6 import QtCore, QtWidgets
 
 from ..core import stats
 from ..core.workspace import ROOT
+from .gating import service as gating
+from .jobs import run_job
 
 
 class TableEditor(QtWidgets.QDialog):
@@ -50,7 +52,10 @@ class TableEditor(QtWidgets.QDialog):
         export.clicked.connect(self._export)
         close = QtWidgets.QPushButton("Close")
         close.clicked.connect(self.accept)
+        self.status = QtWidgets.QLabel()
+        self.status.setObjectName("GraphHint")
         bottom = QtWidgets.QHBoxLayout()
+        bottom.addWidget(self.status)
         bottom.addStretch()
         bottom.addWidget(export)
         bottom.addWidget(close)
@@ -81,8 +86,21 @@ class TableEditor(QtWidgets.QDialog):
         self._recompute()
 
     def _recompute(self):
-        self.table_df = self.ws.statistics_table(self.sample_ids, self.columns)
-        df = self.table_df
+        """Work out the table in the background; the dialog stays usable meanwhile."""
+        ws, sids, columns = self.ws, list(self.sample_ids), [dict(c) for c in self.columns]
+        self.status.setText("Calculating…")
+
+        def compute():
+            self.job = run_job("Statistics table", lambda job: ws.statistics_table(sids, columns),
+                               on_done=self._show, key=("table", id(self)))
+
+        self.job = gating().prepare(ws, sids, "Calculating gates for the table", compute,
+                                    key=("table-gating", id(self)))
+        return self.job
+
+    def _show(self, df):
+        self.status.setText("")
+        self.table_df = df
         self.view.setRowCount(len(df))
         self.view.setColumnCount(len(df.columns))
         self.view.setHorizontalHeaderLabels(list(df.columns))

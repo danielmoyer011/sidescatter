@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import icons, qc_report, theme
 from ..core import cleaning
+from .jobs import run_job
 
 STEPS = ("Margins", "Flow rate", "Isolation tree", "MAD", "Consecutive windows")
 REGION_BRUSH = theme.qcolor(theme.CORAL, 55)
@@ -156,26 +157,24 @@ def _spin(lo, hi, step, value, decimals):
     return w
 
 
-def run_cleaning(ws, sample_ids, settings, parent=None):
-    """Clean with a progress dialog. Returns the results, or None if it failed."""
-    progress = QtWidgets.QProgressDialog("Cleaning…", "", 0, len(sample_ids) + 1, parent)
-    progress.setWindowTitle("Clean data")
-    progress.setCancelButton(None)
-    progress.setMinimumDuration(300)
-    progress.setWindowModality(QtCore.Qt.WindowModal)
+def run_cleaning(ws, sample_ids, settings, parent=None, on_done=None):
+    """Clean in the background (progress and Cancel in the status bar). The
+    results go into the workspace when it's done, then on_done(results) runs.
+    Returns the job."""
+    ids = list(sample_ids)
 
-    def step(done, total, sid):
-        progress.setValue(done)
-        progress.setLabelText(f"Cleaning {sid}")
-        QtWidgets.QApplication.processEvents()
+    def work(job):
+        return ws.compute_cleaning(
+            ids, settings, lambda done, total, sid: job.progress(done / max(total, 1), f"Cleaning {sid}"))
 
-    try:
-        return ws.clean(sample_ids, settings, step)
-    except Exception as exc:
-        QtWidgets.QMessageBox.critical(parent, "Clean data", f"Cleaning failed:\n\n{exc}")
-        return None
-    finally:
-        progress.close()
+    def done(results):
+        applied = ws.apply_cleaning(results, settings)
+        if on_done is not None:
+            on_done(applied)
+
+    n = len(ids)
+    return run_job(f"Cleaning {n} sample{'s' if n > 1 else ''}", work, on_done=done,
+                   key=("clean", id(ws)))
 
 
 class QCWindow(QtWidgets.QWidget):
@@ -440,9 +439,9 @@ class QCWindow(QtWidgets.QWidget):
         if not ids:
             return
         dlg = CleanDialog(self.ws, ids, cleaning.Settings.from_dict(self.ws.qc[ids[0]].settings), self)
-        if dlg.exec() == QtWidgets.QDialog.Accepted and run_cleaning(self.ws, ids, dlg.settings(), self):
-            self.changed.emit()
-            self.refresh()
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            run_cleaning(self.ws, ids, dlg.settings(), self,
+                         on_done=lambda _: (self.changed.emit(), self.refresh()))
 
     def remove_cleaning(self):
         ids = self.selected_ids()

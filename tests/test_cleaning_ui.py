@@ -9,6 +9,7 @@ pytest.importorskip("pytestqt")
 from PySide6 import QtCore, QtWidgets  # noqa: E402
 
 from sidescatter.app import qc_report  # noqa: E402
+from sidescatter.app.jobs import wait_idle  # noqa: E402
 from sidescatter.app.main_window import MainWindow  # noqa: E402
 from sidescatter.app.qc_window import CleanDialog  # noqa: E402
 from sidescatter.core import fcs  # noqa: E402
@@ -28,6 +29,7 @@ def window(qtbot, tmp_path):
         fcs.write_fcs(p, events, names, keywords={"TIMESTEP": "0.01"})
         paths.append(str(p))
     w.add_samples(paths)
+    wait_idle()
     return w
 
 
@@ -39,7 +41,7 @@ def _accept(monkeypatch, settings=None):
 
 def test_clean_data_batch_and_qc_window(window, qtbot, monkeypatch, tmp_path):
     _accept(monkeypatch)
-    done = window.clean_data()
+    done = window.clean_data().wait()
     assert set(done) == set(window.ws.groups["All Samples"])
     assert window.ws.qc_gate() == QC_GATE
 
@@ -99,7 +101,7 @@ def test_graph_window_follows_its_gate_into_qc_passed(window, monkeypatch):
     ws.add_gate(fk.gates.RectangleGate("Pop", [ws.make_dimension(sid, "C1-A", 0.0, 0.5)]))
     view = window.open_graph(sid, "Pop", ROOT)
     _accept(monkeypatch)
-    window.clean_data()
+    window.clean_data().wait()
     assert view.population == ("Pop", ROOT + (QC_GATE,))
     ws.remove_qc()
     window._changed()
@@ -112,6 +114,7 @@ def test_unmixing_tab_cleans_controls_and_exports_report(qtbot, tmp_path, monkey
     w.ask_before_discard = False
     qtbot.addWidget(w)
     w.open_demo()
+    wait_idle()
     tab = w.unmix_tab
     plain = tab.unmixer.matrix.copy()
     tab.clean_check.setChecked(True)
@@ -120,7 +123,7 @@ def test_unmixing_tab_cleans_controls_and_exports_report(qtbot, tmp_path, monkey
     assert tab.unmixer.matrix.shape == plain.shape
     assert tab.setup.to_dict()["clean_controls"] is True
 
-    result = tab.export(tmp_path, "Demo", True, clean=True)
+    result = tab.export(tmp_path, "Demo", True, clean=True).wait()
     with zipfile.ZipFile(result.path) as zf:
         names = zf.namelist()
         pdf = zf.read("Demo/QC/Demo data cleaning.pdf")
@@ -133,6 +136,6 @@ def test_unmixing_tab_cleans_controls_and_exports_report(qtbot, tmp_path, monkey
     assert doc["gates"][0]["type"] == "QCGate"
 
     (tmp_path / "plain").mkdir()
-    plain_export = tab.export(tmp_path / "plain", "Demo", True, clean=False)
+    plain_export = tab.export(tmp_path / "plain", "Demo", True, clean=False).wait()
     with zipfile.ZipFile(plain_export.path) as zf:
         assert not any(n.startswith("Demo/QC/") for n in zf.namelist())

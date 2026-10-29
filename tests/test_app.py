@@ -8,6 +8,7 @@ from PySide6 import QtCore
 pytest.importorskip("pytestqt")
 
 from sidescatter.app.main_window import DEMO_DIR, MainWindow  # noqa: E402
+from sidescatter.app.jobs import wait_idle  # noqa: E402
 from sidescatter.app.table_editor import TableEditor  # noqa: E402
 from sidescatter.app.unmixing_tab import ROLE_CHOICES, UnmixingTab  # noqa: E402
 from sidescatter.core.workspace import Workspace  # noqa: E402
@@ -19,6 +20,7 @@ def window(qtbot):
     w.ask_before_discard = False
     qtbot.addWidget(w)
     w.add_samples([str(DEMO_DIR / "PBMC_full_panel.fcs")])
+    wait_idle()
     return w
 
 
@@ -35,6 +37,7 @@ def test_unmixing_tab_classifies_unmixes_and_exports(window, qtbot, tmp_path, mo
     from PySide6 import QtWidgets
     monkeypatch.setattr(QtWidgets.QMessageBox, "show", lambda self: None)
     window.open_demo()
+    wait_idle()
     tab = window.unmix_tab
     assert window.pages.currentWidget() is tab
     assert _role_of(tab, "PBMC_full_panel.fcs") == "Multicolor sample"
@@ -47,20 +50,23 @@ def test_unmixing_tab_classifies_unmixes_and_exports(window, qtbot, tmp_path, mo
     tab.method.setCurrentIndex(tab.method.findData("ols"))
     assert tab.unmixer.method == "ols" and tab.setup.method == "ols"
 
-    ids = tab.unmix_into_workspace()
+    with qtbot.waitSignal(tab.unmixed, timeout=120000) as unmixed:
+        tab.unmix_into_workspace()
+    ids = unmixed.args[0]
     assert window.pages.currentWidget() is window.panel
     assert window.panel.current_group() == "Unmixed"
     assert window.ws.groups["Unmixed"] == ["PBMC_full_panel.fcs (unmixed)"]
     assert len(window.ws.groups["Reference Group"]) == 15 and len(ids) == 16
     assert window.graph.sample_id == ids[0] or window.graph.sample_id in ids
 
-    result = tab.export(tmp_path, "Demo", True)
+    result = tab.export(tmp_path, "Demo", True).wait()
     assert result.path == tmp_path / "Demo.zip" and result.n_samples == 1
 
     # The setup and the unmixed samples survive saving and reopening the workspace.
     path = tmp_path / "ws.ssw"
     window.path = str(path)
     window.save()
+    wait_idle()
     back = Workspace.load(path)
     assert back.experiments[0]["files"][0]["path"].endswith(".fcs")
     assert "PBMC_full_panel.fcs (unmixed)" in back.samples
@@ -70,6 +76,7 @@ def test_changing_roles_on_several_rows(qtbot):
     tab = UnmixingTab(Workspace())
     qtbot.addWidget(tab)
     tab.add_files(_demo_files())
+    wait_idle()
     rows = [i for i, s in enumerate(tab.specs) if s.path.name.startswith("Beads_B")]
     tab._select_rows(rows)
     exclude = [label for label, _, _ in ROLE_CHOICES].index("Exclude")
@@ -93,6 +100,7 @@ def test_drop_on_unmixing_tab_adds_files(window, qtbot, tmp_path):
     before = len(window.ws.samples)
     target = window.unmix_tab.table.viewport()
     _drop(qtbot, target, [DEMO_DIR / "controls"])
+    wait_idle()
     assert len(window.unmix_tab.specs) == 15
     assert len(window.ws.samples) == before  # raw files stay in the tab
 
@@ -101,9 +109,11 @@ def test_several_experiments(qtbot):
     tab = UnmixingTab(Workspace())
     qtbot.addWidget(tab)
     tab.add_files(_demo_files()[:3])
+    wait_idle()
     tab.new_setup("Panel B")
     assert tab.specs == [] and tab.exp_combo.count() == 2
     tab.add_files(_demo_files()[3:5])
+    wait_idle()
     tab.exp_combo.setCurrentIndex(0)
     assert len(tab.specs) == 3
     assert [d["name"] for d in tab.ws.experiments] == ["Experiment 1", "Panel B"]
@@ -129,6 +139,7 @@ def test_gates_show_in_tree_and_table(window, qtbot):
     editor.pop_combo.setCurrentIndex(1)
     editor.stat_combo.setCurrentText("Freq. of Parent")
     editor._add_column()
+    wait_idle()
     assert editor.table_df.iloc[0, 1] == pytest.approx(50.0, abs=0.1)
 
 
@@ -164,6 +175,7 @@ def test_drop_files_and_folders_adds_samples(window, qtbot, tmp_path, monkeypatc
 
     before = len(window.ws.samples)
     _drop(qtbot, window, [tmp_path / "plate", loose, other])
+    wait_idle()
     assert len(window.ws.samples) == before + 3
     assert {"a.fcs", "b.FCS", "loose.fcs"} <= set(window.ws.samples)
     assert window.dirty
@@ -181,6 +193,7 @@ def test_drop_on_plot_reaches_window(window, qtbot, tmp_path, monkeypatch):
     target = window.graph.plot.viewport()  # QGraphicsView accepts drops itself, then passes them up
     assert target.acceptDrops()
     _drop(qtbot, target, [f])
+    wait_idle()
     assert len(window.ws.samples) == before + 1
 
 
@@ -191,6 +204,7 @@ def test_drop_without_fcs_only_warns(window, qtbot, tmp_path, monkeypatch):
     (tmp_path / "empty").mkdir()
     before = len(window.ws.samples)
     window.add_dropped([tmp_path / "empty"])
+    wait_idle()
     assert len(window.ws.samples) == before and warnings == ["No FCS files"]
 
 
@@ -198,6 +212,7 @@ def test_unmixing_steps_and_identify_rows(qtbot):
     tab = UnmixingTab(Workspace())
     qtbot.addWidget(tab)
     tab.add_files(_demo_files())
+    wait_idle()
     assert tab.step == 0 and not tab.rows
     tab.next_btn.click()
     assert tab.step == 1
@@ -232,6 +247,7 @@ def test_spectrum_plot_type_in_graph_window(window, qtbot):
     qtbot.addWidget(v)
     v.show_population("PBMC_full_panel.fcs")
     v.type_combo.setCurrentText("Spectrum")
+    wait_idle()
     assert v.spectrum.counts is not None
     assert v.spectrum.det_axis.names[:2] == ["V1", "V2"]
     # Every detector gets its own label.
@@ -248,6 +264,7 @@ def test_per_cell_autofluorescence_in_the_tab(qtbot):
     tab.resize(1400, 900)
     tab.show()
     tab.add_files(_demo_files())
+    wait_idle()
     assert tab.setup.af_mode == "per_cell" and tab.unmixer.per_cell_af
     assert tab.af_lib_size.isVisibleTo(tab) and not tab.af_count.isVisibleTo(tab)
     n_lib = len(tab.unmixer.af_library)
@@ -275,12 +292,15 @@ def test_per_cell_autofluorescence_in_the_tab(qtbot):
     assert len(tab.unmixer.af_library) == 2 < n_lib
 
     tab.tabs.setCurrentWidget(tab.af_check_view)
+    wait_idle()
     assert "less spread" in tab.af_check_view.summary.text()
 
     tab.af_mode.setCurrentIndex(tab.af_mode.findData("fluors"))
     assert not tab.unmixer.per_cell_af and tab.af_count.isVisibleTo(tab)
     tab.af_mode.setCurrentIndex(tab.af_mode.findData("per_cell"))
     tab.af_auto.setChecked(True)
-    ids = tab.unmix_into_workspace()
+    with qtbot.waitSignal(tab.unmixed, timeout=120000) as unmixed:
+        tab.unmix_into_workspace()
+    ids = unmixed.args[0]
     sample = tab.ws.samples[next(i for i in ids if i.startswith("PBMC_full"))]
     assert "AF Index" in sample.pnn_labels and "AF-A" in sample.pnn_labels

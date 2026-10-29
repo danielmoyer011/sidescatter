@@ -7,6 +7,7 @@ import flowkit as fk
 import pytest
 
 from sidescatter.core.layout import Layout, LayoutItem, batch, rename_population
+from sidescatter.app.jobs import wait_idle  # noqa: E402
 from sidescatter.core.workspace import ROOT, Workspace
 
 SID = "PBMC_full_panel.fcs"
@@ -94,6 +95,7 @@ def window(qtbot):
     w.ask_before_discard = False
     qtbot.addWidget(w)
     w.add_samples([str(DEMO_DIR / SID)])
+    wait_idle()
     ws = w.ws
     ws.add_gate(fk.gates.RectangleGate("Big", [ws.make_dimension(SID, "FSC-A", 0.3, 0.9),
                                                 ws.make_dimension(SID, "SSC-A", 0.05, 0.8)]))
@@ -258,6 +260,7 @@ def test_batch_and_page_setup(window, editor, monkeypatch):
     from sidescatter.app import layout_editor
 
     window.add_samples([str(DEMO_DIR / "controls" / "Beads_unstained.fcs")])
+    wait_idle()
     window.ws.add_group("Pair", [SID, "Beads_unstained.fcs"])
     editor.add_plots([{"sample_id": SID, "population": ["root", "Big"]}])
     monkeypatch.setattr(layout_editor.BatchDialog, "exec", lambda self: QtWidgets.QDialog.Accepted)
@@ -274,15 +277,24 @@ def test_batch_and_page_setup(window, editor, monkeypatch):
     assert editor.layout.page_size == "A4" and editor.layout.landscape
 
 
+def _plot_data(editor, ws, item):
+    """The editor's plot data, once background gating has caught up."""
+    data = editor.cache.get(ws, item)
+    if data == "Calculating…":
+        wait_idle()
+        data = editor.cache.get(ws, item)
+    return data
+
+
 def test_plots_follow_gate_edits_and_workspace_changes(window, editor):
     item, = editor.add_plots([{"sample_id": SID, "population": ["root", "Big"]}])
-    first = editor.cache.get(window.ws, item)["count"]
+    first = _plot_data(editor, window.ws, item)["count"]
     gate = window.ws.get_gate("Big", ROOT)
     gate.dimensions[0].min = 0.6
     window.ws.invalidate()
     window._changed()
     QtWidgets.QApplication.processEvents()
-    assert editor.cache.get(window.ws, item)["count"] < first
+    assert _plot_data(editor, window.ws, item)["count"] < first
 
     window.ws.rename_gate("Big", "Large", ROOT)
     assert item.population == ["root", "Large"]

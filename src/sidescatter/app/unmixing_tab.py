@@ -9,6 +9,7 @@ the Positive and Negative ranges on its peak detector, and its spectrum.
 the workspace or export a zipped experiment with Raw and Unmixed folders.
 """
 
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -17,8 +18,10 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core import cleaning, experiment, fcs, spectral, unmixing
 from ..core.experiment import Setup
+from ..core.workspace import default_tops
 from . import theme
 from .control_rows import ControlRow
+from .jobs import manager as jobs, run_job
 from .graph_view import BINS, CLOSE_PEN, DRAW_PEN, GATE_PEN, PSEUDOCOLOR, SNAP_FILL, SNAP_RADIUS_PX
 from .spectrum_plot import SignaturesView
 from . import qc_report
@@ -231,6 +234,8 @@ class UnmixingTab(QtWidgets.QWidget):
         self.af_check_view = AFCheckView()
         self.tabs.addTab(self.af_check_view, "AF check")
         self._af_check = None
+        self._af_check_for = None   # the unmixer the AF check job is working on
+        self.loading = None         # the job reading raw files, if any
         self.tabs.currentChanged.connect(self._af_tab_shown)
 
         self.pages = QtWidgets.QStackedWidget()
@@ -263,10 +268,10 @@ class UnmixingTab(QtWidgets.QWidget):
 
         # ----- actions
         self.unmix_btn = QtWidgets.QPushButton("Unmix into workspace")
-        self.unmix_btn.setToolTip("Add the unmixed samples (and references) to the workspace for gating")
+        self.unmix_btn.setProperty("tip", "Add the unmixed samples (and references) to the workspace for gating")
         self.unmix_btn.clicked.connect(self.unmix_into_workspace)
         self.export_btn = QtWidgets.QPushButton("Export experiment…")
-        self.export_btn.setToolTip("Write a zipped experiment with Raw and Unmixed folders, like SpectroFlo")
+        self.export_btn.setProperty("tip", "Write a zipped experiment with Raw and Unmixed folders, like SpectroFlo")
         self.export_btn.clicked.connect(self.export)
         self.export_btn.setDefault(True)
         self.back_btn = QtWidgets.QPushButton("‹  Back")
@@ -340,15 +345,39 @@ class UnmixingTab(QtWidgets.QWidget):
                 w.setValue(v)
             w.blockSignals(False)
         self._show_af_options()
-        missing = [s for s in self.setup.specs if not self._load(s.path)]
-        if missing:
-            gone = {id(s) for s in missing}
-            self.setup.specs = [s for s in self.setup.specs if id(s) not in gone]
-            QtWidgets.QMessageBox.warning(
-                self, "Missing files", "These files could not be found and were left out:\n\n"
-                + "\n".join(str(s.path) for s in missing[:10]))
-        self._fill_table()
-        self.recalculate()
+        setup = self.setup
+        to_read = list(dict.fromkeys(s.path for s in setup.specs if s.path not in self.samples))
+        if not to_read:
+            self._fill_table()
+            self.recalculate()
+            return
+
+        def work(job):
+            loaded = {}
+            for i, path in enumerate(to_read):
+                job.progress(i / len(to_read), f"Reading {Path(path).name}")
+                try:
+                    loaded[path] = fcs.load_sample(path)
+                except (OSError, ValueError):
+                    pass
+            return loaded
+
+        def done(loaded):
+            self.samples.update(loaded)
+            missing = [s for s in setup.specs if s.path not in self.samples]
+            if missing:
+                gone = {id(s) for s in missing}
+                setup.specs = [s for s in setup.specs if id(s) not in gone]
+                QtWidgets.QMessageBox.warning(
+                    self, "Missing files", "These files could not be found and were left out:\n\n"
+                    + "\n".join(str(s.path) for s in missing[:10]))
+            if setup is self.setup:
+                self._fill_table()
+                self.recalculate()
+
+        self.table.setRowCount(0)
+        self.status.setText(f"Reading {len(to_read)} file{'s' if len(to_read) > 1 else ''}…")
+        self.loading = run_job(f"Reading {setup.name}", work, on_done=done, key=("read-setup", id(self)))
 
     def new_setup(self, name=None):
         names = {s.name for s in self.setups}
@@ -380,14 +409,6 @@ class UnmixingTab(QtWidgets.QWidget):
     def specs(self):
         return self.setup.specs
 
-    def _load(self, path):
-        if path not in self.samples:
-            try:
-                self.samples[path] = fcs.load_sample(path)
-            except (OSError, ValueError):
-                return False
-        return True
-
     def _add_files(self):
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "Add raw files", "", "FCS files (*.fcs *.FCS)")
@@ -400,21 +421,41 @@ class UnmixingTab(QtWidgets.QWidget):
             self.add_files([folder])
 
     def add_files(self, paths):
-        """Add files or folders (searched recursively); returns the names skipped."""
+        """Add files or folders (searched recursively). They're read in the
+        background (self.loading is the job); returns the names skipped because
+        they aren't FCS files."""
         found, skipped = fcs.find_fcs_files(paths)
         known = {s.path for s in self.specs}
-        new = [Path(p) for p in found if Path(p) not in known]
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            unreadable = [p for p in new if not self._load(p)]
-            new = [p for p in new if p not in unreadable]
-            self.specs.extend(unmixing.guess_files(new, self.samples))
-        finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
-        skipped += [p.name for p in unreadable]
-        self._fill_table()
-        self.recalculate()
-        self._mark_changed()
+        new = list(dict.fromkeys(Path(p) for p in found if Path(p) not in known))
+        if not new:
+            return skipped
+        setup, to_read = self.setup, [p for p in new if p not in self.samples]
+
+        def work(job):
+            loaded, bad = {}, []
+            for i, p in enumerate(to_read):
+                job.progress(i / len(to_read), f"Reading {p.name}")
+                try:
+                    loaded[p] = fcs.load_sample(p)
+                except (OSError, ValueError):
+                    bad.append(p.name)
+            return loaded, bad
+
+        def done(out):
+            loaded, bad = out
+            self.samples.update(loaded)
+            have = {s.path for s in setup.specs}
+            ok = [p for p in new if p in self.samples and p not in have]
+            setup.specs.extend(unmixing.guess_files(ok, self.samples))
+            if setup is self.setup:
+                self._fill_table()
+                self.recalculate()
+            self._mark_changed()
+            if bad:
+                QtWidgets.QMessageBox.warning(
+                    self, "Couldn't read files", f"Couldn't read {len(bad)} file(s):\n\n" + "\n".join(bad[:10]))
+
+        self.loading = run_job(f"Reading {len(new)} file{'s' if len(new) > 1 else ''}", work, on_done=done)
         return skipped
 
     def remove_selected(self):
@@ -657,8 +698,7 @@ class UnmixingTab(QtWidgets.QWidget):
                 errors.append(f"Couldn't build the unmixing matrix: {exc}")
         self._cleaned = cleaned
         ok = self.unmixer is not None
-        self.unmix_btn.setEnabled(ok)
-        self.export_btn.setEnabled(ok)
+        self._update_buttons()
         self._show_status(errors)
         by_path = {r.spec.path: r for r in self.results}
         self.table.blockSignals(True)
@@ -682,7 +722,7 @@ class UnmixingTab(QtWidgets.QWidget):
         else:
             for row in self.rows:
                 row.update_result(by_path.get(row.spec.path))
-        self._af_check = None
+        self._af_check = self._af_check_for = None
         unstained = [s for s in self.specs if s.role == "unstained" and s.carrier == "cells"]
         self.af_view.set_data(unstained, self.samples, self.unmixer)
         self._af_tab_shown()
@@ -692,14 +732,21 @@ class UnmixingTab(QtWidgets.QWidget):
         if self.tabs.currentWidget() is not self.af_check_view:
             return
         if self._af_check is None and self.unmixer is not None and self.setup.autofluorescence:
-            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-            try:
-                self._af_check = unmixing.af_check([s for s in self.specs if s.role != "exclude"],
-                                                   self.unmixer, self.samples, **self.setup.af_settings)
-            except Exception:
-                self._af_check = None
-            finally:
-                QtWidgets.QApplication.restoreOverrideCursor()
+            if self._af_check_for is not self.unmixer:
+                unmixer, specs = self.unmixer, [s for s in self.specs if s.role != "exclude"]
+                samples, settings = dict(self.samples), dict(self.setup.af_settings)
+                self._af_check_for = unmixer
+
+                def done(check):
+                    if unmixer is self.unmixer:
+                        self._af_check = check
+                        self._af_tab_shown()
+
+                run_job("Checking autofluorescence",
+                        lambda job: unmixing.af_check(specs, unmixer, samples, **settings),
+                        on_done=done, key=("af-check", id(self)))
+            self.af_check_view.show_check(None, None)
+            return
         self.af_check_view.show_check(self._af_check, self.setup.af_mode if self.unmixer else None)
 
     def _show_status(self, errors):
@@ -884,44 +931,64 @@ class UnmixingTab(QtWidgets.QWidget):
 
     # ----- applying --------------------------------------------------------
 
+    def _update_buttons(self):
+        ok = self.unmixer is not None
+        self.unmix_btn.setEnabled(ok and not jobs().busy(key=("unmix", id(self), self.setup.name)))
+        self.export_btn.setEnabled(ok and not jobs().busy(key=("export-experiment", id(self))))
+        for b, what in ((self.unmix_btn, "unmixing"), (self.export_btn, "exporting")):
+            busy = ok and not b.isEnabled()
+            b.setToolTip(f"Still {what} this experiment; see the status bar" if busy else b.property("tip"))
+
     def unmix_into_workspace(self):
-        """Add the unmixed samples and references to the workspace; raw files stay here."""
+        """Unmix every file in the background, then add the unmixed samples and
+        references to the workspace; raw files stay here. Returns the job."""
         if self.unmixer is None:
-            return []
-        name = self.setup.name
-        um_name, n = name, 2
-        while um_name in self.ws.unmixers:
-            um_name, n = f"{name} ({n})", n + 1
-        self.ws.add_unmixer(um_name, self.unmixer)
-        new_ids = []
+            return None
+        key = ("unmix", id(self), self.setup.name)
+        if jobs().busy(key=key):
+            return None
+        ws, setup, unmixer = self.ws, self.setup, self.unmixer
         todo = [s for s in self.specs if s.role != "exclude"]
-        progress = QtWidgets.QProgressDialog("Unmixing…", "", 0, 1000 * len(todo), self)
-        progress.setWindowTitle("Unmix into workspace")
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(500)
-        progress.setWindowModality(QtCore.Qt.WindowModal)
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
+        raws = {s.path: self.samples[s.path] for s in todo}
+
+        def work(job):
+            from ..core.unmixing import unmix_sample
+
+            out = []
             for i, spec in enumerate(todo):
-                progress.setLabelText(f"Unmixing {spec.path.name} ({i + 1} of {len(todo)})")
+                text = f"Unmixing {spec.path.name} ({i + 1} of {len(todo)})"
 
-                def step(done, total, i=i):
-                    progress.setValue(1000 * i + int(1000 * done / max(total, 1)))
-                    QtWidgets.QApplication.processEvents()
+                def step(done, total, i=i, text=text):
+                    job.progress((i + done / max(total, 1)) / len(todo), text)
 
+                step(0, 1)
                 group = "Unmixed" if spec.role == "sample" else experiment.REFERENCE_GROUP
                 af_source = spec.af_source if spec.role == "sample" else None
-                new_ids.append(self.ws.unmix_file(spec.path, um_name, group, self.samples[spec.path],
-                                                  af_source=af_source, progress=step))
-        finally:
-            progress.close()
-            QtWidgets.QApplication.restoreOverrideCursor()
-        self.store()
-        self.unmixed.emit(new_ids)
-        return new_ids
+                unmixed = unmix_sample(raws[spec.path], unmixer, af_source=af_source, progress=step)
+                out.append((spec.path, unmixed, group, af_source, default_tops(unmixed)))
+            return out
+
+        def done(out):
+            if ws is not self.ws:
+                return
+            name = setup.name
+            um_name, n = name, 2
+            while um_name in ws.unmixers:
+                um_name, n = f"{name} ({n})", n + 1
+            ws.add_unmixer(um_name, unmixer)
+            new_ids = [ws.add_unmixed(path, um_name, unmixed, group, af_source, tops)
+                       for path, unmixed, group, af_source, tops in out]
+            self.store()
+            self.unmixed.emit(new_ids)
+
+        job = run_job(f"Unmixing {len(todo)} file{'s' if len(todo) > 1 else ''}", work, on_done=done, key=key)
+        job.finished.connect(self._update_buttons)
+        self._update_buttons()
+        return job
 
     def export(self, dest=None, name=None, as_zip=None, clean=None):
-        """Ask where to write the experiment (unless told), then write it.
+        """Ask where to write the experiment (unless told), then write it in the
+        background. Cancel deletes what was written so far. Returns the job.
 
         clean: also clean the samples and add the data-cleaning PDF (default:
         when anything in the workspace has been cleaned).
@@ -938,30 +1005,23 @@ class UnmixingTab(QtWidgets.QWidget):
             clean = dlg.clean.isChecked()
         elif clean is None:
             clean = bool(self.ws.qc)
-        progress = QtWidgets.QProgressDialog("Exporting…", "", 0, 1, self)
-        progress.setWindowTitle("Export experiment")
-        progress.setCancelButton(None)
-        progress.setMinimumDuration(300)
-        progress.setWindowModality(QtCore.Qt.WindowModal)
+        specs, unmixer, samples = list(self.specs), self.unmixer, dict(self.samples)
+        um_name, af_settings = self.setup.name, dict(self.setup.af_settings)
+        clean_settings = copy.deepcopy(self.ws.qc_settings) if clean else None
 
-        def step(done, total, text):
-            progress.setMaximum(total + 1)
-            progress.setValue(done)
-            progress.setLabelText(text)
-            QtWidgets.QApplication.processEvents()
+        def work(job):
+            return experiment.export_experiment(
+                dest, name, specs, unmixer, as_zip=as_zip, samples=samples, unmixer_name=um_name,
+                progress=lambda done, total, text: job.progress(done / (total + 1), text),
+                af_settings=af_settings, clean_settings=clean_settings,
+                cleaning_report=qc_report.write_pdf)
 
-        try:
-            result = experiment.export_experiment(dest, name, self.specs, self.unmixer,
-                                                  as_zip=as_zip, samples=self.samples,
-                                                  unmixer_name=self.setup.name, progress=step,
-                                                  af_settings=self.setup.af_settings,
-                                                  clean_settings=self.ws.qc_settings if clean else None,
-                                                  cleaning_report=qc_report.write_pdf)
-        except Exception as exc:
-            progress.close()
-            QtWidgets.QMessageBox.critical(self, "Export experiment", f"The export failed:\n\n{exc}")
-            return None
-        progress.close()
+        job = run_job(f"Exporting {name}", work, on_done=self._exported, key=("export-experiment", id(self)))
+        job.finished.connect(self._update_buttons)
+        self._update_buttons()
+        return job
+
+    def _exported(self, result):
         msg = (f"Wrote {result.n_references} reference and {result.n_samples} sample file(s), raw and "
                f"unmixed, to\n{result.path}")
         box = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Information, "Experiment exported", msg,
@@ -971,7 +1031,6 @@ class UnmixingTab(QtWidgets.QWidget):
         box.buttonClicked.connect(lambda b: b is show and QtGui.QDesktopServices.openUrl(
             QtCore.QUrl.fromLocalFile(str(result.path.parent))))
         box.show()
-        return result
 
 
 class ExportDialog(QtWidgets.QDialog):

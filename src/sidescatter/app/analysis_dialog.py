@@ -1,8 +1,9 @@
 """UMAP, tSNE, PCA and FlowSOM: the run dialog and the metacluster heatmap.
 
 The dialog picks a population, the samples and channels, and the methods.
-The work runs in a background thread with a progress bar and a Cancel
-button; the results become channels and populations in the workspace.
+The work runs as a background job (jobs.py) with a progress bar and a Cancel
+button here and in the status bar; the results become channels and
+populations in the workspace.
 """
 
 import numpy as np
@@ -11,34 +12,10 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from ..core import highdim
 from ..core.workspace import ROOT
 from . import theme
+from .jobs import FAILED, manager, run_job
 
+METHOD_NAMES = {"pca": "PCA", "umap": "UMAP", "tsne": "tSNE", "flowsom": "FlowSOM"}
 HEAT_STOPS = ((0.0, "#2B2D6E"), (0.35, "#3E7FC1"), (0.65, "#7CCBA2"), (1.0, "#F8E16C"))
-
-
-class _Worker(QtCore.QObject):
-    progressed = QtCore.Signal(float, str)
-    finished = QtCore.Signal(object)
-    failed = QtCore.Signal(str)
-
-    def __init__(self, inputs):
-        super().__init__()
-        self.inputs = inputs
-        self.cancel_requested = False
-
-    def run(self):
-        def progress(fraction, text):
-            if self.cancel_requested:
-                raise highdim.Cancelled()
-            self.progressed.emit(fraction, text)
-
-        try:
-            result = highdim.compute(self.inputs, progress)
-        except highdim.Cancelled:
-            self.failed.emit("")
-        except Exception as exc:  # shown to the user, not raised in the thread
-            self.failed.emit(str(exc) or type(exc).__name__)
-        else:
-            self.finished.emit(result)
 
 
 class AnalysisDialog(QtWidgets.QDialog):
@@ -51,7 +28,7 @@ class AnalysisDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.ws = workspace
         self.setWindowTitle("UMAP, tSNE and FlowSOM")
-        self.thread = self.worker = None
+        self.job = None
         if settings is None:
             usable = [s for s in samples if self.ws.applies_to(s, population, parent_path)
                       and not self._is_concatenated(s)]
@@ -257,7 +234,7 @@ class AnalysisDialog(QtWidgets.QDialog):
     def _update_summary(self, *_):
         st = self.current_settings()
         problem = self._problem(st)
-        self.run_button.setEnabled(problem is None and self.thread is None)
+        self.run_button.setEnabled(problem is None and self.job is None)
         if problem:
             self.summary.setText(problem)
             return
@@ -286,14 +263,13 @@ class AnalysisDialog(QtWidgets.QDialog):
         QtWidgets.QApplication.restoreOverrideCursor()
         self.settings = st
         self._set_running(True)
-        self.thread = QtCore.QThread(self)
-        self.worker = _Worker(inputs)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.progressed.connect(self._progressed)
-        self.worker.finished.connect(self._done)
-        self.worker.failed.connect(self._failed)
-        self.thread.start()
+        ws = self.ws
+        job = self.job = run_job(
+            f"{', '.join(METHOD_NAMES.get(m, m) for m in st.methods)}: {st.name}",
+            lambda job: highdim.compute(inputs, job.progress),
+            on_done=lambda result: self._done(ws, result), key=("analysis", id(ws), st.name))
+        job.changed.connect(lambda: job.active and self._progressed(job.fraction or 0.0, job.text))
+        job.finished.connect(lambda: job.state != "done" and self._failed(job))
 
     def _set_running(self, on):
         for w in (self.progress, self.progress_text):
@@ -312,42 +288,39 @@ class AnalysisDialog(QtWidgets.QDialog):
         self.progress.setValue(int(1000 * fraction))
         self.progress_text.setText(text)
 
-    def _stop_thread(self):
-        if self.thread is not None:
-            self.thread.quit()
-            self.thread.wait()
-        self.thread = self.worker = None
-
-    def _done(self, result):
-        self._stop_thread()
-        record = self.ws.add_analysis(result)
+    def _done(self, ws, result):
+        self.job = None
+        record = ws.add_analysis(result)
         self.analysisDone.emit(record)
         self.accept()
 
-    def _failed(self, message):
-        self._stop_thread()
+    def _failed(self, job):
+        message = job.text if job.state == FAILED else ""
+        if message:  # shown here, so the status bar doesn't repeat it
+            manager().dismiss(job)
+        self.job = None
         self._set_running(False)
         self._update_summary()
         if message:
             QtWidgets.QMessageBox.warning(self, "UMAP, tSNE and FlowSOM", message)
 
     def _cancel(self):
-        if self.worker is None:
+        if self.job is None:
             self.reject()
             return
-        self.worker.cancel_requested = True
+        self.job.cancel()
         self.cancel_button.setEnabled(False)
         self.progress_text.setText("Stopping after the current step…")
 
     def closeEvent(self, event):
-        if self.worker is not None:
+        if self.job is not None:
             self._cancel()
             event.ignore()
         else:
             super().closeEvent(event)
 
     def reject(self):
-        if self.worker is not None:
+        if self.job is not None:
             self._cancel()
             return
         super().reject()

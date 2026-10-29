@@ -203,12 +203,14 @@ def test_cancel_stops_the_run(ws):
 @pytest.fixture
 def window(qtbot, files):
     pytest.importorskip("pytestqt")
+    from sidescatter.app.jobs import wait_idle
     from sidescatter.app.main_window import MainWindow
 
     w = MainWindow()
     w.ask_before_discard = False
     qtbot.addWidget(w)
     w.add_samples(files[0])
+    wait_idle()
     w.ws.add_gate(fk.gates.RectangleGate("Cells", [w.ws.make_dimension("sample0.fcs", "FSC-A", 0.05, 0.95)]))
     w._changed()
     return w
@@ -228,7 +230,7 @@ def test_dialog_runs_in_background_and_opens_the_map(window, qtbot):
     dlg.analysisDone.connect(window._after_analysis)
     with qtbot.waitSignal(dlg.analysisDone, timeout=120_000):
         dlg.run()
-        assert dlg.progress.isVisible() or dlg.thread is not None
+        assert dlg.progress.isVisible() or dlg.job is not None
     assert window.ws.analysis("Analysis 1") is not None
     view = window.graph
     assert view.sample_id == "Concatenated (Analysis 1)"
@@ -253,7 +255,7 @@ def test_dialog_cancel(window, qtbot):
     dlg.method_boxes["umap"].setChecked(False)
     dlg.run()
     dlg._cancel()
-    qtbot.waitUntil(lambda: dlg.thread is None, timeout=60_000)
+    qtbot.waitUntil(lambda: dlg.job is None, timeout=60_000)
     assert window.ws.analyses == []
     assert dlg.run_button.isEnabled()
 

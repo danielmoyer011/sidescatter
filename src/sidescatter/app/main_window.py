@@ -12,16 +12,20 @@ import flowkit as fk
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import __version__
+from ..core import fcs
 from ..core.fcs import find_fcs_files
-from ..core.workspace import ROOT, Workspace
+from ..core.workspace import ROOT, Workspace, default_tops, write_document
 from . import icons
 from .analysis_dialog import AnalysisDialog, HeatmapDialog
+from .gating import service as gating
 from .graph_view import GraphWindow
+from .jobs import manager as jobs, run_job
 from .layout_editor import LayoutWindow
 from .qc_window import CleanDialog, QCWindow, run_cleaning
 from .ribbon import Ribbon
 from .suggestion_box import SuggestionDialog
 from .table_editor import TableEditor
+from .task_area import TaskArea, run_with_dialog
 from .unmixing_tab import UnmixingTab
 from .workspace_panel import WorkspacePanel
 
@@ -36,6 +40,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ws = Workspace()
         self.path = None
         self.dirty = False
+        self.edits = 0      # counts changes, so a background save knows if it caught them all
         self.ask_before_discard = True
         self.graphs = []   # open GraphWindows
         self.graph = None  # the GraphView used most recently
@@ -63,6 +68,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.license_button = QtWidgets.QPushButton("License…")
         self.license_button.setObjectName("LicenseButton")
         self.license_button.clicked.connect(self.show_license)
+        self.task_area = TaskArea()
+        self.statusBar().addPermanentWidget(self.task_area)
         self.statusBar().addPermanentWidget(self.license_button)
         self.statusBar().showMessage(
             "Add or drop FCS files, open a workspace, or try the demo spectral data.")
@@ -215,6 +222,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _changed(self):
         self._gates_moved()
         self.dirty = True
+        self.edits += 1
+        gating().cancel_stale(self.ws)
         self.panel.rebuild_groups()
         self._update_title()
         sender = self.sender()
@@ -228,6 +237,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _layouts_changed(self):
         self.dirty = True
+        self.edits += 1
         self._update_title()
 
     def _update_title(self):
@@ -289,10 +299,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Add dropped files and folders as samples; report anything that is not FCS."""
         fcs_paths, skipped = find_fcs_files(paths)
         if fcs_paths:
-            before = len(self.ws.samples)
             self.add_samples(fcs_paths)
-            added = len(self.ws.samples) - before
-            self.statusBar().showMessage(f"Added {added} sample(s).", 6000)
         if skipped:
             shown = "\n".join(skipped[:10]) + (f"\n… and {len(skipped) - 10} more" if len(skipped) > 10 else "")
             QtWidgets.QMessageBox.warning(
@@ -303,10 +310,26 @@ class MainWindow(QtWidgets.QMainWindow):
         return fcs_paths, skipped
 
     def closeEvent(self, event):
-        if self._confirm_discard():
-            event.accept()
-        else:
+        if not self._confirm_jobs() or not self._confirm_discard():
             event.ignore()
+            return
+        jobs().cancel_all()
+        jobs().pool.waitForDone(5000)
+        event.accept()
+
+    def _confirm_jobs(self):
+        running = [j for j in jobs().active() if not j.quiet]
+        if not running or not self.ask_before_discard:
+            return True
+        n = len(running)
+        box = QtWidgets.QMessageBox(
+            QtWidgets.QMessageBox.Question, "Jobs still running",
+            f"{n} job{'s are' if n > 1 else ' is'} still running. Cancel {'them' if n > 1 else 'it'} and quit?",
+            parent=self)
+        quit_button = box.addButton("Cancel jobs and quit", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("Keep working", QtWidgets.QMessageBox.RejectRole)
+        box.exec()
+        return box.clickedButton() is quit_button
 
     # ----- graph windows ---------------------------------------------------
 
@@ -394,15 +417,34 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open workspace", "", WORKSPACE_FILTER)
         if path:
-            self._run(lambda: self._set_workspace(Workspace.load(path), path), "Opening workspace")
+            return self.load_workspace(path)
+
+    def load_workspace(self, path):
+        """Open a workspace file in the background, with a progress dialog."""
+        job = run_job(f"Opening {Path(path).name}",
+                      lambda job: Workspace.load(path, progress=job.progress),
+                      on_done=lambda ws: self._set_workspace(ws, path), key=("open-workspace",))
+        return run_with_dialog(job, self)
 
     def save(self):
+        """Save now, in the background. Finished work is saved; a running unmix
+        joins the workspace (and the next save) when it's done."""
         if self.path is None:
             return self.save_as()
         self.unmix_tab.store()
-        self._run(lambda: self.ws.save(self.path), "Saving")
-        self.dirty = False
-        self._update_title()
+        path, doc, edits = self.path, self.ws.to_document(), self.edits
+        analyses = list(self.ws.analyses)
+
+        def saved(_):
+            if self.edits == edits and self.path == path:
+                self.dirty = False
+                self._update_title()
+            busy = jobs().busy(prefix=("unmix",))
+            self.statusBar().showMessage(
+                f"Saved{' (unmix still running)' if busy else ''}.", 6000)
+
+        return run_job(f"Saving {Path(path).name}", lambda job: write_document(path, doc, analyses),
+                       on_done=saved, cancellable=False, key=("save", path))
 
     def save_as(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save workspace", "workspace.ssw",
@@ -415,9 +457,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if not paths:
             paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Add samples", "",
                                                               "FCS files (*.fcs *.FCS)")
-        if paths:
-            self._run(lambda: self.ws.add_fcs(paths), "Loading samples")
+        if not paths:
+            return None
+        ws = self.ws
+
+        def work(job):
+            loaded = []
+            for i, p in enumerate(paths):
+                job.progress(i / len(paths), f"Reading {Path(p).name}")
+                sample = fcs.load_sample(p)
+                loaded.append((p, sample, default_tops(sample)))
+            return loaded
+
+        def done(loaded):
+            if ws is not self.ws:
+                return
+            for p, sample, tops in loaded:
+                sample.id = ws._unique_id(Path(p).name)
+                ws.add_sample(sample, {"path": str(Path(p).resolve())}, tops=tops)
             self._changed()
+            self.statusBar().showMessage(f"Added {len(loaded)} sample(s).", 6000)
+
+        return run_job(f"Adding {len(paths)} sample{'s' if len(paths) > 1 else ''}", work, on_done=done)
 
     def import_flowjo(self):
         if not self._confirm_discard():
@@ -429,8 +490,13 @@ class MainWindow(QtWidgets.QMainWindow):
         fcs_dir = QtWidgets.QFileDialog.getExistingDirectory(
             self, "Folder containing the FCS files", str(Path(wsp).parent))
         if fcs_dir:
-            self._run(lambda: self._set_workspace(Workspace.from_flowjo(wsp, fcs_dir)),
-                      "Importing FlowJo workspace")
+            return self.load_flowjo(wsp, fcs_dir)
+
+    def load_flowjo(self, wsp, fcs_dir):
+        job = run_job(f"Importing {Path(wsp).name}",
+                      lambda job: Workspace.from_flowjo(wsp, fcs_dir, progress=job.progress),
+                      on_done=self._set_workspace, key=("open-workspace",))
+        return run_with_dialog(job, self)
 
     def open_demo(self):
         """Load the demo controls and sample into a new experiment on the Unmixing tab."""
@@ -476,13 +542,14 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg = CleanDialog(self.ws, ids, parent=self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return None
-        done = run_cleaning(self.ws, ids, dlg.settings(), self)
-        if done is None:
-            return None
-        self._changed()
-        win = self.open_qc_window()
-        win.refresh()
-        return done
+        ws = self.ws
+
+        def cleaned(_):
+            if ws is self.ws:
+                self._changed()
+                self.open_qc_window().refresh()
+
+        return run_cleaning(ws, ids, dlg.settings(), self, on_done=cleaned)
 
     def open_qc_window(self):
         if self.qc_window is None:
@@ -617,18 +684,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_website(self):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(WEBSITE))
-
-    # ----- helpers ---------------------------------------------------------
-
-    def _run(self, fn, what):
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            fn()
-        except Exception as exc:
-            QtWidgets.QApplication.restoreOverrideCursor()
-            QtWidgets.QMessageBox.critical(self, what, f"{what} failed:\n\n{exc}")
-            return
-        QtWidgets.QApplication.restoreOverrideCursor()
 
 
 class TransformDialog(QtWidgets.QDialog):
