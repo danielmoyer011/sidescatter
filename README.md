@@ -52,6 +52,17 @@ workflow familiar to FlowJo users.
   apply to every sample in the workspace, as FlowJo group gates do.
 - **Scales**: logicle (biexponential), arcsinh, log and linear per channel;
   changing a scale keeps gates on the same events.
+- **Data cleaning** (Tools › Clean Data): removes margin events, flow-rate
+  jumps (clogs, bubbles, pauses) and unstable stretches of a run, PeacoQC
+  style, for every sample of a group at once. Lenient, Standard (PeacoQC's
+  defaults) and Strict presets, or set MAD, isolation tree limit and window
+  size yourself. Cleaned events become a **QC passed** population at the top
+  of each sample's gates, so nothing in the files changes and every gate below
+  inherits the cleaning. The QC window lists the % removed per sample (amber
+  above 20%) and shows Time plots with the removed stretches shaded; drag,
+  add or delete stretches by hand. Save a PDF report, export cleaned FCS
+  files, or clean single-stain controls before their signatures are
+  calculated (Unmixing tab › Clean controls first).
 - **Statistics**: count, frequency of parent/grandparent/total, mean, median,
   geometric mean, SD, rSD, CV, rCV and percentiles, in a table editor that
   exports CSV or Excel.
@@ -114,6 +125,9 @@ machines; clone [FlowKit](https://github.com/whitews/FlowKit) into
 
 - Signatures derived from the Aurora demo controls match the ones published
   with flowSpecs (cosine similarity above 0.995 for every fluor).
+- Data cleaning removes exactly the events PeacoQC's own R code removes from
+  PeacoQC's example file, and finds clogs, bubbles, drift and flow pauses
+  injected into synthetic runs.
 - Unmixing recovers known abundances exactly on synthetic data, and WLS beats
   OLS under photon noise.
 - On synthetic tissue-like data with four kinds of autofluorescence, per-cell

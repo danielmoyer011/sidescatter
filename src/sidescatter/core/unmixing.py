@@ -178,8 +178,23 @@ class ControlResult:
     negative_mask: np.ndarray = None  # internal negatives; None when another file is the negative
 
 
+def control_keep(sample, settings=None):
+    """Clean a raw control: (mask of events that passed, cleaning.Result).
+
+    A clog or bubble in a single-stain control skews its signature, so the
+    Unmixing tab can drop those stretches before signatures are calculated.
+    """
+    from .workspace import Workspace  # workspace imports this module
+
+    ws = Workspace()
+    sid = ws.add_sample(sample, {"path": ""})
+    ws.compensation[sid] = "uncompensated"
+    res = ws.clean([sid], settings)[sid]
+    return ws.qc_keep(sid), res
+
+
 def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None,
-                  af_mode="fluors", af_library_size=30, af_auto=True):
+                  af_mode="fluors", af_library_size=30, af_auto=True, keep=None):
     """Build an Unmixer from control specs.
 
     af_mode: "fluors" (n_autofluorescence AF signatures as extra fluors) or
@@ -189,9 +204,11 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     Returns (unmixer, results) where results describes how each signature was
     derived so the UI can show it and let the user correct the gates.
     samples: optional {path: loaded Sample}, filled in as files are loaded.
+    keep: optional {path: mask of events to use}, e.g. the events that passed cleaning.
     """
     specs = [s for s in specs if s.is_reference]
     samples = {} if samples is None else samples
+    keep = keep or {}
 
     def sample_for(path):
         if path not in samples:
@@ -206,23 +223,27 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     def det_events(spec):
         return _detector_events(sample_for(spec.path), names, spec.path.name)
 
+    def _kept(spec, n):
+        k = keep.get(spec.path)
+        return np.ones(n, dtype=bool) if k is None else k
+
     def gated_events(spec):
-        """Detector events inside the file's scatter gate (all events without one)."""
+        """Detector events inside the file's scatter gate (all events without one) that
+        passed cleaning (when keep has the file)."""
         events = det_events(spec)
-        if spec.scatter_gate is None:
-            return events
-        return events[scatter_mask(sample_for(spec.path), spec.scatter_gate)]
+        mask = scatter_mask(sample_for(spec.path), spec.scatter_gate) & _kept(spec, len(events))
+        return events[mask]
 
     references, results = [], []
     for spec in specs:
         if spec.role != "single_stain":
             continue
         events = det_events(spec)
-        in_gate = scatter_mask(sample_for(spec.path), spec.scatter_gate)
+        in_gate = scatter_mask(sample_for(spec.path), spec.scatter_gate) & _kept(spec, len(events))
 
         neg_events, neg_source = None, "internal"
         if spec.negative_mask is not None:
-            neg_events = events[spec.negative_mask]
+            neg_events = events[spec.negative_mask & _kept(spec, len(events))]
         elif spec.negative not in ("auto", "internal"):
             other = by_path.get(Path(spec.negative)) or ControlSpec(Path(spec.negative), "")
             neg_events, neg_source = gated_events(other), Path(spec.negative).name
@@ -241,7 +262,7 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
             if drawn.sum() >= 10:
                 pos_mask = drawn
         if spec.positive_mask is not None:
-            pos_mask = spec.positive_mask
+            pos_mask = spec.positive_mask & in_gate
         if neg_events is None:
             if spec.negative_range is not None:
                 drawn = in_gate & _range_mask(events[:, peak], spec.negative_range)
