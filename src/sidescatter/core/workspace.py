@@ -8,6 +8,8 @@ transform registered under its channel name, as FlowJo workspaces do.
 import copy
 import itertools
 import json
+import os
+import tempfile
 import threading
 import zipfile
 from pathlib import Path
@@ -20,10 +22,10 @@ import pandas as pd
 from . import cleaning, fcs, highdim, serialize, stats
 from .layout import Layout, rename_population
 from .spectral import Unmixer
+from .versioning import FORMAT_NAME, FORMAT_VERSION, upgrade
 
 ROOT = ("root",)
 ALL_SAMPLES = "All Samples"
-FORMAT_VERSION = 1
 
 # Default display range for full-spectrum instruments (Cytek Aurora is 2^22).
 SPECTRAL_RANGE = 4194304.0
@@ -82,6 +84,11 @@ class Workspace:
         self.qc = {}             # sample_id -> cleaning.Result
         self.qc_settings = cleaning.Settings()  # what the Clean data dialog last used
         self.analyses = []       # UMAP/tSNE/FlowSOM runs (core.highdim.Analysis)
+        # sample_id -> what the file said about a sample whose FCS file couldn't be
+        # found: {"id", "source", "compensation", "groups", "qc"}. Kept so saving
+        # doesn't lose it, and so Locate files can bring it back.
+        self.missing = {}
+        self.upgraded_from = None  # the older format version this was opened from
         self.revision = 0        # bumped whenever gating results may have changed
         self._results = {}       # sample_id -> fk GatingResults
         self._display_cache = {}
@@ -937,21 +944,30 @@ class Workspace:
     def to_document(self):
         """Everything a workspace file holds, as plain JSON-ready data. Quick, and a
         copy, so a background save never sees later edits."""
+        from .. import __version__
+
+        groups = {k: list(v) for k, v in self.groups.items()}
+        for sid, m in self.missing.items():  # saving never drops a sample it couldn't find
+            for g in m["groups"]:
+                groups.setdefault(g, []).append(sid)
+        qc = {sid: r.to_dict() for sid, r in self.qc.items() if sid in self.samples}
+        qc.update({sid: m["qc"] for sid, m in self.missing.items() if m.get("qc")})
         return copy.deepcopy({
-            "format": "sidescatter-workspace",
+            "format": FORMAT_NAME,
             "version": FORMAT_VERSION,
+            "written_by": __version__,
             "samples": [
                 {"id": sid, "source": self.sources[sid], "compensation": self.compensation[sid]}
                 for sid in self.samples
-            ],
-            "groups": self.groups,
+            ] + [{k: m[k] for k in ("id", "source", "compensation")} for m in self.missing.values()],
+            "groups": groups,
             "transforms": {k: serialize.transform_to_dict(v)
                            for k, v in self.strategy.transformations.items()},
             "gates": [_gate_dict(self.get_gate(n, p), p) for n, p in self.population_paths()],
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
             "layouts": [lay.to_dict() for lay in self.layouts],
             "experiments": self.experiments,
-            "qc": {sid: r.to_dict() for sid, r in self.qc.items() if sid in self.samples},
+            "qc": qc,
             "qc_settings": self.qc_settings.to_dict(),
             "analyses": [a.to_dict() for a in self.analyses],
         })
@@ -959,45 +975,43 @@ class Workspace:
     @classmethod
     def load(cls, path, search_dirs=(), progress=None):
         """progress(fraction, text), if given, is called before each sample (and
-        may raise to stop loading)."""
+        may raise to stop loading). Files from older Sidescatters are upgraded in
+        memory (see versioning.py); samples whose FCS files can't be found go to
+        ws.missing instead of stopping the load."""
         with zipfile.ZipFile(path) as zf:
             doc = json.loads(zf.read("workspace.json"))
-        if doc.get("format") != "sidescatter-workspace":
-            raise ValueError("not a Sidescatter workspace")
+        doc, saved_as = upgrade(doc)
 
         ws = cls()
+        ws.upgraded_from = saved_as if saved_as != doc["version"] else None
         for name, d in doc["transforms"].items():
             ws.strategy.add_transform(name, serialize.transform_from_dict(d))
         ws.unmixers = {k: Unmixer.from_dict(v) for k, v in doc["unmixers"].items()}
+        dirs = [Path(path).parent, *map(Path, search_dirs)]
+        groups = {k: list(v) for k, v in doc["groups"].items()}
+        qc = doc.get("qc", {})
 
-        pending, concatenated = [], []
-        total = max(len(doc["samples"]), 1)
-        step = 0
-        for s in doc["samples"]:
-            src = s["source"]
-            if "concatenated" in src:
-                concatenated.append(s)
-            elif "path" in src:
-                if progress:
-                    progress(step / total, f"Loading {Path(src['path']).name}")
-                step += 1
-                p = _find_file(src["path"], [Path(path).parent, *map(Path, search_dirs)])
-                sample = fcs.load_sample(p, sample_id=s["id"])
-                ws.add_sample(sample, {"path": str(p)})
-                ws.compensation[s["id"]] = s["compensation"]
-            else:
-                pending.append(s)
-        for s in pending:  # unmixed samples are rebuilt from their raw source
-            from .unmixing import unmix_sample
+        def lost(s):
+            ws.missing[s["id"]] = {
+                "id": s["id"], "source": s["source"], "compensation": s["compensation"],
+                "groups": [g for g, members in groups.items() if s["id"] in members and g != ALL_SAMPLES],
+                "qc": qc.get(s["id"])}
 
-            src = s["source"]
+        concatenated = [s for s in doc["samples"] if "concatenated" in s["source"]]
+        others = [s for s in doc["samples"] if "concatenated" not in s["source"]]
+        others.sort(key=lambda s: "path" not in s["source"])  # unmixed ones need their raw files first
+        for step, s in enumerate(others):
             if progress:
-                progress(step / total, f"Unmixing {s['id']}")
-            step += 1
-            raw = ws._raw_for(src, [Path(path).parent, *map(Path, search_dirs)])
-            sample = unmix_sample(raw, ws.unmixers[src["unmixer"]], af_source=src.get("af_source"))
-            sample.id = s["id"]
-            ws.add_sample(sample, src)
+                name = Path(s["source"]["path"]).name if "path" in s["source"] else s["id"]
+                progress(step / max(len(doc["samples"]), 1),
+                         f"{'Loading' if 'path' in s['source'] else 'Unmixing'} {name}")
+            try:
+                sample = ws._read_sample(s["id"], s["source"], dirs)
+            except (FileNotFoundError, KeyError):
+                lost(s)
+                continue
+            ws.add_sample(sample, ws._resolved(s["source"], dirs))
+            ws.compensation[s["id"]] = s["compensation"]
 
         with zipfile.ZipFile(path) as zf:
             ws.analyses = [highdim.Analysis.from_dict(d, zf.read(f"analyses/{i}.npz"))
@@ -1006,9 +1020,13 @@ class Workspace:
             ws._attach_derived(sid)
         for s in concatenated:
             record = ws.analysis(s["source"]["concatenated"])
-            if record is not None:
+            if record is None:
+                continue
+            if all(sid in ws.samples for sid in record.settings.samples):
                 ws._add_concatenated(record)
-        ws.groups = {k: list(v) for k, v in doc["groups"].items()}
+            else:  # built again once its samples are found
+                lost(s)
+        ws.groups = {k: [sid for sid in v if sid not in ws.missing] for k, v in groups.items()}
         ws.experiments = doc.get("experiments", [])
         for g in doc["gates"]:
             if g["type"] == "QCGate":
@@ -1017,11 +1035,101 @@ class Workspace:
                 ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]))
         ws.layouts = [Layout.from_dict(d) for d in doc.get("layouts", [])]
         ws.qc_settings = cleaning.Settings.from_dict(doc.get("qc_settings", {}))
-        ws.qc = {sid: cleaning.Result.from_dict(r) for sid, r in doc.get("qc", {}).items()
-                 if sid in ws.samples}
-        if ws.qc or ws.qc_gate():
-            ws._sync_qc()
+        ws.qc = {sid: cleaning.Result.from_dict(r) for sid, r in qc.items() if sid in ws.samples}
+        if ws.qc or (ws.qc_gate() and not any(m.get("qc") for m in ws.missing.values())):
+            ws._sync_qc()  # (cleaned samples still missing keep QC passed where it is)
         return ws
+
+    def _read_sample(self, sample_id, src, search_dirs, raws=None):
+        """Read (or unmix again) one sample from its source. Touches nothing in the
+        workspace. raws: samples just read that aren't in the workspace yet."""
+        if "path" in src:
+            return fcs.load_sample(_find_file(src["path"], search_dirs), sample_id=sample_id)
+        from .unmixing import unmix_sample
+
+        if "unmixed_from" in src and raws and src["unmixed_from"] in raws:
+            raw = raws[src["unmixed_from"]]
+        else:
+            raw = self._raw_for(src, search_dirs)
+        sample = unmix_sample(raw, self.unmixers[src["unmixer"]], af_source=src.get("af_source"))
+        sample.id = sample_id
+        return sample
+
+    def _resolved(self, src, search_dirs):
+        """The source, pointing at where its file was actually found."""
+        if "path" in src:
+            return {**src, "path": str(_find_file(src["path"], search_dirs))}
+        return dict(src)
+
+    # ----- samples whose files couldn't be found ---------------------------
+
+    def find_missing(self, folder, progress=None):
+        """{sample id: file found for it} for the missing samples whose files are in
+        this folder or any folder below it, matched by file name. Safe on a worker."""
+        wanted = {}
+        for sid, m in self.missing.items():
+            src = m["source"]
+            original = src.get("path") or src.get("unmixed_from_path")
+            if original:
+                wanted.setdefault(Path(original).name, []).append(sid)
+        found = {}
+        for root, dirs, files in os.walk(folder):
+            if progress:
+                progress(None, f"Looking in {root}")
+            dirs.sort()
+            for name in sorted(files):
+                for sid in wanted.pop(name, []):
+                    found[sid] = Path(root) / name
+            if not wanted:
+                break
+        return found
+
+    def read_missing(self, found, progress=None):
+        """Read the samples find_missing found, plus the samples unmixed from them
+        inside this workspace. Safe on a worker; restore_missing adds the result."""
+        out, raws = [], {}
+        todo = dict(found)
+        later = [sid for sid, m in self.missing.items()
+                 if m["source"].get("unmixed_from") and sid not in todo]
+        order = sorted(todo, key=lambda sid: "path" not in self.missing[sid]["source"]) + later
+        for i, sid in enumerate(order):
+            m = self.missing[sid]
+            src = dict(m["source"])
+            if sid in todo:  # look exactly where the file was found
+                key = "path" if "path" in src else "unmixed_from_path"
+                src[key] = str(todo[sid])
+            elif src["unmixed_from"] not in raws and src["unmixed_from"] not in self.samples:
+                continue  # its raw sample is still missing
+            if progress:
+                progress(i / max(len(order), 1), f"Loading {sid}")
+            sample = self._read_sample(sid, src, [], raws)
+            raws[sid] = sample
+            out.append((sid, sample, src, default_tops(sample)))
+        return out
+
+    def restore_missing(self, loaded):
+        """Put samples read by read_missing back where they were (UI thread)."""
+        for sid, sample, src, tops in loaded:
+            m = self.missing.pop(sid, None)
+            if m is None or sid in self.samples:
+                continue
+            self.add_sample(sample, src, tops=tops)
+            self.compensation[sid] = m["compensation"]
+            for g in m["groups"]:
+                self.groups.setdefault(g, []).append(sid)
+            if m.get("qc"):
+                self.qc[sid] = cleaning.Result.from_dict(m["qc"])
+            self._attach_derived(sid)
+        for sid, m in list(self.missing.items()):
+            record = self.analysis(m["source"].get("concatenated", object()))
+            if record is not None and all(s in self.samples for s in record.settings.samples):
+                self.missing.pop(sid)
+                self._add_concatenated(record)
+        self._sync_qc()
+
+    def forget_missing(self, sample_id):
+        """Drop a missing sample from the workspace for good."""
+        self.missing.pop(sample_id, None)
 
     # ----- FlowJo import ---------------------------------------------------
 
@@ -1180,11 +1288,40 @@ def _unique(name, taken):
 
 def write_document(path, doc, analyses=()):
     """Write a workspace document (from Workspace.to_document) and its analyses'
-    arrays to a .ssw file. Touches no workspace, so it can run on a worker thread."""
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("workspace.json", json.dumps(doc, indent=1))
-        for i, a in enumerate(analyses):
-            zf.writestr(f"analyses/{i}.npz", a.arrays_bytes())
+    arrays to a .ssw file. Touches no workspace, so it can run on a worker thread.
+
+    Writes a temporary file next to it first and swaps it in at the end, so a
+    crash or full disk never leaves a half-written workspace behind."""
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}-", suffix=".ssw.tmp", dir=path.parent)
+    try:
+        os.chmod(tmp, _file_mode(path))  # mkstemp makes it private; keep the usual permissions
+        with os.fdopen(fd, "wb") as f:
+            with zipfile.ZipFile(f, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("workspace.json", json.dumps(doc, indent=1))
+                for i, a in enumerate(analyses):
+                    zf.writestr(f"analyses/{i}.npz", a.arrays_bytes())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _file_mode(path):
+    """The permissions a save should leave: the old file's, or the default for a new one."""
+    try:
+        return path.stat().st_mode & 0o777
+    except OSError:
+        return 0o666 & ~_UMASK
+
+
+_UMASK = os.umask(0o022)  # read once at import: setting it from a worker thread isn't safe
+os.umask(_UMASK)
 
 
 def default_tops(sample):

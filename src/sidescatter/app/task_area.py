@@ -266,16 +266,23 @@ class JobDialog(QtWidgets.QDialog):
         super().reject()
 
 
-def run_with_dialog(job, parent=None):
+def run_with_dialog(job, parent=None, on_failure=None):
     """Show a JobDialog for this job until it ends. Returns right away; the
     dialog closes itself. A failure is shown straight away, since the user was
-    waiting for it."""
+    waiting for it: by on_failure(job) if given and it returns True, otherwise
+    with show_failure."""
     if job.active:
         dlg = JobDialog(job, parent)
         dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
         dlg.show()
-    job.finished.connect(lambda: job.state == FAILED and QtCore.QTimer.singleShot(
-        0, lambda: show_failure(job, parent)))
+
+    def failed():
+        if on_failure is not None and on_failure(job):
+            manager().dismiss(job)
+        else:
+            show_failure(job, parent)
+
+    job.finished.connect(lambda: job.state == FAILED and QtCore.QTimer.singleShot(0, failed))
     return job
 
 

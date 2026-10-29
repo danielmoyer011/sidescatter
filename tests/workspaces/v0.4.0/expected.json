@@ -1,0 +1,52 @@
+{
+ "counts": {
+  "Concatenated (Example map)": {
+   "Metacluster 1": 224,
+   "Metacluster 2": 1573,
+   "Metacluster 3": 1155,
+   "Metacluster 4": 1048,
+   "QC passed": 4000,
+   "QC passed/Cells": 3740,
+   "QC passed/Cells/AF647-A+": 1067,
+   "QC passed/Cells/Lymphocytes": 2137,
+   "QC passed/Cells/Singlets": 3697
+  },
+  "PBMC_example.fcs": {
+   "QC passed": 3750,
+   "QC passed/Cells": 3516,
+   "QC passed/Cells/B3+": 1653,
+   "QC passed/Cells/Lymphocytes": 2014,
+   "QC passed/Cells/Lymphocytes AND NOT V7+": 1397,
+   "QC passed/Cells/Singlets": 3516,
+   "QC passed/Cells/V7+": 1335,
+   "QC passed/Cells/V7+ B3+": 876,
+   "QC passed/Cells/V7+ B3-": 459,
+   "QC passed/Cells/V7-": 2181,
+   "QC passed/Cells/V7- B3+": 777
+  },
+  "PBMC_example.fcs (unmixed)": {
+   "Metacluster 1": 259,
+   "Metacluster 2": 2017,
+   "Metacluster 3": 1445,
+   "Metacluster 4": 1279,
+   "QC passed": 5000,
+   "QC passed/Cells": 4656,
+   "QC passed/Cells/AF647-A+": 1280,
+   "QC passed/Cells/Lymphocytes": 2678,
+   "QC passed/Cells/Singlets": 4601
+  },
+  "PBMC_example.fcs (unmixed) (2)": {
+   "Metacluster 1": 261,
+   "Metacluster 2": 2012,
+   "Metacluster 3": 1441,
+   "Metacluster 4": 1286,
+   "QC passed": 5000,
+   "QC passed/Cells": 4656,
+   "QC passed/Cells/AF647-A+": 1244,
+   "QC passed/Cells/Lymphocytes": 2678,
+   "QC passed/Cells/Singlets": 4601
+  }
+ },
+ "events": 5000,
+ "version": "0.4.0"
+}

@@ -1,0 +1,290 @@
+{
+ "analyses": [
+  {
+   "meta_counts": [
+    "number"
+   ],
+   "meta_medians": [
+    [
+     "number"
+    ]
+   ],
+   "samples": [
+    "str"
+   ],
+   "settings": {
+    "channels": [
+     "str"
+    ],
+    "max_total": "number",
+    "methods": [
+     "str"
+    ],
+    "n_meta": "number",
+    "name": "str",
+    "parent_path": [
+     "str"
+    ],
+    "per_sample": "number",
+    "population": "null",
+    "samples": [
+     "str"
+    ],
+    "seed": "number",
+    "som_x": "number",
+    "som_y": "number",
+    "suffix": "str",
+    "tsne_perplexity": "number",
+    "umap_min_dist": "number",
+    "umap_neighbors": "number"
+   }
+  }
+ ],
+ "experiments": [
+  {
+   "af_auto": "bool",
+   "af_library_size": "number",
+   "af_mode": "str",
+   "autofluorescence": "bool",
+   "clean_controls": "bool",
+   "files": [
+    {
+     "af_gates": [],
+     "af_source": "str",
+     "carrier": "str",
+     "guessed_by": "str",
+     "marker": "str",
+     "name": "str",
+     "negative": "str",
+     "path": "str",
+     "reasons": [
+      "str"
+     ],
+     "role": "str"
+    }
+   ],
+   "method": "str",
+   "n_autofluorescence": "number",
+   "name": "str"
+  }
+ ],
+ "format": "str",
+ "gates": [
+  {
+   "bool_type": "str",
+   "coordinates": [
+    "number"
+   ],
+   "covariance_matrix": [
+    [
+     "number"
+    ]
+   ],
+   "dimensions": [
+    {
+     "compensation_ref": "str",
+     "id": "str",
+     "max": "number",
+     "min": "number",
+     "transformation_ref": "str"
+    }
+   ],
+   "distance_square": "number",
+   "gate_refs": [
+    {
+     "complement": "bool",
+     "path": [
+      "str"
+     ],
+     "ref": "str"
+    }
+   ],
+   "name": "str",
+   "parent_path": [
+    "str"
+   ],
+   "type": "str",
+   "use_complement": "bool",
+   "vertices": [
+    [
+     "number"
+    ]
+   ]
+  }
+ ],
+ "groups": {
+  "{map}": [
+   "str"
+  ]
+ },
+ "layouts": [
+  {
+   "items": [
+    {
+     "bold": "bool",
+     "font_size": "number",
+     "h": "number",
+     "id": "str",
+     "italic": "bool",
+     "kind": "str",
+     "plot_type": "str",
+     "population": [
+      "str"
+     ],
+     "sample_id": "str",
+     "show_axis_labels": "bool",
+     "show_gate_labels": "bool",
+     "show_gates": "bool",
+     "text": "str",
+     "title": "str",
+     "w": "number",
+     "x": "number",
+     "x_channel": "str",
+     "y": "number",
+     "y_channel": "str"
+    }
+   ],
+   "landscape": "bool",
+   "name": "str",
+   "page_size": "str"
+  }
+ ],
+ "qc": {
+  "{map}": {
+   "auto_stretches": [
+    [
+     "number"
+    ]
+   ],
+   "bins": {
+    "events_per_bin": "number",
+    "good": [
+     "bool"
+    ],
+    "mids": [
+     "number"
+    ],
+    "n_bins": "number",
+    "peaks": {
+     "{map}": [
+      "number"
+     ]
+    },
+    "rate": [
+     "number"
+    ]
+   },
+   "channels": [
+    "str"
+   ],
+   "edited": "bool",
+   "margin": "str",
+   "margin_counts": {
+    "{map}": "number"
+   },
+   "n_events": "number",
+   "removed_by": {
+    "Consecutive windows": "number",
+    "Flow rate": "number",
+    "MAD": "number",
+    "Margins": "number"
+   },
+   "settings": {
+    "channels": "null",
+    "consecutive_bins": "number",
+    "events_per_bin": "number",
+    "flow_rate": "bool",
+    "force_it": "number",
+    "it_limit": "number",
+    "mad": "number",
+    "margins": "bool",
+    "min_bins_peakdetection": "number",
+    "peak_removal": "number",
+    "preset": "str",
+    "remove_zeros": "bool",
+    "signal": "bool"
+   },
+   "stretches": [
+    [
+     "number"
+    ]
+   ],
+   "time_channel": "str",
+   "trend": "str",
+   "warnings": [
+    "str"
+   ]
+  }
+ },
+ "qc_settings": {
+  "channels": "null",
+  "consecutive_bins": "number",
+  "events_per_bin": "number",
+  "flow_rate": "bool",
+  "force_it": "number",
+  "it_limit": "number",
+  "mad": "number",
+  "margins": "bool",
+  "min_bins_peakdetection": "number",
+  "peak_removal": "number",
+  "preset": "str",
+  "remove_zeros": "bool",
+  "signal": "bool"
+ },
+ "samples": [
+  {
+   "compensation": "str",
+   "id": "str",
+   "source": {
+    "concatenated": "str",
+    "path": "str",
+    "unmixed_from": "str",
+    "unmixed_from_path": "str",
+    "unmixer": "str"
+   }
+  }
+ ],
+ "transforms": {
+  "{map}": {
+   "param_a": "number",
+   "param_m": "number",
+   "param_t": "number",
+   "param_w": "number",
+   "type": "str"
+  }
+ },
+ "unmixers": {
+  "{map}": {
+   "af_library": [
+    [
+     "number"
+    ]
+   ],
+   "af_sources": [
+    "str"
+   ],
+   "background_var": [
+    "number"
+   ],
+   "channel_style": "str",
+   "detectors": [
+    "str"
+   ],
+   "fine_tune": "null",
+   "method": "str",
+   "references": [
+    {
+     "is_autofluorescence": "bool",
+     "marker": "str",
+     "name": "str",
+     "signature": [
+      "number"
+     ],
+     "source": "str"
+    }
+   ]
+  }
+ },
+ "version": "number",
+ "written_by": "str"
+}
