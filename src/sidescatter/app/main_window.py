@@ -340,7 +340,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for win in self.graphs:
             v = win.view
             if v.sample_id == sample_id and v.population == (name, tuple(parent_path)):
-                return v.x_combo.currentData(), v.y_combo.currentData(), v.type_combo.currentText()
+                kind = v.type_combo.currentText()
+                # Layouts don't draw spectra yet; drop the plot in as a pseudocolour.
+                return v.x_combo.currentData(), v.y_combo.currentData(), "Pseudocolor" if kind == "Spectrum" else kind
         return None
 
     # ----- file actions ----------------------------------------------------

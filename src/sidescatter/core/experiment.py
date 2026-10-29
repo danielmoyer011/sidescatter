@@ -245,6 +245,26 @@ def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
     return ExportResult(final, n_ref, len(included) - n_ref, warnings)
 
 
+def _gates_to_dict(spec):
+    """The Identify-step gates of one file, leaving out the ones never drawn."""
+    out = {}
+    if spec.scatter_gate is not None:
+        out["scatter_gate"] = [[float(x), float(y)] for x, y in spec.scatter_gate]
+    if spec.gate_detector:
+        out["gate_detector"] = spec.gate_detector
+    for key in ("positive_range", "negative_range"):
+        value = getattr(spec, key)
+        if value is not None:
+            out[key] = [float(v) for v in value]
+    return out
+
+
+def _gates_from_dict(f):
+    return {"scatter_gate": f.get("scatter_gate"), "gate_detector": f.get("gate_detector", ""),
+            "positive_range": tuple(f["positive_range"]) if f.get("positive_range") else None,
+            "negative_range": tuple(f["negative_range"]) if f.get("negative_range") else None}
+
+
 @dataclass
 class Setup:
     """An unmixing experiment as the Unmixing tab edits it: files and settings."""
@@ -261,14 +281,14 @@ class Setup:
             "n_autofluorescence": self.n_autofluorescence,
             "files": [{"path": str(s.path), "name": s.name, "role": s.role, "carrier": s.carrier,
                        "negative": s.negative, "marker": s.marker, "reasons": list(s.reasons),
-                       "guessed_by": s.guessed_by} for s in self.specs],
+                       "guessed_by": s.guessed_by, **_gates_to_dict(s)} for s in self.specs],
         }
 
     @classmethod
     def from_dict(cls, d):
         specs = [unmixing.ControlSpec(Path(f["path"]), f["name"], f["role"], f["carrier"], f["negative"],
                                       marker=f.get("marker", ""), reasons=f.get("reasons", []),
-                                      guessed_by=f.get("guessed_by", ""))
+                                      guessed_by=f.get("guessed_by", ""), **_gates_from_dict(f))
                  for f in d["files"]]
         return cls(d["name"], specs, d.get("method", "wls"), d.get("autofluorescence", True),
                    d.get("n_autofluorescence", 1))

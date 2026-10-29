@@ -14,8 +14,10 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import icons, theme
+from ..core import fcs
 from ..core.workspace import ALL_SAMPLES, ROOT
 from .axes import TransformAxis
+from .spectrum_plot import SpectrumPlot
 
 BINS = 256
 PSEUDOCOLOR = pg.ColorMap(*zip(*theme.PSEUDOCOLOR_STOPS))
@@ -26,7 +28,7 @@ CLOSE_PEN = pg.mkPen(QtGui.QColor(theme.ACCENT).lighter(150), width=1.2, style=Q
 SNAP_RADIUS_PX = 10  # a click this close to a polygon's first corner closes it
 SNAP_FILL = QtGui.QColor(theme.ACCENT)
 SNAP_FILL.setAlpha(60)
-PLOT_TYPES = ("Pseudocolor", "Dot plot", "Contour", "Histogram")
+PLOT_TYPES = ("Pseudocolor", "Dot plot", "Contour", "Histogram", "Spectrum")
 
 # (mode, tooltip, needs a histogram). None separates the 2D and 1D tools.
 GATE_TOOLS = (
@@ -173,6 +175,9 @@ class GraphView(QtWidgets.QWidget):
         grid.setSpacing(2)
         grid.addWidget(self.y_combo, 0, 0, QtCore.Qt.AlignCenter)
         grid.addWidget(self.plot, 0, 1)
+        self.spectrum = SpectrumPlot()
+        self.spectrum.hide()
+        grid.addWidget(self.spectrum, 0, 0, 1, 2)
         grid.addWidget(self.x_combo, 1, 1, QtCore.Qt.AlignHCenter)
         grid.setColumnStretch(1, 1)
         grid.setRowStretch(0, 1)
@@ -254,6 +259,10 @@ class GraphView(QtWidgets.QWidget):
                 combo.setCurrentIndex(i)
 
     @property
+    def is_spectrum(self):
+        return self.type_combo.currentText() == "Spectrum"
+
+    @property
     def is_histogram(self):
         return self.type_combo.currentText() == "Histogram"
 
@@ -282,12 +291,15 @@ class GraphView(QtWidgets.QWidget):
             self.status.setText("This population doesn't apply to this sample.")
             return
         xch, ych = self.x_combo.currentData(), self.y_combo.currentData()
-        self.y_combo.setVisible(not self.is_histogram)
+        spectral = self.is_spectrum
+        self.y_combo.setVisible(not self.is_histogram and not spectral)
+        self.x_combo.setVisible(not spectral)
+        self.plot.setVisible(not spectral)
+        self.spectrum.setVisible(spectral)
+        self.transform_button.setEnabled(not spectral)
         for mode, b in self.tools.items():
             needs_hist = next(s[2] for s in GATE_TOOLS if s and s[0] == mode)
-            b.setEnabled(needs_hist is None or needs_hist == self.is_histogram)
-        x = self.ws.display_values(self.sample_id, xch, mask)
-        self.x_axis.set_transform(self.ws.transform(xch))
+            b.setEnabled(needs_hist is None or (not spectral and needs_hist == self.is_histogram))
 
         trail = " › ".join([*parent[1:], name]) if name else "All events"
         self.title.setText(f"{self.sample_id}  ›  {trail}" if name else self.sample_id)
@@ -295,6 +307,12 @@ class GraphView(QtWidgets.QWidget):
         win = self.window()
         if win is not self and isinstance(win, GraphWindow):
             win.setWindowTitle(f"{self.sample_id}: {name or 'All events'}")
+        if spectral:
+            self._draw_spectrum(mask)
+            return
+
+        x = self.ws.display_values(self.sample_id, xch, mask)
+        self.x_axis.set_transform(self.ws.transform(xch))
 
         if self.is_histogram:
             self.y_axis.set_transform(None)
@@ -308,6 +326,25 @@ class GraphView(QtWidgets.QWidget):
             self.plot.setYRange(0, 1, padding=0.0)
         self._draw_gates(xch, None if self.is_histogram else ych)
         self.status.setText(HINTS[self._draw_mode or "pointer"])
+
+    def _draw_spectrum(self, mask):
+        """Every fluorescence detector side by side, in laser order, for this population."""
+        sample = self.ws.samples[self.sample_id]
+        dets = fcs.detector_channels(sample)
+        if not dets:
+            self.spectrum.set_events(np.empty((0, 0)), [])
+            self.status.setText("This sample has no fluorescence detectors to show as a spectrum.")
+            return
+        idx = [c.index for c in dets]
+        events = sample.get_events(source="raw")[mask][:, idx]
+        pnr = sample.channels["pnr"].tolist()
+        self.spectrum.set_title("")
+        self.spectrum.set_events(events, [c.pnn for c in dets], max(pnr[i] for i in idx))
+        if fcs.is_spectral(sample):
+            self.status.setText("Spectrum of this population in every raw detector, grouped by laser.")
+        else:
+            self.status.setText("Spectrum of this population in every fluorescence channel. "
+                                "Raw full-spectrum files show one column per detector.")
 
     def _draw_bivariate(self, x, y):
         kind = self.type_combo.currentText()
@@ -594,7 +631,7 @@ class GraphView(QtWidgets.QWidget):
         needs_hist = next(s[2] for s in GATE_TOOLS if s and s[0] == mode)
         if needs_hist and not self.is_histogram:
             self.type_combo.setCurrentText("Histogram")
-        if not needs_hist and self.is_histogram:
+        if not needs_hist and (self.is_histogram or self.is_spectrum):
             self.type_combo.setCurrentText("Pseudocolor")
         self._draw_mode = mode
         self.tools[mode].setChecked(True)

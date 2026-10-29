@@ -30,6 +30,12 @@ class ControlSpec:
     marker: str = ""                # antigen, e.g. "CD3"
     reasons: list = field(default_factory=list)  # why the role was guessed
     guessed_by: str = ""            # strongest evidence: folder, name, keywords, data, default
+    # Gates drawn in the Identify step, all in raw units and saved with the setup:
+    # a polygon on the scatter channels, and Positive/Negative ranges on one detector.
+    scatter_gate: list = None       # [[x, y], ...] on fcs.scatter_channels
+    gate_detector: str = ""         # detector the ranges are on (the peak channel)
+    positive_range: tuple = None    # (low, high)
+    negative_range: tuple = None    # (low, high); only used with an internal negative
 
     @property
     def is_reference(self):
@@ -114,6 +120,47 @@ def _detector_events(sample, detectors, label=None):
     return sample.get_events(source="raw")[:, _detector_index(sample, detectors, label)]
 
 
+def in_polygon(x, y, vertices):
+    """Events inside a polygon (even-odd rule); points on an edge count as inside."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    v = np.asarray(vertices, dtype=float)
+    inside = np.zeros(x.shape, dtype=bool)
+    on_edge = np.zeros(x.shape, dtype=bool)
+    for (x0, y0), (x1, y1) in zip(v, np.roll(v, -1, axis=0)):
+        crosses = (y0 > y) != (y1 > y)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            at = x0 + (y - y0) * (x1 - x0) / (y1 - y0)
+        inside ^= crosses & (x < at)
+        # On the segment: collinear and within its bounding box.
+        cross = (x1 - x0) * (y - y0) - (y1 - y0) * (x - x0)
+        scale = max(abs(x1 - x0) + abs(y1 - y0), 1e-12)
+        on_edge |= ((np.abs(cross) <= 1e-9 * scale * scale)
+                    & (np.minimum(x0, x1) <= x) & (x <= np.maximum(x0, x1))
+                    & (np.minimum(y0, y1) <= y) & (y <= np.maximum(y0, y1)))
+    return inside | on_edge
+
+
+def scatter_mask(sample, vertices):
+    """Events inside a scatter gate drawn on fcs.scatter_channels; all events without one."""
+    pair = fcs.scatter_channels(sample)
+    if vertices is None or len(vertices) < 3 or pair is None:
+        return np.ones(sample.event_count, dtype=bool)
+    raw = sample.get_events(source="raw")
+    return in_polygon(raw[:, sample.get_channel_index(pair[0])],
+                      raw[:, sample.get_channel_index(pair[1])], vertices)
+
+
+def _range_mask(values, bounds):
+    lo, hi = sorted(map(float, bounds))
+    return (values >= lo) & (values <= hi)
+
+
+def _expand(sub_mask, keep):
+    full = np.zeros(keep.shape, dtype=bool)
+    full[np.flatnonzero(keep)[sub_mask]] = True
+    return full
+
+
 @dataclass
 class ControlResult:
     spec: ControlSpec
@@ -123,6 +170,8 @@ class ControlResult:
     negative_source: str
     n_positive: int
     n_negative: int
+    in_gate: np.ndarray = None        # events inside the scatter gate
+    negative_mask: np.ndarray = None  # internal negatives; None when another file is the negative
 
 
 def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None):
@@ -143,44 +192,67 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     first = sample_for(specs[0].path)
     detectors = fcs.detector_channels(first)
     names = [c.pnn for c in detectors]
+    by_path = {s.path: s for s in specs}
 
     def det_events(spec):
         return _detector_events(sample_for(spec.path), names, spec.path.name)
+
+    def gated_events(spec):
+        """Detector events inside the file's scatter gate (all events without one)."""
+        events = det_events(spec)
+        if spec.scatter_gate is None:
+            return events
+        return events[scatter_mask(sample_for(spec.path), spec.scatter_gate)]
 
     references, results = [], []
     for spec in specs:
         if spec.role != "single_stain":
             continue
         events = det_events(spec)
+        in_gate = scatter_mask(sample_for(spec.path), spec.scatter_gate)
 
         neg_events, neg_source = None, "internal"
         if spec.negative_mask is not None:
             neg_events = events[spec.negative_mask]
         elif spec.negative not in ("auto", "internal"):
-            neg_events, neg_source = det_events(ControlSpec(Path(spec.negative), "")), Path(spec.negative).name
+            other = by_path.get(Path(spec.negative)) or ControlSpec(Path(spec.negative), "")
+            neg_events, neg_source = gated_events(other), Path(spec.negative).name
         elif spec.negative == "auto":
             unstained = _matching_unstained(spec, specs)
             if unstained is not None:
-                neg_events, neg_source = det_events(unstained), unstained.path.name
+                neg_events, neg_source = gated_events(unstained), unstained.path.name
 
-        pos_mask, internal_neg, peak = spectral.auto_gate_control(events, neg_events)
+        pos_sub, neg_sub, peak = spectral.auto_gate_control(events[in_gate], neg_events)
+        pos_mask = _expand(pos_sub, in_gate)
+        internal_neg = None if neg_sub is None else _expand(neg_sub, in_gate)
+        if spec.gate_detector in names:
+            peak = names.index(spec.gate_detector)
+        if spec.positive_range is not None:
+            drawn = in_gate & _range_mask(events[:, peak], spec.positive_range)
+            if drawn.sum() >= 10:
+                pos_mask = drawn
         if spec.positive_mask is not None:
             pos_mask = spec.positive_mask
         if neg_events is None:
+            if spec.negative_range is not None:
+                drawn = in_gate & _range_mask(events[:, peak], spec.negative_range)
+                if drawn.sum() >= 10:
+                    internal_neg = drawn
             neg_events = events[internal_neg]
 
         sig = spectral.extract_signature(events[pos_mask], neg_events)
         references.append(spectral.Reference(spec.name, sig, source=spec.path.name, marker=spec.marker))
         results.append(ControlResult(spec, sig, names[peak], pos_mask, neg_source,
-                                     int(pos_mask.sum()), len(neg_events)))
+                                     int(pos_mask.sum()), len(neg_events), in_gate,
+                                     internal_neg if neg_source == "internal" else None))
 
     background_var = None
     cell_unstained = next((s for s in specs if s.role == "unstained" and s.carrier == "cells"), None)
     any_unstained = cell_unstained or next((s for s in specs if s.role == "unstained"), None)
     if any_unstained is not None:
-        background_var = spectral.robust_sd(det_events(any_unstained)) ** 2
+        background_var = spectral.robust_sd(gated_events(any_unstained)) ** 2
     if autofluorescence and cell_unstained is not None:
-        af = spectral.autofluorescence_signatures(det_events(cell_unstained), n_autofluorescence)
+        af = spectral.autofluorescence_signatures(gated_events(cell_unstained), n_autofluorescence)
         for i, sig in enumerate(af):
             label = "Autofluorescence" if len(af) == 1 else f"Autofluorescence {i + 1}"
             references.append(spectral.Reference(label, sig, True, cell_unstained.path.name))
