@@ -19,7 +19,7 @@ from flowkit._models.gates._base_gate import Gate
 import numpy as np
 import pandas as pd
 
-from . import cleaning, fcs, highdim, serialize, stats
+from . import cleaning, fcs, highdim, scales, serialize, stats
 from .layout import Layout, rename_population
 from .spectral import Unmixer
 from .versioning import FORMAT_NAME, FORMAT_VERSION, upgrade
@@ -64,9 +64,15 @@ class Strategy(fk.GatingStrategy):
 
 
 def default_transform(channel, top):
+    saved = scales.saved_defaults.get(channel.pnn)
+    if saved:
+        try:
+            return scales.make(saved["kind"], {**saved["settings"], "max": top})
+        except (KeyError, ValueError):
+            pass
     if channel.kind in ("time", "scatter"):
         return fk.transforms.LinearTransform(param_t=top, param_a=0.0)
-    return fk.transforms.LogicleTransform(param_t=top, param_w=0.5, param_m=4.5, param_a=0.0)
+    return scales.make("biex", scales.defaults("biex", top))
 
 
 class Workspace:
@@ -83,6 +89,7 @@ class Workspace:
         self.layouts = []        # Layout Editor pages (core.layout.Layout)
         self.qc = {}             # sample_id -> cleaning.Result
         self.qc_settings = cleaning.Settings()  # what the Clean data dialog last used
+        self.scale_history = {}  # channel -> earlier transforms, for "Previous scale" (not saved)
         self.analyses = []       # UMAP/tSNE/FlowSOM runs (core.highdim.Analysis)
         # sample_id -> what the file said about a sample whose FCS file couldn't be
         # found: {"id", "source", "compensation", "groups", "qc"}. Kept so saving
@@ -174,10 +181,12 @@ class Workspace:
     def transform(self, channel):
         return self.strategy.transformations[channel]
 
-    def set_transform(self, channel, new):
+    def set_transform(self, channel, new, remember=True):
         """Change a channel's transform; gate coordinates are re-mapped so gates
         keep selecting the same events."""
         old = self.strategy.transformations[channel]
+        if remember:
+            self.scale_history.setdefault(channel, []).append(old)
         for gate in self._all_gates():
             for dim in getattr(gate, "dimensions", []):
                 if getattr(dim, "transformation_ref", None) != channel:
@@ -204,6 +213,17 @@ class Workspace:
                 gate.covariance_matrix = cov.tolist()
         self.strategy.transformations[channel] = new
         self.invalidate()
+
+    def previous_transform(self, channel):
+        """The scale this channel had before its last change (None if unchanged)."""
+        history = self.scale_history.get(channel)
+        return history[-1] if history else None
+
+    def restore_previous_transform(self, channel):
+        """Put back the scale a channel had before its last change."""
+        history = self.scale_history.get(channel)
+        if history:
+            self.set_transform(channel, history.pop(), remember=False)
 
     # ----- gating ----------------------------------------------------------
 
@@ -507,7 +527,8 @@ class Workspace:
         if mask is not None:
             values = values[mask]
         xform = self.strategy.transformations[channel]
-        return xform.apply(values.reshape(-1, 1)).ravel()
+        with np.errstate(divide="ignore", invalid="ignore"):  # log scales: <= 0 is off the scale
+            return xform.apply(values.reshape(-1, 1)).ravel()
 
     def scale_values(self, sample_id, channel, mask=None):
         """Values for one channel on the linear scale (used for MFI and other stats)."""
@@ -1171,7 +1192,17 @@ class Workspace:
         for name in fj.get_sample_groups():
             if name != ALL_SAMPLES:
                 ws.groups[name] = list(fj.get_sample_ids(name))
+        ws.rescale_flowjo_biex()
         return ws
+
+    def rescale_flowjo_biex(self):
+        """FlowJo's biex runs 0..4096 and plots run 0..1: swap in the same
+        scale divided by 4096, with gates rescaled to match."""
+        for name, xform in list(self.strategy.transformations.items()):
+            if type(xform) is fk.transforms.WSPBiexTransform:
+                self.set_transform(name, scales.BiexTransform(xform.negative, xform.width,
+                                                              xform.positive, xform.max_value),
+                                   remember=False)
 
 
 def _gate_dict(gate, parent_path):

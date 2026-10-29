@@ -50,8 +50,12 @@ workflow familiar to FlowJo users.
   bisector tools in a strip right above each plot, drawn on pseudocolor, dot,
   contour or histogram plots, nested to any depth, editable by dragging. Gates
   apply to every sample in the workspace, as FlowJo group gates do.
-- **Scales**: logicle (biexponential), arcsinh, log and linear per channel;
-  changing a scale keeps gates on the same events.
+- **Scales**: linear, log, FlowJo-style biex (the default for fluorescence),
+  logicle, arcsinh, hyperlog and negative log (log mirrored below zero), per
+  channel. Pick one from the button beside each axis picker (or right-click
+  the axis); Customize… opens a Transform window with a live preview, range
+  and width sliders, and Apply to Parameters. Changing a scale keeps gates on
+  the same events.
 - **Data cleaning** (Tools › Clean Data): removes margin events, flow-rate
   jumps (clogs, bubbles, pauses) and unstable stretches of a run, PeacoQC
   style, for every sample of a group at once. Lenient, Standard (PeacoQC's
