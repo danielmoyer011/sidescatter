@@ -110,6 +110,19 @@ def detector_channels(sample):
     return area or fluor
 
 
+def scatter_channels(sample):
+    """The (x, y) channels for a forward/side scatter gate, or None.
+
+    FSC-A against SSC-A when both exist (Cytek also has SSC-B-A, which comes
+    second); otherwise the first two scatter area channels.
+    """
+    scatter = [c.pnn for c in channels(sample) if c.kind == "scatter"]
+    if "FSC-A" in scatter and "SSC-A" in scatter:
+        return "FSC-A", "SSC-A"
+    area = [n for n in scatter if n.upper().endswith("-A")] or scatter
+    return tuple(area[:2]) if len(area) >= 2 else None
+
+
 def is_spectral(sample):
     """Raw full-spectrum data (as opposed to conventional or already-unmixed files)."""
     dets = detector_channels(sample)

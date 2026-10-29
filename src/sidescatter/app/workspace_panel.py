@@ -8,8 +8,9 @@ import json
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from . import theme
+from . import icons, theme
 from ..core.workspace import ALL_SAMPLES, ROOT
+from .boolean_editor import BooleanDialog, confirm_delete
 
 ROLE = QtCore.Qt.UserRole
 # Dragging populations from the sample table (e.g. onto a layout) carries this JSON:
@@ -154,6 +155,11 @@ class WorkspacePanel(QtWidgets.QWidget):
             item.setTextAlignment(1, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             item.setTextAlignment(2, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             item.setForeground(1, QtGui.QColor(theme.ACCENT_DARK))
+            if self.ws.is_boolean(name, parent):
+                item.setIcon(0, icons.icon("boolean", 16))
+                op, inputs = self.ws.boolean_inputs(name, parent)
+                item.setToolTip(0, "Boolean gate: " + f" {op.upper()} ".join(
+                    ("NOT " if neg else "") + " › ".join([*p[1:], n]) for n, p, neg in inputs))
             parent_item.addChild(item)
             self._add_children(item, sid, parent + (name,))
 
@@ -171,6 +177,16 @@ class WorkspacePanel(QtWidgets.QWidget):
     def selected(self):
         items = self.tree.selectedItems()
         return self._key(items[0]) if items else None
+
+    def selected_populations(self):
+        """(name, parent_path) of each selected gated population, once each, in tree order."""
+        out = []
+        for it in self._items():
+            if it.isSelected():
+                _, name, parent = self._key(it)
+                if name is not None and (name, parent) not in out:
+                    out.append((name, parent))
+        return out
 
     def selected_samples(self):
         return list(dict.fromkeys(self._key(i)[0] for i in self.tree.selectedItems()))
@@ -195,6 +211,11 @@ class WorkspacePanel(QtWidgets.QWidget):
         menu.addAction("UMAP, tSNE and FlowSOM…", lambda: self.analysisRequested.emit(sid, name, parent))
         menu.addSeparator()
         if name is not None:
+            if self.ws.is_boolean(name, parent):
+                menu.addAction(icons.icon("boolean", 16), "Edit Boolean gate…",
+                               lambda: self.edit_boolean(name, parent, sid))
+            menu.addAction(icons.icon("boolean", 16), "Boolean gate from selection…",
+                           lambda: self.make_boolean())
             menu.addAction("Rename population…", lambda: self._rename(name, parent))
             menu.addAction("Delete gate", lambda: self._delete(name, parent))
         else:
@@ -230,11 +251,28 @@ class WorkspacePanel(QtWidgets.QWidget):
             self.changed.emit()
 
     def _delete(self, name, parent):
-        answer = QtWidgets.QMessageBox.question(
-            self, "Delete gate", f"Delete {name} and every population inside it, in all samples?")
-        if answer == QtWidgets.QMessageBox.Yes:
+        if confirm_delete(self, self.ws, name, parent):
             self.ws.remove_gate(name, parent)
             self.changed.emit()
+
+    def make_boolean(self):
+        """Open the Boolean gate editor with the selected populations filled in."""
+        if not self.ws.population_paths():
+            QtWidgets.QMessageBox.information(
+                self, "Boolean gate", "Draw some gates first, then select the populations to combine.")
+            return []
+        sel = self.selected()
+        dlg = BooleanDialog(self.ws, self.selected_populations(),
+                            sample_id=sel[0] if sel else None, parent=self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted and dlg.made:
+            self.changed.emit()
+        return dlg.made
+
+    def edit_boolean(self, name, parent, sample_id=None):
+        dlg = BooleanDialog(self.ws, editing=(name, tuple(parent)), sample_id=sample_id, parent=self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted and dlg.made:
+            self.changed.emit()
+        return dlg.made
 
     def create_group(self):
         name, ok = QtWidgets.QInputDialog.getText(self, "Create group", "Group name:")
