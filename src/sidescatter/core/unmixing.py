@@ -125,15 +125,40 @@ class ControlResult:
     n_negative: int
 
 
-def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None):
+def control_keep(sample, settings=None):
+    """Clean a raw control: (mask of events that passed, cleaning.Result).
+
+    A clog or bubble in a single-stain control skews its signature, so the
+    Unmixing tab can drop those stretches before signatures are calculated.
+    """
+    from .workspace import Workspace  # workspace imports this module
+
+    ws = Workspace()
+    sid = ws.add_sample(sample, {"path": ""})
+    ws.compensation[sid] = "uncompensated"
+    res = ws.clean([sid], settings)[sid]
+    return ws.qc_keep(sid), res
+
+
+def _expand(mask_kept, kept):
+    """A mask over the kept events, as a mask over all events."""
+    full = np.zeros(len(kept), dtype=bool)
+    full[np.flatnonzero(kept)] = mask_kept
+    return full
+
+
+def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None,
+                  keep=None):
     """Build an Unmixer from control specs.
 
     Returns (unmixer, results) where results describes how each signature was
     derived so the UI can show it and let the user correct the gates.
     samples: optional {path: loaded Sample}, filled in as files are loaded.
+    keep: optional {path: mask of events to use}, e.g. the events that passed cleaning.
     """
     specs = [s for s in specs if s.is_reference]
     samples = {} if samples is None else samples
+    keep = keep or {}
 
     def sample_for(path):
         if path not in samples:
@@ -147,25 +172,34 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     def det_events(spec):
         return _detector_events(sample_for(spec.path), names, spec.path.name)
 
+    def kept_events(spec):
+        events, k = det_events(spec), keep.get(spec.path)
+        return events if k is None else events[k]
+
     references, results = [], []
     for spec in specs:
         if spec.role != "single_stain":
             continue
         events = det_events(spec)
+        k = keep.get(spec.path)
+        if k is None:
+            k = np.ones(len(events), dtype=bool)
 
         neg_events, neg_source = None, "internal"
         if spec.negative_mask is not None:
-            neg_events = events[spec.negative_mask]
+            neg_events = events[spec.negative_mask & k]
         elif spec.negative not in ("auto", "internal"):
-            neg_events, neg_source = det_events(ControlSpec(Path(spec.negative), "")), Path(spec.negative).name
+            neg_events = kept_events(ControlSpec(Path(spec.negative), ""))
+            neg_source = Path(spec.negative).name
         elif spec.negative == "auto":
             unstained = _matching_unstained(spec, specs)
             if unstained is not None:
-                neg_events, neg_source = det_events(unstained), unstained.path.name
+                neg_events, neg_source = kept_events(unstained), unstained.path.name
 
-        pos_mask, internal_neg, peak = spectral.auto_gate_control(events, neg_events)
+        pos_kept, neg_kept, peak = spectral.auto_gate_control(events[k], neg_events)
+        pos_mask, internal_neg = _expand(pos_kept, k), _expand(neg_kept, k)
         if spec.positive_mask is not None:
-            pos_mask = spec.positive_mask
+            pos_mask = spec.positive_mask & k
         if neg_events is None:
             neg_events = events[internal_neg]
 
@@ -178,9 +212,9 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     cell_unstained = next((s for s in specs if s.role == "unstained" and s.carrier == "cells"), None)
     any_unstained = cell_unstained or next((s for s in specs if s.role == "unstained"), None)
     if any_unstained is not None:
-        background_var = spectral.robust_sd(det_events(any_unstained)) ** 2
+        background_var = spectral.robust_sd(kept_events(any_unstained)) ** 2
     if autofluorescence and cell_unstained is not None:
-        af = spectral.autofluorescence_signatures(det_events(cell_unstained), n_autofluorescence)
+        af = spectral.autofluorescence_signatures(kept_events(cell_unstained), n_autofluorescence)
         for i, sig in enumerate(af):
             label = "Autofluorescence" if len(af) == 1 else f"Autofluorescence {i + 1}"
             references.append(spectral.Reference(label, sig, True, cell_unstained.path.name))

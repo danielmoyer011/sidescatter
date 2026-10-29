@@ -170,12 +170,15 @@ def qc_report(name, unmixer, specs, residuals, problems):
 
 
 def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
-                      unmixer_name="Unmixing", progress=None):
+                      unmixer_name="Unmixing", progress=None, clean_settings=None, cleaning_report=None):
     """Write the experiment into dest_dir as <name>.zip or a <name>/ folder.
 
     specs: every file of the experiment (excluded ones are skipped). samples:
     optional {path: loaded Sample}; files not in it are loaded one at a time.
     progress(done, total, text) is called before each file.
+    clean_settings: clean the unmixed samples (they get a QC passed population
+    in the exported workspace); cleaning_report(path, pages) then writes the
+    data-cleaning PDF into QC/.
     Returns an ExportResult. Nothing is left behind if writing fails.
     """
     from .workspace import Workspace  # workspace imports unmixing; keep this module light
@@ -195,6 +198,7 @@ def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
     ws = Workspace()
     ws.add_unmixer(unmixer_name, unmixer)
     residuals = {}
+    qc_pages = []
     work = Path(tempfile.mkdtemp(prefix="sidescatter-export-", dir=dest_dir))
     try:
         root = work / name
@@ -216,6 +220,11 @@ def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
             unmixed = fcs.load_sample(out, sample_id=ws._unique_id(fname))
             ws.add_sample(unmixed, {"path": f"{UNMIXED}/{group}/{fname}"},
                           "Unmixed" if group == SAMPLES else REFERENCE_GROUP)
+            if clean_settings is not None and group == SAMPLES:
+                if progress:
+                    progress(i, len(included), f"Cleaning {spec.path.name}")
+                res = ws.clean([unmixed.id], clean_settings, raw={unmixed.id: sample})[unmixed.id]
+                qc_pages.append({"sample": fname, "result": res, "plot": ws.qc_plot_data(unmixed.id)})
             # The saved workspace only needs ids, sources and transforms, so the
             # events can go now rather than piling up over a big experiment.
             ws.samples[unmixed.id] = None
@@ -228,6 +237,9 @@ def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
         (root / "QC report.txt").write_text(
             qc_report(name, unmixer, specs, residuals, [("warning", w) for w in warnings]),
             encoding="utf-8")
+        if qc_pages and cleaning_report is not None:
+            (root / "QC").mkdir()
+            cleaning_report(root / "QC" / f"{name} data cleaning.pdf", qc_pages)
         ws.save(root / f"{name}.ssw")
 
         if as_zip:
@@ -254,11 +266,12 @@ class Setup:
     method: str = "wls"
     autofluorescence: bool = True
     n_autofluorescence: int = 1
+    clean_controls: bool = False  # drop clogs and bubbles from controls before signatures
 
     def to_dict(self):
         return {
             "name": self.name, "method": self.method, "autofluorescence": self.autofluorescence,
-            "n_autofluorescence": self.n_autofluorescence,
+            "n_autofluorescence": self.n_autofluorescence, "clean_controls": self.clean_controls,
             "files": [{"path": str(s.path), "name": s.name, "role": s.role, "carrier": s.carrier,
                        "negative": s.negative, "marker": s.marker, "reasons": list(s.reasons),
                        "guessed_by": s.guessed_by} for s in self.specs],
@@ -271,4 +284,4 @@ class Setup:
                                       guessed_by=f.get("guessed_by", ""))
                  for f in d["files"]]
         return cls(d["name"], specs, d.get("method", "wls"), d.get("autofluorescence", True),
-                   d.get("n_autofluorescence", 1))
+                   d.get("n_autofluorescence", 1), d.get("clean_controls", False))

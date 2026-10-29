@@ -687,3 +687,22 @@ def _(p):
     p.setPen(QtCore.Qt.NoPen)
     _fill(p, theme.CORAL)
     p.drawPolygon(spark)
+
+
+@_register("clean_data")
+def _(p):
+    """Data cleaning: a signal over time with the bad stretch (a clog) shaded and cut out."""
+    p.setPen(QtCore.Qt.NoPen)
+    _fill(p, theme.CORAL, 70)
+    p.drawRoundedRect(QtCore.QRectF(13, 4, 7, 24), 1.5, 1.5)
+    _pen(p, theme.INK, 1.8)
+    p.drawLine(QtCore.QPointF(4, 28), QtCore.QPointF(28, 28))
+    p.drawLine(QtCore.QPointF(4, 4), QtCore.QPointF(4, 28))
+    _pen(p, theme.TEAL, 2.2)
+    p.drawPolyline([QtCore.QPointF(x, y) for x, y in
+                    ((6, 13), (8.5, 11), (11, 13), (13, 12))])
+    p.drawPolyline([QtCore.QPointF(x, y) for x, y in
+                    ((20, 12), (22.5, 13.5), (25, 11), (28, 12.5))])
+    _pen(p, theme.CORAL, 1.8)
+    p.drawPolyline([QtCore.QPointF(x, y) for x, y in
+                    ((13, 12), (15, 22), (17, 24), (19, 20), (20, 12))])

@@ -11,9 +11,11 @@ import zipfile
 from pathlib import Path
 
 import flowkit as fk
+from flowkit._models.gates._base_gate import Gate
 import numpy as np
+import pandas as pd
 
-from . import fcs, serialize, stats
+from . import cleaning, fcs, serialize, stats
 from .layout import Layout, rename_population
 from .spectral import Unmixer
 
@@ -26,6 +28,37 @@ SPECTRAL_RANGE = 4194304.0
 CONVENTIONAL_RANGE = 262144.0
 
 
+QC_GATE = "QC passed"
+
+
+class QCGate(Gate):
+    """The events that passed data cleaning: no shape, just one sample's mask.
+
+    The template gate keeps every event; each cleaned sample gets a custom
+    gate holding its own mask, so samples that were never cleaned are unaffected.
+    """
+
+    def __init__(self, gate_name=QC_GATE, keep=None):
+        super().__init__(gate_name, [])
+        self.gate_type = "QCGate"
+        self.keep = keep
+
+    def apply(self, df_events):
+        n = len(df_events)
+        if self.keep is None or len(self.keep) != n:
+            return np.ones(n, dtype=bool)
+        return self.keep.copy()
+
+
+class Strategy(fk.GatingStrategy):
+    """FlowKit's gating strategy, minus copying every event to apply a QC gate."""
+
+    def _preprocess_sample_events(self, sample, gate, cache_events=False):
+        if isinstance(gate, QCGate):
+            return pd.DataFrame(index=pd.RangeIndex(sample.event_count))
+        return super()._preprocess_sample_events(sample, gate, cache_events)
+
+
 def default_transform(channel, top):
     if channel.kind in ("time", "scatter"):
         return fk.transforms.LinearTransform(param_t=top, param_a=0.0)
@@ -34,7 +67,7 @@ def default_transform(channel, top):
 
 class Workspace:
     def __init__(self):
-        self.strategy = fk.GatingStrategy()
+        self.strategy = Strategy()
         self.samples = {}        # sample_id -> fk.Sample
         # sample_id -> {"path": str}, {"unmixed_from": id, "unmixer": name}, or
         # {"unmixed_from_path": raw file not in the workspace, "unmixer": name}
@@ -44,6 +77,8 @@ class Workspace:
         self.experiments = []    # Unmixing tab setups, as experiment.Setup.to_dict() dicts
         self.compensation = {}   # sample_id -> "FCS" (acquisition spillover) or "uncompensated"
         self.layouts = []        # Layout Editor pages (core.layout.Layout)
+        self.qc = {}             # sample_id -> cleaning.Result
+        self.qc_settings = cleaning.Settings()  # what the Clean data dialog last used
         self.revision = 0        # bumped whenever gating results may have changed
         self._results = {}       # sample_id -> fk GatingResults
         self._display_cache = {}
@@ -74,8 +109,11 @@ class Workspace:
         for members in self.groups.values():
             if sample_id in members:
                 members.remove(sample_id)
-        for d in (self.samples, self.sources, self.compensation, self._results):
+        for d in (self.samples, self.sources, self.compensation, self._results, self.qc):
             d.pop(sample_id, None)
+        qc = self.qc_gate()
+        if qc is not None:
+            self.strategy.remove_gate(qc, gate_path=ROOT, sample_id=sample_id)
         self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sample_id}
 
     def _unique_id(self, name):
@@ -181,6 +219,9 @@ class Workspace:
         self.invalidate()
 
     def remove_gate(self, name, parent_path):
+        if tuple(parent_path) == ROOT and name == self.qc_gate():
+            self.remove_qc()  # keeps the gates inside it
+            return
         self.strategy.remove_gate(name, gate_path=tuple(parent_path))
         self.invalidate()
 
@@ -341,6 +382,178 @@ class Workspace:
             rows.append(row)
         return pd.DataFrame(rows)
 
+    # ----- data cleaning ---------------------------------------------------
+
+    def qc_gate(self):
+        """Name of the QC passed population, if there is one."""
+        for gate in self.strategy.get_root_gates():
+            if isinstance(gate, QCGate):
+                return gate.gate_name
+        return None
+
+    def time_values(self, sample_id):
+        """Raw Time values, or None when the sample has no Time channel."""
+        ch = next((c for c in self.channels(sample_id) if c.kind == "time"), None)
+        if ch is None:
+            return None, None
+        return self.samples[sample_id].get_events(source="raw")[:, ch.index], ch.pnn
+
+    def time_step(self, sample_id):
+        """Seconds per Time unit ($TIMESTEP), or None."""
+        try:
+            return float(self.samples[sample_id].get_metadata().get("timestep"))
+        except (TypeError, ValueError):
+            return None
+
+    def default_qc_channels(self, sample_id):
+        return cleaning.default_channels(self.channels(sample_id))
+
+    def _margin_input(self, sample_id, names, raw=None):
+        """Raw values, $PnR and names of the channels checked for margin events.
+
+        Unmixed samples are checked on their raw detectors, where saturation
+        happens: raw, if given, or the raw file they were unmixed from.
+        """
+        src = self.sources.get(sample_id, {})
+        sample = self.samples[sample_id]
+        if raw is None and ("unmixed_from" in src or "unmixed_from_path" in src):
+            try:
+                raw = self._raw_for(src)
+            except (FileNotFoundError, KeyError, OSError, ValueError):
+                raw = None
+        if raw is not None:
+            if raw.event_count == sample.event_count:
+                chans = [c for c in fcs.channels(raw) if c.kind in ("scatter", "fluorescence")]
+                return (raw.get_events(source="raw")[:, [c.index for c in chans]],
+                        [float(raw.channels.loc[c.index, "pnr"] or 0) for c in chans],
+                        [c.pnn for c in chans])
+        idx = [sample.get_channel_index(n) for n in names]
+        return (sample.get_events(source="raw")[:, idx],
+                [float(sample.channels.loc[i, "pnr"] or 0) for i in idx], list(names))
+
+    def clean(self, sample_ids, settings=None, progress=None, raw=None):
+        """Clean samples with the same settings and put them under QC passed.
+
+        A sample whose stretches were edited by hand keeps the edits when it is
+        cleaned again with the same settings. progress(done, total, sample_id)
+        is called before each sample. raw: optional {sample_id: raw Sample} for
+        unmixed samples' margin check. Returns {sample_id: cleaning.Result}.
+        """
+        raw = raw or {}
+        settings = settings or self.qc_settings
+        self.qc_settings = settings
+        done = {}
+        for i, sid in enumerate(sample_ids):
+            if progress:
+                progress(i, len(sample_ids), sid)
+            have = set(self.samples[sid].pnn_labels)
+            names = [c for c in (settings.channels or self.default_qc_channels(sid)) if c in have]
+            values = np.column_stack([self.display_values(sid, c) for c in names]) if names \
+                else np.zeros((self.samples[sid].event_count, 0))
+            time, time_name = self.time_values(sid)
+            mraw, ranges, mnames = self._margin_input(sid, names, raw.get(sid))
+            res = cleaning.clean(values, names, time, settings, mraw, ranges, mnames, time_name)
+            old = self.qc.get(sid)
+            if old is not None and old.edited and \
+                    cleaning.Settings.from_dict(old.settings).same_method(settings):
+                res.stretches, res.edited = [list(x) for x in old.stretches], True
+            self.qc[sid] = res
+            done[sid] = res
+        self._sync_qc()
+        return done
+
+    def qc_keep(self, sample_id):
+        """Events of a sample that passed cleaning (all events if it wasn't cleaned)."""
+        res = self.qc.get(sample_id)
+        if res is None:
+            return np.ones(self.samples[sample_id].event_count, dtype=bool)
+        return ~res.removed(self.time_values(sample_id)[0])
+
+    def qc_plot_data(self, sample_id, channels=None):
+        """Time plots of a cleaned sample (see cleaning.plot_data)."""
+        res = self.qc[sample_id]
+        names = [c for c in (channels or res.channels) if c in self.samples[sample_id].pnn_labels]
+        values = np.column_stack([self.display_values(sample_id, c) for c in names]) if names \
+            else np.zeros((res.n_events, 0))
+        return cleaning.plot_data(res, self.time_values(sample_id)[0], values, names,
+                                  self.time_step(sample_id))
+
+    def set_qc_stretches(self, sample_id, spans):
+        """Replace a sample's removed stretches with (start, end) spans in Time units."""
+        res = self.qc[sample_id]
+        cleaning.set_stretch_times(res, self.time_values(sample_id)[0], spans)
+        self._sync_qc()
+
+    def reset_qc_stretches(self, sample_id):
+        res = self.qc[sample_id]
+        res.stretches, res.edited = [list(x) for x in res.auto_stretches], False
+        self._sync_qc()
+
+    def remove_qc(self, sample_ids=None):
+        """Undo cleaning. With no samples left cleaned, QC passed goes and its gates move back up."""
+        for sid in list(self.qc) if sample_ids is None else sample_ids:
+            self.qc.pop(sid, None)
+        self._sync_qc()
+
+    def _sync_qc(self):
+        qc = self.qc_gate()
+        if not self.qc:
+            if qc is not None:
+                self.strategy.remove_gate(qc, gate_path=ROOT, keep_children=True)
+                _move_layouts(self.layouts, (ROOT[0], qc), ROOT)
+            self.invalidate()
+            return
+        if qc is None:
+            qc = _unique(QC_GATE, [n for n, _ in self.children(ROOT)])
+            self._nest_root_gates(qc)
+        node = self.strategy._get_gate_node(qc, ROOT)
+        node.custom_gates.clear()
+        for sid in self.qc:
+            if self.samples.get(sid) is not None:  # an export drops events once a sample is written
+                node.custom_gates[sid] = QCGate(qc, self.qc_keep(sid))
+        self.invalidate()
+
+    def _nest_root_gates(self, qc):
+        """Put a new QC gate at the top and every existing gate inside it."""
+        old = self.strategy
+        new = Strategy()
+        for k, v in old.transformations.items():
+            new.add_transform(k, v)
+        for k, v in old.comp_matrices.items():
+            new.add_comp_matrix(k, v)
+        new.add_gate(QCGate(qc), ROOT)
+        top = (ROOT[0], qc)
+
+        def moved(path):
+            path = tuple(path)
+            return top + path[1:] if path[:1] == ROOT else path
+
+        for name, parent in self.population_paths():
+            node = old._get_gate_node(name, parent)
+            if isinstance(node.gate, fk.gates.Quadrant):
+                continue  # added with its QuadrantGate
+            gate = node.gate
+            if isinstance(gate, fk.gates.BooleanGate):
+                gate = copy.deepcopy(gate)
+                for ref in gate.gate_refs:
+                    ref["path"] = moved(ref["path"])
+            new.add_gate(gate, moved(parent))
+            for sid, custom in node.custom_gates.items():
+                new.add_gate(custom, moved(parent), sample_id=sid)
+        self.strategy = new
+        _move_layouts(self.layouts, ROOT, top)
+
+    def export_cleaned(self, sample_id, path):
+        """Write the events that passed cleaning (all channels, raw values) as an FCS file."""
+        sample = self.samples[sample_id]
+        keep = self.qc_keep(sample_id)
+        meta = {k: v for k, v in fcs.keywords(sample).items() if not k.lower().startswith("p")
+                or not k[1:2].isdigit()}
+        meta["SIDESCATTER_QC"] = f"{int(keep.sum())} of {len(keep)} events passed"
+        fcs.write_fcs(path, sample.get_events(source="raw")[keep], list(sample.pnn_labels),
+                      list(sample.pns_labels), meta, sample.channels["pnr"].tolist())
+        return int(keep.sum())
+
     # ----- spectral --------------------------------------------------------
 
     def add_unmixer(self, name, unmixer):
@@ -387,6 +600,8 @@ class Workspace:
                 self.samples[sid] = fresh
                 self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sid}
                 self.invalidate(sid)
+        if self.qc:
+            self._sync_qc()
 
     # ----- save / load -----------------------------------------------------
 
@@ -401,11 +616,12 @@ class Workspace:
             "groups": self.groups,
             "transforms": {k: serialize.transform_to_dict(v)
                            for k, v in self.strategy.transformations.items()},
-            "gates": [serialize.gate_to_dict(self.get_gate(n, p), p)
-                      for n, p in self.population_paths()],
+            "gates": [_gate_dict(self.get_gate(n, p), p) for n, p in self.population_paths()],
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
             "layouts": [lay.to_dict() for lay in self.layouts],
             "experiments": self.experiments,
+            "qc": {sid: r.to_dict() for sid, r in self.qc.items() if sid in self.samples},
+            "qc_settings": self.qc_settings.to_dict(),
         }
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("workspace.json", json.dumps(doc, indent=1))
@@ -444,8 +660,16 @@ class Workspace:
         ws.groups = {k: list(v) for k, v in doc["groups"].items()}
         ws.experiments = doc.get("experiments", [])
         for g in doc["gates"]:
-            ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]))
+            if g["type"] == "QCGate":
+                ws.strategy.add_gate(QCGate(g["name"]), ROOT)
+            else:
+                ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]))
         ws.layouts = [Layout.from_dict(d) for d in doc.get("layouts", [])]
+        ws.qc_settings = cleaning.Settings.from_dict(doc.get("qc_settings", {}))
+        ws.qc = {sid: cleaning.Result.from_dict(r) for sid, r in doc.get("qc", {}).items()
+                 if sid in ws.samples}
+        if ws.qc or ws.qc_gate():
+            ws._sync_qc()
         return ws
 
     # ----- FlowJo import ---------------------------------------------------
@@ -484,6 +708,31 @@ class Workspace:
             if name != ALL_SAMPLES:
                 ws.groups[name] = list(fj.get_sample_ids(name))
         return ws
+
+
+def _gate_dict(gate, parent_path):
+    if isinstance(gate, QCGate):
+        return {"name": gate.gate_name, "parent_path": list(parent_path), "type": "QCGate"}
+    return serialize.gate_to_dict(gate, parent_path)
+
+
+def _move_layouts(layouts, old_prefix, new_prefix):
+    """Point layout items at their populations' new paths after gates were nested or un-nested.
+
+    Items showing all events stay on all events.
+    """
+    old_prefix, n = list(old_prefix), len(old_prefix)
+    for lay in layouts:
+        for it in lay.items:
+            if it.population[:n] == old_prefix and len(it.population) > 1:
+                it.population = list(new_prefix) + it.population[n:]
+
+
+def _unique(name, taken):
+    out, k = name, 2
+    while out in taken:
+        out, k = f"{name} {k}", k + 1
+    return out
 
 
 def _gate_channels(gate):
