@@ -15,12 +15,13 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..core import experiment, fcs, spectral, unmixing
+from ..core import cleaning, experiment, fcs, spectral, unmixing
 from ..core.experiment import Setup
 from . import theme
 from .control_rows import ControlRow
 from .graph_view import BINS, CLOSE_PEN, DRAW_PEN, GATE_PEN, PSEUDOCOLOR, SNAP_FILL, SNAP_RADIUS_PX
 from .spectrum_plot import SignaturesView
+from . import qc_report
 
 COLS = ["File", "Role", "Fluor", "Marker", "Negative / AF", "Peak", "Positives", "Why"]
 C_FILE, C_ROLE, C_FLUOR, C_MARKER, C_NEG, C_PEAK, C_POS, C_WHY = range(len(COLS))
@@ -64,6 +65,7 @@ class UnmixingTab(QtWidgets.QWidget):
         self.results = []
         self.problems = []
         self._preview_cache = {}
+        self._control_qc = {}      # (path, settings) -> (keep mask, cleaning.Result)
         self.rows = []
         self._rows_stale = True
         self.setAcceptDrops(True)
@@ -129,6 +131,11 @@ class UnmixingTab(QtWidgets.QWidget):
         self.af_count.setRange(1, 6)
         self.af_count.setPrefix("Signatures: ")
         self.af_count.valueChanged.connect(self._settings_changed)
+        self.clean_check = QtWidgets.QCheckBox("Clean controls first")
+        self.clean_check.setToolTip(
+            "Remove margin events, clogs and bubbles from each control before its signature is "
+            "calculated (uses the Clean data settings). A clog in a control skews its spectrum.")
+        self.clean_check.toggled.connect(self._settings_changed)
         self.af_lib_size = QtWidgets.QSpinBox()
         self.af_lib_size.setRange(1, 60)
         self.af_lib_size.setValue(30)
@@ -151,6 +158,7 @@ class UnmixingTab(QtWidgets.QWidget):
         af_row.addWidget(self.af_auto)
         af_row.addStretch()
         options.addRow(af_row)
+        options.addRow(self.clean_check)
 
         self.status = QtWidgets.QLabel()
         self.status.setWordWrap(True)
@@ -320,6 +328,7 @@ class UnmixingTab(QtWidgets.QWidget):
             w.setCurrentIndex(v) if w is self.method else w.setValue(v)
             w.blockSignals(False)
         for w, v in ((self.af_check, self.setup.autofluorescence), (self.af_auto, self.setup.af_auto),
+                     (self.clean_check, self.setup.clean_controls),
                      (self.af_lib_size, self.setup.af_library_size),
                      (self.af_mode, self.af_mode.findData(self.setup.af_mode))):
             w.blockSignals(True)
@@ -569,6 +578,7 @@ class UnmixingTab(QtWidgets.QWidget):
         self.setup.method = self.method.currentData()
         self.setup.autofluorescence = self.af_check.isChecked()
         self.setup.n_autofluorescence = self.af_count.value()
+        self.setup.clean_controls = self.clean_check.isChecked()
         mode_changed = self.setup.af_mode != self.af_mode.currentData()
         self.setup.af_mode = self.af_mode.currentData()
         self.setup.af_library_size = self.af_lib_size.value()
@@ -604,6 +614,22 @@ class UnmixingTab(QtWidgets.QWidget):
 
     # ----- computing -------------------------------------------------------
 
+    def control_cleaning(self):
+        """{path: (keep mask, cleaning.Result)} for the reference controls, when they are cleaned."""
+        if not self.setup.clean_controls:
+            return {}
+        settings = self.ws.qc_settings
+        key = repr(sorted(settings.to_dict().items()))
+        out = {}
+        for spec in self.specs:
+            if spec.is_reference and spec.path in self.samples:
+                if (spec.path, key) not in self._control_qc:
+                    self._control_qc[(spec.path, key)] = unmixing.control_keep(
+                        self.samples[spec.path], cleaning.Settings.from_dict(
+                            {**settings.to_dict(), "channels": None}))
+                out[spec.path] = self._control_qc[(spec.path, key)]
+        return out
+
     def recalculate(self, rebuild_rows=True):
         """Rebuild the matrix from the current files and gates.
 
@@ -613,16 +639,23 @@ class UnmixingTab(QtWidgets.QWidget):
         self.problems = unmixing.check_specs(self.specs) if self.specs else []
         errors = [m for level, m in self.problems if level == "error"]
         self.unmixer, self.results = None, []
+        cleaned = {}
         if self.specs and not errors:
             try:
+                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+                try:
+                    cleaned = self.control_cleaning()
+                finally:
+                    QtWidgets.QApplication.restoreOverrideCursor()
                 self.unmixer, self.results = unmixing.build_unmixer(
                     [s for s in self.specs if s.role != "exclude"], method=self.setup.method,
                     n_autofluorescence=self.setup.n_autofluorescence,
                     autofluorescence=self.setup.autofluorescence, samples=self.samples,
                     af_mode=self.setup.af_mode, af_library_size=self.setup.af_library_size,
-                    af_auto=self.setup.af_auto)
+                    af_auto=self.setup.af_auto, keep={p: k for p, (k, _) in cleaned.items()})
             except Exception as exc:
                 errors.append(f"Couldn't build the unmixing matrix: {exc}")
+        self._cleaned = cleaned
         ok = self.unmixer is not None
         self.unmix_btn.setEnabled(ok)
         self.export_btn.setEnabled(ok)
@@ -691,6 +724,14 @@ class UnmixingTab(QtWidgets.QWidget):
                 if sim[i, j] > 0.98:
                     text += " Pairs above 0.98 are very hard to separate."
             lines.append(text)
+        cleaned = getattr(self, "_cleaned", {})
+        if cleaned:
+            parts = [(p.name, 100 * (1 - k.mean())) for p, (k, _) in cleaned.items() if len(k)]
+            worst = sorted(parts, key=lambda x: -x[1])[:3]
+            text = f"Cleaned {len(parts)} control(s)"
+            if worst and worst[0][1] > 0:
+                text += ": most removed from " + ", ".join(f"{n} ({pct:.1f}%)" for n, pct in worst if pct > 0)
+            lines.append(text + ".")
         lines += [f"<span style='color:#C2412D'>{m}</span>" for m in errors]
         lines += [f"<span style='color:#6A7187'>{m}</span>" for level, m in self.problems if level == "warning"]
         self.status.setText("<br>".join(lines))
@@ -879,16 +920,24 @@ class UnmixingTab(QtWidgets.QWidget):
         self.unmixed.emit(new_ids)
         return new_ids
 
-    def export(self, dest=None, name=None, as_zip=None):
-        """Ask where to write the experiment (unless told), then write it."""
+    def export(self, dest=None, name=None, as_zip=None, clean=None):
+        """Ask where to write the experiment (unless told), then write it.
+
+        clean: also clean the samples and add the data-cleaning PDF (default:
+        when anything in the workspace has been cleaned).
+        """
         if self.unmixer is None:
             return None
         if dest is None:
             dlg = ExportDialog(self.setup.name if not self.setup.name.startswith("Experiment ")
-                               else experiment.default_name(self.specs, self.samples), self)
+                               else experiment.default_name(self.specs, self.samples), self,
+                               clean=bool(self.ws.qc))
             if dlg.exec() != QtWidgets.QDialog.Accepted:
                 return None
             dest, name, as_zip = dlg.values()
+            clean = dlg.clean.isChecked()
+        elif clean is None:
+            clean = bool(self.ws.qc)
         progress = QtWidgets.QProgressDialog("Exporting…", "", 0, 1, self)
         progress.setWindowTitle("Export experiment")
         progress.setCancelButton(None)
@@ -905,7 +954,9 @@ class UnmixingTab(QtWidgets.QWidget):
             result = experiment.export_experiment(dest, name, self.specs, self.unmixer,
                                                   as_zip=as_zip, samples=self.samples,
                                                   unmixer_name=self.setup.name, progress=step,
-                                                  af_settings=self.setup.af_settings)
+                                                  af_settings=self.setup.af_settings,
+                                                  clean_settings=self.ws.qc_settings if clean else None,
+                                                  cleaning_report=qc_report.write_pdf)
         except Exception as exc:
             progress.close()
             QtWidgets.QMessageBox.critical(self, "Export experiment", f"The export failed:\n\n{exc}")
@@ -926,9 +977,11 @@ class UnmixingTab(QtWidgets.QWidget):
 class ExportDialog(QtWidgets.QDialog):
     """Name, destination folder and zip-or-folder for an exported experiment."""
 
-    def __init__(self, name, parent=None):
+    def __init__(self, name, parent=None, clean=False):
         super().__init__(parent)
         self.setWindowTitle("Export experiment")
+        self.clean = QtWidgets.QCheckBox("Clean the samples and add a data-cleaning report (QC/*.pdf)")
+        self.clean.setChecked(clean)
         self.name = QtWidgets.QLineEdit(name)
         self.folder = QtWidgets.QLineEdit(str(Path.home()))
         browse = QtWidgets.QPushButton("Browse…")
@@ -956,6 +1009,7 @@ class ExportDialog(QtWidgets.QDialog):
         form.addRow("Experiment name", self.name)
         form.addRow("Save in", row)
         form.addRow("Format", fmt)
+        form.addRow(self.clean)
         form.addRow(layout_hint)
         form.addRow(buttons)
         self.setMinimumWidth(520)

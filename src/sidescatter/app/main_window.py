@@ -18,6 +18,7 @@ from . import icons
 from .analysis_dialog import AnalysisDialog, HeatmapDialog
 from .graph_view import GraphWindow
 from .layout_editor import LayoutWindow
+from .qc_window import CleanDialog, QCWindow, run_cleaning
 from .ribbon import Ribbon
 from .suggestion_box import SuggestionDialog
 from .table_editor import TableEditor
@@ -39,6 +40,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graphs = []   # open GraphWindows
         self.graph = None  # the GraphView used most recently
         self.layout_window = None
+        self.qc_window = None
 
         self.panel = WorkspacePanel(self.ws)
         self.panel.populationActivated.connect(self.open_graph)
@@ -114,6 +116,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "export_exp": A("Export &experiment…", "export", lambda: self.unmix_tab.export(), None,
                             "Export\nExperiment…",
                             tip="Write a zipped experiment with Raw and Unmixed folders, like SpectroFlo"),
+            "clean": A("&Clean data…", "clean_data", self.clean_data, None, "Clean\nData…",
+                       tip="Remove margin events, clogs, bubbles and drift from every sample in the "
+                           "group (PeacoQC-style)"),
+            "qc": A("Data cleaning &results…", "clean_data", self.open_qc_window, None, "Cleaning\nResults",
+                    tip="Check what cleaning removed, edit the removed stretches, export a PDF report"),
             "analysis": A("UMAP, tSNE and &FlowSOM…", "umap", self.run_analysis, None,
                           "UMAP / tSNE\nFlowSOM…",
                           tip="Map and cluster the selected population (UMAP, tSNE, PCA, FlowSOM)"),
@@ -138,8 +145,8 @@ class MainWindow(QtWidgets.QMainWindow):
                        "export", None, "quit"]),
             ("&Edit", ["boolean", "rename", "delete", "remove"]),
             ("&Workspace", ["add", "group", "keyword", None, "graph", "layout"]),
-            ("&Tools", ["unmix", "export_exp", None, "analysis", "heatmap", "remove_analysis", None,
-                        "table", "transform"]),
+            ("&Tools", ["unmix", "export_exp", "clean", "qc", None, "analysis", "heatmap", "remove_analysis",
+                        None, "table", "transform"]),
             ("&Help", ["suggest", None, "about", "license", "website"]),
         )
         # FlowJo 10 has no menu bar on Windows: the ribbon replaces it. macOS keeps
@@ -165,7 +172,8 @@ class MainWindow(QtWidgets.QMainWindow):
         home.add_group("Navigate", [acts["new"], acts["add"], acts["group"], acts["table"]])
         home.add_group("Experiment", [acts["keyword"], acts["graph"], acts["boolean"], acts["layout"],
                                       acts["demo"]])
-        home.add_group("Cytometry", [acts["unmix"], acts["analysis"], acts["transform"], acts["import"]])
+        home.add_group("Cytometry", [acts["unmix"], acts["clean"], acts["analysis"], acts["transform"],
+                                     acts["import"]])
         home.add_group("Help", [acts["suggest"], acts["website"], acts["about"], acts["license"]])
 
         page = r.add_tab("File")
@@ -186,6 +194,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         page = r.add_tab("Tools")
         page.add_group("Spectral", [acts["unmix"], acts["export_exp"]])
+        page.add_group("Quality", [acts["clean"], acts["qc"]])
         page.add_group("Clustering", [acts["analysis"], acts["heatmap"], acts["remove_analysis"]])
         page.add_group("Statistics", [acts["table"]])
         page.add_group("Figures", [acts["layout"]])
@@ -204,6 +213,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ----- state -----------------------------------------------------------
 
     def _changed(self):
+        self._gates_moved()
         self.dirty = True
         self.panel.rebuild_groups()
         self._update_title()
@@ -213,6 +223,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(0, win.view.refresh)
         if self.layout_window is not None and sender is not self.layout_window:
             QtCore.QTimer.singleShot(0, self.layout_window.refresh)
+        if self.qc_window is not None and sender is not self.qc_window:
+            QtCore.QTimer.singleShot(0, self.qc_window.refresh)
 
     def _layouts_changed(self):
         self.dirty = True
@@ -230,6 +242,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.layout_window is not None:
             self.layout_window.set_workspace(ws)
         self.unmix_tab.set_workspace(ws)
+        if self.qc_window is not None:
+            self.qc_window.set_workspace(ws)
         self.path, self.dirty = path, False
         self._update_title()
 
@@ -452,6 +466,49 @@ class MainWindow(QtWidgets.QMainWindow):
         if new_ids:
             self.open_graph(new_ids[0])
         self.statusBar().showMessage(f"Unmixed {len(new_ids)} sample(s).", 6000)
+
+    def clean_data(self, sample_ids=None):
+        """Clean every sample of the current group (or the given ones) with the same settings."""
+        ids = list(sample_ids or self.ws.groups.get(self.panel.current_group(), []))
+        if not ids:
+            QtWidgets.QMessageBox.information(self, "Clean data", "Add samples first.")
+            return None
+        dlg = CleanDialog(self.ws, ids, parent=self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        done = run_cleaning(self.ws, ids, dlg.settings(), self)
+        if done is None:
+            return None
+        self._changed()
+        win = self.open_qc_window()
+        win.refresh()
+        return done
+
+    def open_qc_window(self):
+        if self.qc_window is None:
+            self.qc_window = QCWindow(self.ws, self)
+            self.qc_window.changed.connect(self._changed)
+        win = self.qc_window
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        return win
+
+    def _gates_moved(self):
+        """Keep graph windows on their population after QC passed was added or removed."""
+        qc = self.ws.qc_gate()
+        pops = set(self.ws.population_paths()) if self.graphs else set()
+        for win in self.graphs:
+            v = win.view
+            name, parent = v.population
+            if name is None:
+                continue
+            tries = [parent]
+            if qc is not None and parent[1:2] != (qc,):
+                tries.append(ROOT + (qc,) + parent[1:])
+            if len(parent) > 1:
+                tries.append(ROOT + parent[2:])
+            v.population = next(((name, tuple(p)) for p in tries if (name, tuple(p)) in pops), (None, ROOT))
 
     def run_analysis(self, sample_id=None, name=None, parent_path=ROOT):
         """Set up UMAP / tSNE / PCA / FlowSOM on a population (the selected one by default)."""
