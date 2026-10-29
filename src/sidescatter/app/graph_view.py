@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import icons, theme
 from ..core.workspace import ALL_SAMPLES, ROOT
 from .axes import TransformAxis
+from .boolean_editor import confirm_delete
 
 BINS = 256
 PSEUDOCOLOR = pg.ColorMap(*zip(*theme.PSEUDOCOLOR_STOPS))
@@ -568,9 +569,7 @@ class GraphView(QtWidgets.QWidget):
             self.refresh()
 
     def _delete_gate(self, child, path):
-        answer = QtWidgets.QMessageBox.question(
-            self, "Delete gate", f"Delete {child} and every population inside it, in all samples?")
-        if answer == QtWidgets.QMessageBox.Yes:
+        if confirm_delete(self, self.ws, child, path):
             self.ws.remove_gate(child, path)
             self.gatesChanged.emit()
             self.refresh()
