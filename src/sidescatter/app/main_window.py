@@ -15,6 +15,7 @@ from .. import __version__
 from ..core.fcs import find_fcs_files
 from ..core.workspace import ROOT, Workspace
 from . import icons
+from .analysis_dialog import AnalysisDialog, HeatmapDialog
 from .graph_view import GraphWindow
 from .layout_editor import LayoutWindow
 from .ribbon import Ribbon
@@ -42,6 +43,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel = WorkspacePanel(self.ws)
         self.panel.populationActivated.connect(self.open_graph)
         self.panel.changed.connect(self._changed)
+        self.panel.analysisRequested.connect(self.run_analysis)
         self.unmix_tab = UnmixingTab(self.ws)
         self.unmix_tab.unmixed.connect(self._after_unmix)
         self.unmix_tab.changed.connect(self._changed)
@@ -109,6 +111,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "export_exp": A("Export &experiment…", "export", lambda: self.unmix_tab.export(), None,
                             "Export\nExperiment…",
                             tip="Write a zipped experiment with Raw and Unmixed folders, like SpectroFlo"),
+            "analysis": A("UMAP, tSNE and &FlowSOM…", "umap", self.run_analysis, None,
+                          "UMAP / tSNE\nFlowSOM…",
+                          tip="Map and cluster the selected population (UMAP, tSNE, PCA, FlowSOM)"),
+            "heatmap": A("Metacluster &heatmap…", "heatmap", self.show_heatmap, None,
+                         "Cluster\nHeatmap…", tip="Median of each channel in each FlowSOM metacluster"),
+            "remove_analysis": A("Delete &analysis…", "delete", self.delete_analysis, None,
+                                 "Delete\nAnalysis…",
+                                 tip="Remove an analysis with its channels and metacluster populations"),
             "table": A("&Table editor…", "table_editor", self.open_table_editor, "Ctrl+T",
                        "Table\nEditor"),
             "transform": A("Axis &transform…", "transform", self.edit_transform, None,
@@ -125,7 +135,8 @@ class MainWindow(QtWidgets.QMainWindow):
                        "export", None, "quit"]),
             ("&Edit", ["rename", "delete", "remove"]),
             ("&Workspace", ["add", "group", "keyword", None, "graph", "layout"]),
-            ("&Tools", ["unmix", "export_exp", "table", "transform"]),
+            ("&Tools", ["unmix", "export_exp", None, "analysis", "heatmap", "remove_analysis", None,
+                        "table", "transform"]),
             ("&Help", ["suggest", None, "about", "license", "website"]),
         )
         # FlowJo 10 has no menu bar on Windows: the ribbon replaces it. macOS keeps
@@ -150,7 +161,7 @@ class MainWindow(QtWidgets.QMainWindow):
         home = r.add_tab("Sidescatter")
         home.add_group("Navigate", [acts["new"], acts["add"], acts["group"], acts["table"]])
         home.add_group("Experiment", [acts["keyword"], acts["graph"], acts["layout"], acts["demo"]])
-        home.add_group("Cytometry", [acts["unmix"], acts["transform"], acts["import"]])
+        home.add_group("Cytometry", [acts["unmix"], acts["analysis"], acts["transform"], acts["import"]])
         home.add_group("Help", [acts["suggest"], acts["website"], acts["about"], acts["license"]])
 
         page = r.add_tab("File")
@@ -170,6 +181,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         page = r.add_tab("Tools")
         page.add_group("Spectral", [acts["unmix"], acts["export_exp"]])
+        page.add_group("Clustering", [acts["analysis"], acts["heatmap"], acts["remove_analysis"]])
         page.add_group("Statistics", [acts["table"]])
         page.add_group("Figures", [acts["layout"]])
 
@@ -426,6 +438,70 @@ class MainWindow(QtWidgets.QMainWindow):
         if new_ids:
             self.open_graph(new_ids[0])
         self.statusBar().showMessage(f"Unmixed {len(new_ids)} sample(s).", 6000)
+
+    def run_analysis(self, sample_id=None, name=None, parent_path=ROOT):
+        """Set up UMAP / tSNE / PCA / FlowSOM on a population (the selected one by default)."""
+        if not self.ws.samples:
+            QtWidgets.QMessageBox.information(self, "UMAP, tSNE and FlowSOM", "Add samples first.")
+            return None
+        if sample_id is None:
+            sel = self.panel.selected()
+            if sel:
+                sample_id, name, parent_path = sel
+        group = self.panel.current_group()
+        samples = self.ws.groups.get(group) or self.ws.groups.get("All Samples", [])
+        if sample_id is not None and sample_id not in samples:
+            samples = [sample_id]
+        dlg = AnalysisDialog(self.ws, name, parent_path, samples, parent=self)
+        dlg.analysisDone.connect(self._after_analysis)
+        dlg.exec()
+        return dlg
+
+    def _after_analysis(self, record):
+        self._changed()
+        st = record.settings
+        self.panel.select_group(st.name)
+        view = self.open_graph(record.concatenated_id, st.population, st.parent_path)
+        maps = [m for m in ("umap", "tsne", "pca") if m in st.methods]
+        if maps:
+            x, y = st.output_channels()[maps[0]]
+            view.set_axes(x, y)
+        self.statusBar().showMessage(
+            f"{st.name}: added {', '.join(st.all_output_channels())} to {len(st.samples)} sample(s).", 8000)
+
+    def _pick_analysis(self, title, flowsom_only=False):
+        names = [a.settings.name for a in self.ws.analyses
+                 if not flowsom_only or "flowsom" in a.settings.methods]
+        if not names:
+            QtWidgets.QMessageBox.information(
+                self, title, "No FlowSOM analysis yet. Run UMAP, tSNE and FlowSOM first."
+                if flowsom_only else "There are no analyses in this workspace.")
+            return None
+        if len(names) == 1:
+            return self.ws.analysis(names[0])
+        name, ok = QtWidgets.QInputDialog.getItem(self, title, "Analysis:", names, len(names) - 1, False)
+        return self.ws.analysis(name) if ok else None
+
+    def show_heatmap(self):
+        record = self._pick_analysis("Metacluster heatmap", flowsom_only=True)
+        if record is not None:
+            dlg = HeatmapDialog(self.ws, record, self)
+            dlg.show()
+            return dlg
+        return None
+
+    def delete_analysis(self):
+        record = self._pick_analysis("Delete analysis")
+        if record is None:
+            return
+        st = record.settings
+        answer = QtWidgets.QMessageBox.question(
+            self, "Delete analysis",
+            f"Delete {st.name}? This removes {', '.join(st.all_output_channels())} from its samples, "
+            "its concatenated sample, and its metacluster populations with every gate inside them.")
+        if answer == QtWidgets.QMessageBox.Yes:
+            self.ws.remove_analysis(st.name)
+            self._changed()
 
     def open_table_editor(self):
         samples = self.ws.groups.get(self.panel.current_group(), [])

@@ -687,3 +687,28 @@ def _(p):
     p.setPen(QtCore.Qt.NoPen)
     _fill(p, theme.CORAL)
     p.drawPolygon(spark)
+
+
+@_register("umap")
+def _(p):
+    """UMAP / FlowSOM: islands of cells in three cluster colours."""
+    for colour, pts in ((theme.ACCENT, [(8, 9), (11, 7), (10, 12), (6, 12), (13, 10)]),
+                        (theme.TEAL, [(21, 8), (24, 11), (20, 12), (25, 7), (22, 14)]),
+                        (theme.CORAL, [(14, 22), (17, 25), (12, 25), (18, 21), (15, 19), (20, 24)])):
+        _scatter(p, pts, colour, 2.0)
+    _pen(p, theme.INK, 1.4)
+    p.drawLine(QtCore.QPointF(3, 3), QtCore.QPointF(3, 29))
+    p.drawLine(QtCore.QPointF(3, 29), QtCore.QPointF(29, 29))
+
+
+@_register("heatmap")
+def _(p):
+    """Cluster heatmap: a grid of cells shaded low to high."""
+    shades = ((40, 200, 90, 30), (220, 60, 30, 120), (90, 30, 230, 60), (30, 140, 60, 220))
+    p.setPen(QtCore.Qt.NoPen)
+    for r, row in enumerate(shades):
+        for c, alpha in enumerate(row):
+            _fill(p, theme.ACCENT, alpha)
+            p.drawRect(QtCore.QRectF(5 + c * 6, 5 + r * 6, 5.4, 5.4))
+    _pen(p, theme.INK, 1.4)
+    p.drawRect(QtCore.QRectF(4.5, 4.5, 24, 24))
