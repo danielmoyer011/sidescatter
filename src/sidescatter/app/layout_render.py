@@ -148,6 +148,8 @@ class PlotCache:
         else:
             y = ws.display_values(sid, ych, mask)
             if item.plot_type == "Dot plot":
+                ok = np.isfinite(x) & np.isfinite(y)  # computed channels (UMAP...) can be empty
+                x, y = x[ok], y[ok]
                 n = min(len(x), DOT_LIMIT)
                 idx = np.random.default_rng(0).choice(len(x), n, replace=False) \
                     if len(x) > n else slice(None)
