@@ -366,3 +366,23 @@ def test_plot_data_for_reports(tmp_path):
     assert [c["name"] for c in data["channels"]] == ws.qc[sid].channels
     assert data["channels"][1]["hist"].shape == (240, 90)
     assert data["channels"][1]["peaks"]
+
+
+def test_boolean_gates_follow_their_inputs_into_qc_passed(tmp_path):
+    ws, sid, _, _ = _workspace(tmp_path, clog=True)
+    _linear(ws, sid)
+    ws.add_gate(fk.gates.RectangleGate("A", [ws.make_dimension(sid, "C1-A", 0.15, 0.45)]))
+    ws.add_gate(fk.gates.RectangleGate("B", [ws.make_dimension(sid, "C2-A", 0.4, None)]))
+    name, parent = ws.add_boolean([("A", ROOT, False), ("B", ROOT, True)], "and")
+    before = ws.count(sid, name, parent)
+
+    ws.clean([sid])
+    top = ROOT + (QC_GATE,)
+    paths = dict(ws.population_paths())
+    assert paths["A"] == top and paths["B"] == top
+    assert all(tuple(p)[:2] == top for _, p, _ in ws.boolean_inputs(name, paths[name])[1])
+    assert 0 < ws.count(sid, name, paths[name]) < before
+
+    ws.remove_qc()
+    paths = dict(ws.population_paths())
+    assert paths["A"] == ROOT and ws.count(sid, name, paths[name]) == before

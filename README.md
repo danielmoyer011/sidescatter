@@ -28,8 +28,13 @@ workflow familiar to FlowJo users.
     themselves, and each stain is paired with the unstained control of the
     same kind, or with its own dim events;
   - signature viewer, similarity matrix and complexity index;
-  - ordinary or weighted least squares, with one or more autofluorescence
-    signatures from unstained cells;
+  - ordinary or weighted least squares, with autofluorescence handled per
+    cell (each cell is matched to the best of a library of AF spectra from
+    the unstained cells, AutoSpectral style, adding `AF-A` and `AF Index`
+    channels) or as one or more AF signatures unmixed like fluors;
+  - draw AF populations on the unstained cells to add them to the library,
+    give each sample its own tissue's unstained, and compare both AF methods
+    on the unstained cells in the AF check tab and the QC report;
   - drag the positive gate on any control and see signatures, unmixed plots
     and per-detector residuals update live;
   - unmix any number of samples into new, gateable samples, with channels
@@ -112,6 +117,10 @@ machines; clone [FlowKit](https://github.com/whitews/FlowKit) into
   injected into synthetic runs.
 - Unmixing recovers known abundances exactly on synthetic data, and WLS beats
   OLS under photon noise.
+- On synthetic tissue-like data with four kinds of autofluorescence, per-cell
+  AF matching leaves at least 4 times less spread on unstained cells than a
+  single AF signature, and recovers stained cells at least twice as
+  accurately.
 - Gate counts on FlowJo 10 workspaces: populations above 1,000 events agree
   with FlowJo within 0.5%. Small populations gated on FlowJo's biexponential
   scale can still differ by up to about 15%; closing that gap is the current

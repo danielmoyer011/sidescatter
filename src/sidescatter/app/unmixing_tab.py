@@ -1,10 +1,12 @@
 """The Unmixing tab: raw files in, classified, unmixed, and packaged like SpectroFlo.
 
-Add or drop every raw file of an experiment. Each one is classified as an
-unstained or single-color reference (on beads or cells), a multicolor
-sample, or left out, and the table shows why. Fix anything that's wrong,
-check the signatures and the live preview, then unmix into the workspace or
-export a zipped experiment with Raw and Unmixed folders.
+Three steps, as on the instrument. 1 Select controls: add or drop every raw
+file of an experiment; each one is classified as an unstained or single-color
+reference (on beads or cells), a multicolor sample, or left out, and the table
+shows why. 2 Identify positives: one row per control with its scatter gate,
+the Positive and Negative ranges on its peak detector, and its spectrum.
+3 Check and unmix: signatures, similarity and a live preview, then unmix into
+the workspace or export a zipped experiment with Raw and Unmixed folders.
 """
 
 from pathlib import Path
@@ -15,10 +17,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core import cleaning, experiment, fcs, spectral, unmixing
 from ..core.experiment import Setup
-from .graph_view import BINS, PSEUDOCOLOR
+from . import theme
+from .control_rows import ControlRow
+from .graph_view import BINS, CLOSE_PEN, DRAW_PEN, GATE_PEN, PSEUDOCOLOR, SNAP_FILL, SNAP_RADIUS_PX
+from .spectrum_plot import SignaturesView
 from . import qc_report
 
-COLS = ["File", "Role", "Fluor", "Marker", "Negative", "Peak", "Positives", "Why"]
+COLS = ["File", "Role", "Fluor", "Marker", "Negative / AF", "Peak", "Positives", "Why"]
 C_FILE, C_ROLE, C_FLUOR, C_MARKER, C_NEG, C_PEAK, C_POS, C_WHY = range(len(COLS))
 # The six choices in the Role column: (label, role, carrier).
 ROLE_CHOICES = [
@@ -32,8 +37,7 @@ ROLE_CHOICES = [
 ROLE_COLORS = {"unstained": "#EEF0F6", "single_stain": "#E8F6F6", "sample": "#EEEEFB", "exclude": "#F6F7FB"}
 ASINH_COFACTOR = 2000.0
 PREVIEW_EVENTS = 50_000
-PALETTE = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 103, 189),
-           (140, 86, 75), (227, 119, 194), (127, 127, 127), (188, 189, 34), (23, 190, 207)]
+STEPS = ("Select controls", "Identify positives", "Check and unmix")
 
 
 def _asinh(x):
@@ -62,6 +66,8 @@ class UnmixingTab(QtWidgets.QWidget):
         self.problems = []
         self._preview_cache = {}
         self._control_qc = {}      # (path, settings) -> (keep mask, cleaning.Result)
+        self.rows = []
+        self._rows_stale = True
         self.setAcceptDrops(True)
 
         # ----- experiment picker
@@ -89,7 +95,6 @@ class UnmixingTab(QtWidgets.QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.table.itemSelectionChanged.connect(self._show_control)
         self.table.itemChanged.connect(self._on_item_edited)
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_menu)
@@ -114,6 +119,14 @@ class UnmixingTab(QtWidgets.QWidget):
         self.af_check = QtWidgets.QCheckBox("Extract autofluorescence from unstained cells")
         self.af_check.setChecked(True)
         self.af_check.toggled.connect(self._settings_changed)
+        self.af_mode = QtWidgets.QComboBox()
+        self.af_mode.addItem("Per-cell matching", "per_cell")
+        self.af_mode.addItem("AF signatures as fluors", "fluors")
+        self.af_mode.setToolTip(
+            "Per-cell matching: every cell gets the one AF spectrum from a library that fits it best "
+            "(best for tissues with mixed AF). As fluors: a few AF signatures are unmixed like fluors, "
+            "as SpectroFlo does.")
+        self.af_mode.currentIndexChanged.connect(self._settings_changed)
         self.af_count = QtWidgets.QSpinBox()
         self.af_count.setRange(1, 6)
         self.af_count.setPrefix("Signatures: ")
@@ -123,11 +136,27 @@ class UnmixingTab(QtWidgets.QWidget):
             "Remove margin events, clogs and bubbles from each control before its signature is "
             "calculated (uses the Clean data settings). A clog in a control skews its spectrum.")
         self.clean_check.toggled.connect(self._settings_changed)
+        self.af_lib_size = QtWidgets.QSpinBox()
+        self.af_lib_size.setRange(1, 60)
+        self.af_lib_size.setValue(30)
+        self.af_lib_size.setPrefix("Library: up to ")
+        self.af_lib_size.setSuffix(" spectra")
+        self.af_lib_size.setToolTip("Most automatic AF spectra per unstained file; near-duplicates "
+                                    "(cosine similarity above 0.99) are dropped.")
+        self.af_lib_size.valueChanged.connect(self._settings_changed)
+        self.af_auto = QtWidgets.QCheckBox("Automatic spectra")
+        self.af_auto.setChecked(True)
+        self.af_auto.setToolTip("Untick to use only the AF populations you draw in the AF library tab.")
+        self.af_auto.toggled.connect(self._settings_changed)
         options = QtWidgets.QFormLayout()
         options.addRow("Method", self.method)
         af_row = QtWidgets.QHBoxLayout()
         af_row.addWidget(self.af_check)
+        af_row.addWidget(self.af_mode)
         af_row.addWidget(self.af_count)
+        af_row.addWidget(self.af_lib_size)
+        af_row.addWidget(self.af_auto)
+        af_row.addStretch()
         options.addRow(af_row)
         options.addRow(self.clean_check)
 
@@ -135,7 +164,9 @@ class UnmixingTab(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         self.status.setTextFormat(QtCore.Qt.RichText)
 
-        left = QtWidgets.QVBoxLayout()
+        select_page = QtWidgets.QWidget()
+        left = QtWidgets.QVBoxLayout(select_page)
+        left.setContentsMargins(0, 0, 0, 0)
         buttons = QtWidgets.QHBoxLayout()
         for b in (add_btn, folder_btn, remove_btn):
             buttons.addWidget(b)
@@ -146,26 +177,32 @@ class UnmixingTab(QtWidgets.QWidget):
         left.addLayout(options)
         left.addWidget(self.status)
 
-        # ----- workbench
+        # ----- step 2: one row per reference control
+        identify_page = QtWidgets.QWidget()
+        il = QtWidgets.QVBoxLayout(identify_page)
+        il.setContentsMargins(0, 0, 0, 0)
+        self.identify_hint = QtWidgets.QLabel()
+        self.identify_hint.setWordWrap(True)
+        self.identify_hint.setObjectName("Hint")
+        self.rows_box = QtWidgets.QWidget()
+        self.rows_layout = QtWidgets.QVBoxLayout(self.rows_box)
+        self.rows_layout.setContentsMargins(0, 0, 6, 0)
+        self.rows_layout.setSpacing(10)
+        self.rows_layout.addStretch()
+        rows_scroll = QtWidgets.QScrollArea()
+        rows_scroll.setWidgetResizable(True)
+        rows_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        rows_scroll.setWidget(self.rows_box)
+        il.addWidget(self.identify_hint)
+        il.addWidget(rows_scroll, 1)
+
+        # ----- step 3: signatures, similarity, live preview
         self.tabs = QtWidgets.QTabWidget()
-        self.sig_plot = pg.PlotWidget(background="w")
-        self.sig_plot.addLegend(offset=(-10, 10))
-        self.sig_plot.setLabel("left", "Normalised intensity")
-        self.tabs.addTab(self.sig_plot, "Signatures")
+        self.signatures = SignaturesView()
+        self.tabs.addTab(self.signatures, "Signatures")
 
         self.sim_table = QtWidgets.QTableWidget()
         self.tabs.addTab(self.sim_table, "Similarity")
-
-        self.ctrl_plot = pg.PlotWidget(background="w")
-        self.ctrl_plot.setLabel("bottom", "Peak detector (asinh scale)")
-        self.ctrl_hint = QtWidgets.QLabel(
-            "Select a single-color control. Drag the shaded region to choose which events count as positive.")
-        self.ctrl_hint.setWordWrap(True)
-        ctrl_box = QtWidgets.QWidget()
-        cl = QtWidgets.QVBoxLayout(ctrl_box)
-        cl.addWidget(self.ctrl_hint)
-        cl.addWidget(self.ctrl_plot)
-        self.tabs.addTab(ctrl_box, "Control gate")
 
         preview = QtWidgets.QWidget()
         pl = QtWidgets.QGridLayout(preview)
@@ -188,6 +225,42 @@ class UnmixingTab(QtWidgets.QWidget):
         pl.addWidget(self.resid_plot, 2, 0, 1, 6)
         self.tabs.addTab(preview, "Live preview")
 
+        self.af_view = AFLibraryView()
+        self.af_view.gates_changed.connect(self._af_gates_changed)
+        self.tabs.addTab(self.af_view, "AF library")
+        self.af_check_view = AFCheckView()
+        self.tabs.addTab(self.af_check_view, "AF check")
+        self._af_check = None
+        self.tabs.currentChanged.connect(self._af_tab_shown)
+
+        self.pages = QtWidgets.QStackedWidget()
+        for page in (select_page, identify_page, self.tabs):
+            self.pages.addWidget(page)
+
+        # ----- step bar
+        step_bar = QtWidgets.QWidget()
+        step_bar.setObjectName("StepBar")
+        step_bar.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        sl = QtWidgets.QHBoxLayout(step_bar)
+        sl.setContentsMargins(4, 4, 4, 4)
+        sl.setSpacing(2)
+        self.step_group = QtWidgets.QButtonGroup(self)
+        self.step_buttons = []
+        for i, label in enumerate(STEPS):
+            if i:
+                arrow = QtWidgets.QLabel("›")
+                arrow.setObjectName("StepArrow")
+                sl.addWidget(arrow)
+            b = QtWidgets.QToolButton()
+            b.setObjectName("StepButton")
+            b.setText(f"{i + 1}   {label}")
+            b.setCheckable(True)
+            self.step_group.addButton(b, i)
+            self.step_buttons.append(b)
+            sl.addWidget(b)
+        self.step_buttons[0].setChecked(True)
+        self.step_group.idClicked.connect(self.go_to_step)
+
         # ----- actions
         self.unmix_btn = QtWidgets.QPushButton("Unmix into workspace")
         self.unmix_btn.setToolTip("Add the unmixed samples (and references) to the workspace for gating")
@@ -196,25 +269,31 @@ class UnmixingTab(QtWidgets.QWidget):
         self.export_btn.setToolTip("Write a zipped experiment with Raw and Unmixed folders, like SpectroFlo")
         self.export_btn.clicked.connect(self.export)
         self.export_btn.setDefault(True)
+        self.back_btn = QtWidgets.QPushButton("‹  Back")
+        self.back_btn.clicked.connect(lambda: self.go_to_step(self.step - 1))
+        self.next_btn = QtWidgets.QPushButton("Next  ›")
+        self.next_btn.clicked.connect(lambda: self.go_to_step(self.step + 1))
 
-        split = QtWidgets.QSplitter()
-        lw = QtWidgets.QWidget()
-        lw.setLayout(left)
-        split.addWidget(lw)
-        split.addWidget(self.tabs)
-        split.setSizes([760, 540])
+        steps_row = QtWidgets.QHBoxLayout()
+        steps_row.addStretch()
+        steps_row.addWidget(step_bar)
+        steps_row.addStretch()
 
         bottom = QtWidgets.QHBoxLayout()
+        bottom.addWidget(self.back_btn)
         bottom.addStretch()
         bottom.addWidget(self.unmix_btn)
         bottom.addWidget(self.export_btn)
+        bottom.addWidget(self.next_btn)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.addLayout(top)
-        layout.addWidget(split, 1)
+        layout.addLayout(steps_row)
+        layout.addWidget(self.pages, 1)
         layout.addLayout(bottom)
 
+        self.go_to_step(0)
         self.set_workspace(workspace)
 
     # ----- setups ----------------------------------------------------------
@@ -248,11 +327,19 @@ class UnmixingTab(QtWidgets.QWidget):
             w.blockSignals(True)
             w.setCurrentIndex(v) if w is self.method else w.setValue(v)
             w.blockSignals(False)
-        for box, on in ((self.af_check, self.setup.autofluorescence),
-                        (self.clean_check, self.setup.clean_controls)):
-            box.blockSignals(True)
-            box.setChecked(on)
-            box.blockSignals(False)
+        for w, v in ((self.af_check, self.setup.autofluorescence), (self.af_auto, self.setup.af_auto),
+                     (self.clean_check, self.setup.clean_controls),
+                     (self.af_lib_size, self.setup.af_library_size),
+                     (self.af_mode, self.af_mode.findData(self.setup.af_mode))):
+            w.blockSignals(True)
+            if isinstance(w, QtWidgets.QCheckBox):
+                w.setChecked(v)
+            elif isinstance(w, QtWidgets.QComboBox):
+                w.setCurrentIndex(max(v, 0))
+            else:
+                w.setValue(v)
+            w.blockSignals(False)
+        self._show_af_options()
         missing = [s for s in self.setup.specs if not self._load(s.path)]
         if missing:
             gone = {id(s) for s in missing}
@@ -359,16 +446,28 @@ class UnmixingTab(QtWidgets.QWidget):
             single = spec.role == "single_stain"
             self.table.setItem(row, C_FLUOR, self._item(spec.name if single else "", editable=single))
             self.table.setItem(row, C_MARKER, self._item(spec.marker, editable=spec.role != "exclude"))
-            negs = [("Auto", "auto"), ("Internal", "internal")]
-            negs += [(u.path.name, str(u.path)) for u in unstained]
             neg = QtWidgets.QComboBox()
-            for label, value in negs:
-                neg.addItem(label, value)
-            neg.setCurrentIndex(max(neg.findData(spec.negative), 0))
-            neg.setEnabled(single)
-            neg.setToolTip("Auto: the unstained file of the same carrier (beads or cells). "
-                           "Internal: the dim events in this file.")
-            neg.currentIndexChanged.connect(lambda _, s=spec, c=neg: self._set_negative(s, c.currentData()))
+            if spec.role == "sample":
+                # Samples: which unstained cells' AF library they use (per-cell AF).
+                neg.addItem("Shared AF library", "shared")
+                for u in unstained:
+                    if u.carrier == "cells":
+                        neg.addItem(f"AF from {u.path.name}", str(u.path))
+                neg.setCurrentIndex(max(neg.findData(spec.af_source), 0))
+                neg.setEnabled(self.setup.af_mode == "per_cell" and neg.count() > 2)
+                neg.setToolTip("Per-cell autofluorescence: match this sample's cells against the AF "
+                               "spectra of every unstained file, or only one (e.g. the same tissue's).")
+                neg.currentIndexChanged.connect(lambda _, s=spec, c=neg: self._set_af_source(s, c.currentData()))
+            else:
+                negs = [("Auto", "auto"), ("Internal", "internal")]
+                negs += [(u.path.name, str(u.path)) for u in unstained]
+                for label, value in negs:
+                    neg.addItem(label, value)
+                neg.setCurrentIndex(max(neg.findData(spec.negative), 0))
+                neg.setEnabled(single)
+                neg.setToolTip("Auto: the unstained file of the same carrier (beads or cells). "
+                               "Internal: the dim events in this file.")
+                neg.currentIndexChanged.connect(lambda _, s=spec, c=neg: self._set_negative(s, c.currentData()))
             self.table.setCellWidget(row, C_NEG, neg)
             for col in (C_PEAK, C_POS):
                 self.table.setItem(row, col, self._item("", editable=False))
@@ -433,6 +532,25 @@ class UnmixingTab(QtWidgets.QWidget):
         self.recalculate()
         self._mark_changed()
 
+    def _set_af_source(self, spec, value):
+        spec.af_source = value
+        self._draw_preview()
+        self._mark_changed()
+
+    def _af_gates_changed(self, spec):
+        self.recalculate()
+        self._mark_changed()
+
+    def _show_af_options(self):
+        on = self.af_check.isChecked()
+        per_cell = self.af_mode.currentData() == "per_cell"
+        self.af_mode.setEnabled(on)
+        self.af_count.setVisible(not per_cell)
+        self.af_count.setEnabled(on)
+        for w in (self.af_lib_size, self.af_auto):
+            w.setVisible(per_cell)
+            w.setEnabled(on)
+
     def _on_item_edited(self, item):
         spec = self.specs[item.row()]
         text = item.text().strip()
@@ -461,6 +579,13 @@ class UnmixingTab(QtWidgets.QWidget):
         self.setup.autofluorescence = self.af_check.isChecked()
         self.setup.n_autofluorescence = self.af_count.value()
         self.setup.clean_controls = self.clean_check.isChecked()
+        mode_changed = self.setup.af_mode != self.af_mode.currentData()
+        self.setup.af_mode = self.af_mode.currentData()
+        self.setup.af_library_size = self.af_lib_size.value()
+        self.setup.af_auto = self.af_auto.isChecked()
+        self._show_af_options()
+        if mode_changed:
+            self._fill_table()  # the samples' AF source choice depends on the mode
         self.recalculate()
         self._mark_changed()
 
@@ -505,7 +630,12 @@ class UnmixingTab(QtWidgets.QWidget):
                 out[spec.path] = self._control_qc[(spec.path, key)]
         return out
 
-    def recalculate(self):
+    def recalculate(self, rebuild_rows=True):
+        """Rebuild the matrix from the current files and gates.
+
+        rebuild_rows False keeps the Identify rows (and whatever is being
+        dragged in them) and only redraws their histograms and spectra.
+        """
         self.problems = unmixing.check_specs(self.specs) if self.specs else []
         errors = [m for level, m in self.problems if level == "error"]
         self.unmixer, self.results = None, []
@@ -521,7 +651,8 @@ class UnmixingTab(QtWidgets.QWidget):
                     [s for s in self.specs if s.role != "exclude"], method=self.setup.method,
                     n_autofluorescence=self.setup.n_autofluorescence,
                     autofluorescence=self.setup.autofluorescence, samples=self.samples,
-                    keep={p: k for p, (k, _) in cleaned.items()})
+                    af_mode=self.setup.af_mode, af_library_size=self.setup.af_library_size,
+                    af_auto=self.setup.af_auto, keep={p: k for p, (k, _) in cleaned.items()})
             except Exception as exc:
                 errors.append(f"Couldn't build the unmixing matrix: {exc}")
         self._cleaned = cleaned
@@ -536,14 +667,40 @@ class UnmixingTab(QtWidgets.QWidget):
             self.table.item(row, C_PEAK).setText(r.peak_detector if r else "")
             self.table.item(row, C_POS).setText(f"{r.n_positive:,}" if r else "")
         self.table.blockSignals(False)
-        self.sig_plot.clear()
         self.sim_table.clear()
         self.sim_table.setRowCount(0)
         if ok:
-            self._draw_signatures()
+            self.signatures.set_signatures(self.unmixer.references, self.unmixer.detectors)
             self._draw_similarity()
-        self._show_control()
+        else:
+            self.signatures.clear()
         self._fill_preview()
+        if rebuild_rows:
+            self._rows_stale = True
+            if self.step == 1:
+                self._build_rows()
+        else:
+            for row in self.rows:
+                row.update_result(by_path.get(row.spec.path))
+        self._af_check = None
+        unstained = [s for s in self.specs if s.role == "unstained" and s.carrier == "cells"]
+        self.af_view.set_data(unstained, self.samples, self.unmixer)
+        self._af_tab_shown()
+
+    def _af_tab_shown(self, *_):
+        """The AF comparison is the slow part, so it only runs while its tab is open."""
+        if self.tabs.currentWidget() is not self.af_check_view:
+            return
+        if self._af_check is None and self.unmixer is not None and self.setup.autofluorescence:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            try:
+                self._af_check = unmixing.af_check([s for s in self.specs if s.role != "exclude"],
+                                                   self.unmixer, self.samples, **self.setup.af_settings)
+            except Exception:
+                self._af_check = None
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        self.af_check_view.show_check(self._af_check, self.setup.af_mode if self.unmixer else None)
 
     def _show_status(self, errors):
         counts = {}
@@ -560,6 +717,8 @@ class UnmixingTab(QtWidgets.QWidget):
             np.fill_diagonal(sim, 0)
             i, j = np.unravel_index(np.argmax(sim), sim.shape)
             text = f"Complexity index {spectral.complexity_index(um.matrix):.1f} with {len(um.names)} components."
+            if um.per_cell_af:
+                text += f" Per-cell AF library: {len(um.af_library)} spectra."
             if len(um.names) > 1:
                 text += f" Most similar pair: {um.names[i]} and {um.names[j]} ({sim[i, j]:.2f})."
                 if sim[i, j] > 0.98:
@@ -576,16 +735,6 @@ class UnmixingTab(QtWidgets.QWidget):
         lines += [f"<span style='color:#C2412D'>{m}</span>" for m in errors]
         lines += [f"<span style='color:#6A7187'>{m}</span>" for level, m in self.problems if level == "warning"]
         self.status.setText("<br>".join(lines))
-
-    def _draw_signatures(self):
-        um = self.unmixer
-        for i, ref in enumerate(um.references):
-            color = (90, 90, 90) if ref.is_autofluorescence else PALETTE[i % len(PALETTE)]
-            style = QtCore.Qt.DashLine if ref.is_autofluorescence else QtCore.Qt.SolidLine
-            self.sig_plot.plot(ref.signature, pen=pg.mkPen(color, width=2, style=style), name=ref.name)
-        ticks = [(i, d.replace("-A", "")) for i, d in enumerate(um.detectors)]
-        self.sig_plot.getAxis("bottom").setTicks([ticks[::2], ticks[1::2]])
-        self.sig_plot.setLabel("bottom", "Detector")
 
     def _draw_similarity(self):
         um = self.unmixer
@@ -604,38 +753,69 @@ class UnmixingTab(QtWidgets.QWidget):
                 self.sim_table.setItem(i, j, item)
         self.sim_table.resizeColumnsToContents()
 
-    def _show_control(self):
-        self.ctrl_plot.clear()
-        rows = self._selected_rows()
-        if len(rows) != 1 or self.unmixer is None:
-            return
-        spec = self.specs[rows[0]]
-        result = next((r for r in self.results if r.spec.path == spec.path), None)
-        if result is None:
-            self.ctrl_hint.setText(f"{spec.path.name} is not a single-color control.")
-            return
-        peak = self.unmixer.detectors.index(result.peak_detector)
-        events = unmixing._detector_events(self.samples[spec.path], self.unmixer.detectors)
-        values = _asinh(events[:, peak])
-        counts, edges = np.histogram(values, bins=128)
-        self.ctrl_plot.plot(edges, counts, stepMode="center", fillLevel=0,
-                            brush=(91, 91, 214, 110), pen=pg.mkPen((60, 60, 160)))
-        pos_vals = values[result.positive_mask]
-        region = pg.LinearRegionItem((float(pos_vals.min()), float(pos_vals.max())), brush=(20, 163, 163, 50))
-        self.ctrl_plot.addItem(region)
-        self.ctrl_plot.setLabel("bottom", f"{result.peak_detector} (asinh scale)")
-        self.ctrl_hint.setText(
-            f"{spec.name}: {result.n_positive:,} positive events; negative from "
-            f"{result.negative_source}. Drag the shaded region to change the positives.")
+    # ----- steps ---------------------------------------------------------
 
-        def changed():
-            lo, hi = region.getRegion()
-            spec.positive_mask = (values >= lo) & (values <= hi)
-            if spec.positive_mask.sum() < 10:
-                spec.positive_mask = None
-            self.recalculate()
+    @property
+    def step(self):
+        return self.pages.currentIndex()
 
-        region.sigRegionChangeFinished.connect(changed)
+    def go_to_step(self, index):
+        index = max(0, min(index, len(STEPS) - 1))
+        self.pages.setCurrentIndex(index)
+        self.step_buttons[index].setChecked(True)
+        self.back_btn.setEnabled(index > 0)
+        self.next_btn.setVisible(index < len(STEPS) - 1)
+        self.next_btn.setDefault(index < len(STEPS) - 1)
+        self.export_btn.setDefault(index == len(STEPS) - 1)
+        if index == 1 and self._rows_stale:
+            self._build_rows()
+
+    def _negative_for(self, spec):
+        """(spec, sample) of the file a single stain takes its negatives from, if any."""
+        other = None
+        if spec.negative == "auto":
+            other = unmixing._matching_unstained(spec, self.specs)
+        elif spec.negative != "internal":
+            other = next((s for s in self.specs if str(s.path) == spec.negative), None)
+        if other is None or other.path not in self.samples:
+            return None
+        return other, self.samples[other.path]
+
+    def _build_rows(self):
+        """One row per reference control, single stains first, then unstained."""
+        for row in self.rows:
+            row.setParent(None)
+            row.deleteLater()
+        self.rows = []
+        self._rows_stale = False
+        if self.unmixer is None:
+            self.identify_hint.setText(
+                "Add single-color controls and fix the problems listed in step 1 first; "
+                "the controls appear here once a matrix can be built.")
+            return
+        self.identify_hint.setText(
+            "For each control, draw the scatter gate around the beads or cells, then drag the "
+            "Positive and Negative ranges on its peak detector. The spectrum shows the positive "
+            "events in every detector and updates as you go.")
+        by_path = {r.spec.path: r for r in self.results}
+        refs = [s for s in self.specs if s.role == "single_stain"] + [s for s in self.specs if s.role == "unstained"]
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for spec in refs:
+                try:
+                    row = ControlRow(spec, self.samples[spec.path], self.unmixer.detectors,
+                                     by_path.get(spec.path), self._negative_for(spec))
+                except ValueError:
+                    continue   # detectors don't match the experiment; check_specs reports it
+                row.edited.connect(self._gate_edited)
+                self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
+                self.rows.append(row)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _gate_edited(self, spec):
+        self.recalculate(rebuild_rows=False)
+        self._mark_changed()
 
     # ----- preview ---------------------------------------------------------
 
@@ -649,7 +829,7 @@ class UnmixingTab(QtWidgets.QWidget):
         i = self.preview_sample.findData(keep)
         self.preview_sample.setCurrentIndex(i if i >= 0 else 0)
         self.preview_sample.blockSignals(False)
-        names = self.unmixer.names if self.unmixer else []
+        names = self.unmixer.output_names if self.unmixer else []
         for combo, default in ((self.preview_x, 0), (self.preview_y, 1)):
             keep = combo.currentText()
             combo.blockSignals(True)
@@ -677,11 +857,14 @@ class UnmixingTab(QtWidgets.QWidget):
             rows = np.random.default_rng(0).choice(len(raw), min(len(raw), PREVIEW_EVENTS), replace=False)
             self._preview_cache[key] = raw[np.sort(rows)][:, idx]
         Y = self._preview_cache[key]
-        A = self.unmixer.unmix(Y)
+        spec = next((s for s in self.specs if str(s.path) == path), None)
+        af_source = spec.af_source if spec is not None and spec.af_source != "shared" else None
+        A = self.unmixer.unmix(Y, af_source)
         xi, yi = self.preview_x.currentIndex(), self.preview_y.currentIndex()
         if xi < 0 or yi < 0:
             return
-        x, y = _asinh(A[:, xi]), _asinh(A[:, yi])
+        names = self.unmixer.output_names
+        x, y = (A[:, i] if names[i] == "AF Index" else _asinh(A[:, i]) for i in (xi, yi))
         lo = min(np.percentile(x, 0.5), np.percentile(y, 0.5), -1)
         hi = max(np.percentile(x, 99.9), np.percentile(y, 99.9))
         h, _, _ = np.histogram2d(x, y, bins=BINS, range=[[lo, hi], [lo, hi]])
@@ -691,14 +874,13 @@ class UnmixingTab(QtWidgets.QWidget):
         img = pg.ImageItem(rgba)
         img.setRect(QtCore.QRectF(lo, lo, hi - lo, hi - lo))
         self.preview_plot.addItem(img)
-        self.preview_plot.setLabel("bottom", f"{self.unmixer.names[xi]} (asinh)")
-        self.preview_plot.setLabel("left", f"{self.unmixer.names[yi]} (asinh)")
-        R = spectral.residuals(Y, A, self.unmixer.matrix)
+        self.preview_plot.setLabel("bottom", names[xi] if names[xi] == "AF Index" else f"{names[xi]} (asinh)")
+        self.preview_plot.setLabel("left", names[yi] if names[yi] == "AF Index" else f"{names[yi]} (asinh)")
+        R = self.unmixer.residuals(Y, A)
         rms = np.sqrt((R ** 2).mean(axis=0))
         self.resid_plot.addItem(pg.BarGraphItem(x=np.arange(len(rms)), height=rms, width=0.8,
                                                 brush=(242, 109, 91, 170)))
-        ticks = [(i, d.replace("-A", "")) for i, d in enumerate(self.unmixer.detectors)]
-        self.resid_plot.getAxis("bottom").setTicks([ticks[::3], []])
+        self.resid_plot.getAxis("bottom").setTicks([_detector_ticks(self.unmixer.detectors), []])
 
     # ----- applying --------------------------------------------------------
 
@@ -712,14 +894,27 @@ class UnmixingTab(QtWidgets.QWidget):
             um_name, n = f"{name} ({n})", n + 1
         self.ws.add_unmixer(um_name, self.unmixer)
         new_ids = []
+        todo = [s for s in self.specs if s.role != "exclude"]
+        progress = QtWidgets.QProgressDialog("Unmixing…", "", 0, 1000 * len(todo), self)
+        progress.setWindowTitle("Unmix into workspace")
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(500)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            for spec in self.specs:
-                if spec.role == "exclude":
-                    continue
+            for i, spec in enumerate(todo):
+                progress.setLabelText(f"Unmixing {spec.path.name} ({i + 1} of {len(todo)})")
+
+                def step(done, total, i=i):
+                    progress.setValue(1000 * i + int(1000 * done / max(total, 1)))
+                    QtWidgets.QApplication.processEvents()
+
                 group = "Unmixed" if spec.role == "sample" else experiment.REFERENCE_GROUP
-                new_ids.append(self.ws.unmix_file(spec.path, um_name, group, self.samples[spec.path]))
+                af_source = spec.af_source if spec.role == "sample" else None
+                new_ids.append(self.ws.unmix_file(spec.path, um_name, group, self.samples[spec.path],
+                                                  af_source=af_source, progress=step))
         finally:
+            progress.close()
             QtWidgets.QApplication.restoreOverrideCursor()
         self.store()
         self.unmixed.emit(new_ids)
@@ -759,6 +954,7 @@ class UnmixingTab(QtWidgets.QWidget):
             result = experiment.export_experiment(dest, name, self.specs, self.unmixer,
                                                   as_zip=as_zip, samples=self.samples,
                                                   unmixer_name=self.setup.name, progress=step,
+                                                  af_settings=self.setup.af_settings,
                                                   clean_settings=self.ws.qc_settings if clean else None,
                                                   cleaning_report=qc_report.write_pdf)
         except Exception as exc:
@@ -825,3 +1021,363 @@ class ExportDialog(QtWidgets.QDialog):
 
     def values(self):
         return Path(self.folder.text()), self.name.text().strip() or "Experiment", self.as_zip.isChecked()
+
+
+AF_COLORS = [(91, 91, 214), (20, 163, 163), (242, 109, 91), (214, 160, 20), (148, 103, 189),
+             (44, 160, 44), (227, 119, 194), (140, 86, 75)]
+
+
+def _detector_ticks(detectors, labels=14):
+    """Every nth detector's name, so a 64-detector axis stays readable."""
+    step = max(1, int(np.ceil(len(detectors) / labels)))
+    return [(i, d.replace("-A", "")) for i, d in enumerate(detectors)][::step]
+
+
+class AFLibraryView(QtWidgets.QWidget):
+    """The per-cell AF library: unstained cells on two detectors, hand-drawn AF
+    populations (AF Explorer style), and every library spectrum.
+
+    Draw a polygon around a population to add its median spectrum to the
+    library: click the corners, then click the first corner, double-click,
+    right-click or press Enter to close it. Backspace removes the last corner
+    and Esc cancels.
+    """
+
+    gates_changed = QtCore.Signal(object)   # the ControlSpec whose gates changed
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.specs, self.samples, self.unmixer = [], {}, None
+        self._events = None
+        self._points, self._drawing = [], False
+        self._preview = self._close_preview = self._snap_ring = None
+
+        self.file_combo = QtWidgets.QComboBox()
+        self.x_combo = QtWidgets.QComboBox()
+        self.y_combo = QtWidgets.QComboBox()
+        for c in (self.file_combo, self.x_combo, self.y_combo):
+            c.currentIndexChanged.connect(self._draw)
+        self.draw_btn = QtWidgets.QPushButton("Draw AF population")
+        self.draw_btn.setCheckable(True)
+        self.draw_btn.toggled.connect(self._toggle_drawing)
+        self.gate_list = QtWidgets.QListWidget()
+        self.gate_list.setMaximumHeight(90)
+        self.remove_btn = QtWidgets.QPushButton("Remove")
+        self.remove_btn.clicked.connect(self.remove_selected_gate)
+        self.plot = pg.PlotWidget(background="w")
+        self.plot.viewport().installEventFilter(self)
+        self.spectra_plot = pg.PlotWidget(background="w")
+        self.spectra_plot.setLabel("left", "Normalised intensity")
+        self.spectra_plot.setMaximumHeight(200)
+        self.spectra_plot.addLegend(offset=(-10, 5))
+        self.summary = QtWidgets.QLabel()
+        self.summary.setWordWrap(True)
+        self.summary.setObjectName("Hint")
+
+        top = QtWidgets.QHBoxLayout()
+        for label, w in (("Unstained", self.file_combo), ("X", self.x_combo), ("Y", self.y_combo)):
+            top.addWidget(QtWidgets.QLabel(label))
+            top.addWidget(w, 1 if w is self.file_combo else 0)
+        top.addWidget(self.draw_btn)
+        gates = QtWidgets.QHBoxLayout()
+        gates.addWidget(self.gate_list, 1)
+        gates.addWidget(self.remove_btn, 0, QtCore.Qt.AlignTop)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(top)
+        layout.addWidget(self.plot, 1)
+        layout.addLayout(gates)
+        layout.addWidget(self.spectra_plot)
+        layout.addWidget(self.summary)
+
+        for key, slot in ((QtCore.Qt.Key_Return, self.close_polygon), (QtCore.Qt.Key_Enter, self.close_polygon),
+                          (QtCore.Qt.Key_Backspace, self.undo_point), (QtCore.Qt.Key_Escape, self.cancel)):
+            sc = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            sc.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(slot)
+
+    @property
+    def spec(self):
+        i = self.file_combo.currentIndex()
+        return self.specs[i] if 0 <= i < len(self.specs) else None
+
+    def set_data(self, specs, samples, unmixer):
+        """specs: the unstained-cells files; unmixer: the current one (or None)."""
+        keep = self.file_combo.currentText()
+        self.specs, self.samples, self.unmixer = specs, samples, unmixer
+        detectors = list(unmixer.detectors) if unmixer is not None else []
+        for combo, items in ((self.file_combo, [s.path.name for s in specs]),
+                             (self.x_combo, detectors), (self.y_combo, detectors)):
+            old = keep if combo is self.file_combo else combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(items)
+            if combo.findText(old) >= 0:
+                combo.setCurrentIndex(combo.findText(old))
+            combo.blockSignals(False)
+        self._pick_default_axes()
+        self._draw()
+
+    def _pick_default_axes(self):
+        """Start on the detectors where AF is brightest and where its shape varies most."""
+        if self.unmixer is None or not self.specs or self.x_combo.property("chosen"):
+            return
+        Y = self._unstained_events()
+        if Y is None:
+            return
+        med = np.median(Y, axis=0)
+        x = int(np.argmax(med))
+        shapes = np.clip(Y, 0, None) / np.maximum(np.clip(Y, 0, None).max(axis=1, keepdims=True), 1e-9)
+        spread = spectral.robust_sd(shapes)
+        spread[x] = -1
+        y = int(np.argmax(spread))
+        for combo, i in ((self.x_combo, x), (self.y_combo, y)):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(i)
+            combo.blockSignals(False)
+        self.x_combo.setProperty("chosen", True)
+
+    def _unstained_events(self):
+        spec = self.spec
+        if spec is None or self.unmixer is None or spec.path not in self.samples:
+            return None
+        try:
+            Y = unmixing._detector_events(self.samples[spec.path], self.unmixer.detectors)
+        except ValueError:
+            return None
+        if len(Y) > PREVIEW_EVENTS:
+            Y = Y[np.sort(np.random.default_rng(0).choice(len(Y), PREVIEW_EVENTS, replace=False))]
+        return Y
+
+    def _draw(self, *_):
+        self._clear_preview()
+        self.plot.clear()
+        self.spectra_plot.clear()
+        self.gate_list.clear()
+        Y = self._unstained_events()
+        self._events = Y
+        enabled = Y is not None and self.unmixer is not None and self.unmixer.per_cell_af
+        self.draw_btn.setEnabled(enabled)
+        if self.unmixer is not None and not self.unmixer.per_cell_af:
+            self.summary.setText("Choose per-cell matching under the file table to use an AF library.")
+        elif not self.specs:
+            self.summary.setText("Add unstained cells to build an autofluorescence library.")
+        if Y is None:
+            return
+        xi, yi = self.x_combo.currentIndex(), self.y_combo.currentIndex()
+        if xi < 0 or yi < 0:
+            return
+        x, y = _asinh(Y[:, xi]), _asinh(Y[:, yi])
+        lo = [min(np.percentile(v, 0.5), -0.5) for v in (x, y)]
+        hi = [np.percentile(v, 99.9) for v in (x, y)]
+        h, _, _ = np.histogram2d(x, y, bins=BINS, range=[[lo[0], hi[0]], [lo[1], hi[1]]])
+        density = np.log1p(h)
+        rgba = PSEUDOCOLOR.map(density / (density.max() or 1), mode="byte")
+        rgba[h == 0] = (0, 0, 0, 0)
+        img = pg.ImageItem(rgba)
+        img.setRect(QtCore.QRectF(lo[0], lo[1], hi[0] - lo[0], hi[1] - lo[1]))
+        self.plot.addItem(img)
+        self.plot.setLabel("bottom", f"{self.x_combo.currentText()} (asinh)")
+        self.plot.setLabel("left", f"{self.y_combo.currentText()} (asinh)")
+        detectors = list(self.unmixer.detectors)
+        for i, gate in enumerate(self.spec.af_gates):
+            color = AF_COLORS[i % len(AF_COLORS)]
+            n = int(unmixing.af_gate_mask(gate, Y, detectors).sum())
+            item = QtWidgets.QListWidgetItem(f"{gate['name']}  ({gate['x']} vs {gate['y']}, {n:,} events shown)")
+            item.setForeground(QtGui.QColor(*color))
+            self.gate_list.addItem(item)
+            if gate["x"] == self.x_combo.currentText() and gate["y"] == self.y_combo.currentText():
+                v = _asinh(np.asarray(gate["vertices"], float))
+                v = np.vstack([v, v[:1]])
+                self.plot.plot(v[:, 0], v[:, 1], pen=pg.mkPen(color, width=2))
+                label = pg.TextItem(gate["name"], color=color, anchor=(0, 1))
+                label.setPos(*v[0])
+                self.plot.addItem(label)
+        self._draw_library()
+
+    def _draw_library(self):
+        um = self.unmixer
+        if um is None or not um.per_cell_af:
+            return
+        n_drawn = sum(len(s.af_gates) for s in self.specs)
+        for i, sig in enumerate(um.af_library):
+            self.spectra_plot.plot(sig, pen=pg.mkPen((150, 155, 170, 140), width=1))
+        # Drawn gates come first in each file's part of the library.
+        drawn = 0
+        for spec in self.specs:
+            rows = [i for i, s in enumerate(um.af_sources or []) if s == str(spec.path)]
+            for k, gate in enumerate(spec.af_gates):
+                if k < len(rows):
+                    self.spectra_plot.plot(um.af_library[rows[k]], name=gate["name"],
+                                           pen=pg.mkPen(AF_COLORS[drawn % len(AF_COLORS)], width=2.4))
+                drawn += 1
+        self.spectra_plot.getAxis("bottom").setTicks([_detector_ticks(um.detectors), []])
+        files = len({s for s in (um.af_sources or [])})
+        self.summary.setText(
+            f"{len(um.af_library)} AF spectra in the library from {files} unstained file(s), "
+            f"{n_drawn} of them drawn by hand. Each cell is matched to the one that fits it best; "
+            "the AF Index channel says which (1 = first spectrum).")
+
+    # ----- drawing ---------------------------------------------------------
+
+    def _toggle_drawing(self, on):
+        self._drawing = on
+        self._points = []
+        self._clear_preview()
+        if on:
+            self.plot.viewport().setCursor(QtCore.Qt.CrossCursor)
+            self.plot.setFocus()
+        else:
+            self.plot.viewport().unsetCursor()
+
+    def cancel(self):
+        self.draw_btn.setChecked(False)
+
+    def undo_point(self):
+        if self._drawing and self._points:
+            self._points.pop()
+            self._update_preview(self._points[-1] if self._points else None)
+
+    def close_polygon(self):
+        if not self._drawing or len(self._points) < 3 or self.spec is None:
+            return False
+        pts = np.sinh(np.asarray(self._points)) * ASINH_COFACTOR  # back to raw detector units
+        names = {g["name"] for g in self.spec.af_gates}
+        n = len(self.spec.af_gates) + 1
+        while f"AF {n}" in names:
+            n += 1
+        self.add_gate({"name": f"AF {n}", "x": self.x_combo.currentText(), "y": self.y_combo.currentText(),
+                       "vertices": pts.tolist()})
+        self.draw_btn.setChecked(False)
+        return True
+
+    def add_gate(self, gate):
+        self.spec.af_gates.append(gate)
+        self.gates_changed.emit(self.spec)
+
+    def remove_selected_gate(self):
+        row = self.gate_list.currentRow()
+        if self.spec is not None and 0 <= row < len(self.spec.af_gates):
+            del self.spec.af_gates[row]
+            self.gates_changed.emit(self.spec)
+
+    def _view_point(self, pos):
+        p = self.plot.getViewBox().mapSceneToView(self.plot.mapToScene(pos.toPoint()))
+        return [float(p.x()), float(p.y())]
+
+    def _near_first(self, pos):
+        if len(self._points) < 3:
+            return False
+        first = self.plot.mapFromScene(self.plot.getViewBox().mapViewToScene(QtCore.QPointF(*self._points[0])))
+        return np.hypot(pos.x() - first.x(), pos.y() - first.y()) <= SNAP_RADIUS_PX
+
+    def eventFilter(self, obj, event):
+        if obj is not self.plot.viewport() or not self._drawing:
+            return super().eventFilter(obj, event)
+        t = event.type()
+        if t == QtCore.QEvent.MouseButtonDblClick:
+            self.close_polygon()
+            return True
+        if t == QtCore.QEvent.MouseButtonPress:
+            if event.button() == QtCore.Qt.RightButton:
+                if not self.close_polygon():
+                    self.cancel()
+            elif event.button() == QtCore.Qt.LeftButton:
+                if self._near_first(event.position()):
+                    self.close_polygon()
+                else:
+                    pt = self._view_point(event.position())
+                    self._points.append(pt)
+                    self._update_preview(pt, event.position())
+            return True
+        if t == QtCore.QEvent.MouseMove and self._points:
+            self._update_preview(self._view_point(event.position()), event.position())
+            return True
+        return super().eventFilter(obj, event)
+
+    def _clear_preview(self):
+        for attr in ("_preview", "_close_preview", "_snap_ring"):
+            item = getattr(self, attr)
+            if item is not None:
+                self.plot.removeItem(item)
+                setattr(self, attr, None)
+
+    def _update_preview(self, pt, widget_pos=None):
+        if not self._points or pt is None:
+            self._clear_preview()
+            return
+        if self._preview is None:
+            self._preview = pg.PlotDataItem(pen=DRAW_PEN)
+            self._close_preview = pg.PlotDataItem(pen=CLOSE_PEN)
+            self._snap_ring = pg.ScatterPlotItem(size=2 * SNAP_RADIUS_PX, symbol="o",
+                                                 pen=pg.mkPen(theme.ACCENT, width=2),
+                                                 brush=pg.mkBrush(SNAP_FILL))
+            for item in (self._preview, self._close_preview, self._snap_ring):
+                self.plot.addItem(item)
+        xs, ys = zip(*(self._points + [pt]))
+        self._preview.setData(np.asarray(xs), np.asarray(ys))
+        first = self._points[0]
+        snap = widget_pos is not None and self._near_first(widget_pos)
+        if len(self._points) >= 2 and not snap:
+            self._close_preview.setData([pt[0], first[0]], [pt[1], first[1]])
+        else:
+            self._close_preview.setData([], [])
+        self._snap_ring.setData([first[0]] if snap else [], [first[1]] if snap else [])
+
+
+class AFCheckView(QtWidgets.QWidget):
+    """Unstained cells unmixed with per-cell AF and with AF as fluors, side by side.
+
+    Unstained cells should sit at zero in every fluor channel, so the spread
+    left there (and the per-detector residual) shows which AF model fits.
+    """
+
+    COLORS = {"per_cell": (91, 91, 214, 200), "fluors": (163, 169, 186, 200)}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.summary = QtWidgets.QLabel()
+        self.summary.setWordWrap(True)
+        self.summary.setTextFormat(QtCore.Qt.RichText)
+        self.spread_plot = pg.PlotWidget(background="w")
+        self.spread_plot.setLabel("bottom", "Spread left in each fluor on unstained cells (rSD)")
+        self.spread_plot.getViewBox().invertY(True)
+        self.resid_plot = pg.PlotWidget(background="w")
+        self.resid_plot.setLabel("left", "Residual RMS")
+        self.resid_plot.setMaximumHeight(190)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self.summary)
+        layout.addWidget(self.spread_plot, 1)
+        layout.addWidget(self.resid_plot)
+
+    def show_check(self, check, mode):
+        self.spread_plot.clear()
+        self.resid_plot.clear()
+        if check is None:
+            self.summary.setText("Add unstained cells and at least one single-color control to compare "
+                                 "the two ways of handling autofluorescence.")
+            return
+        per, flu = check["methods"]["per_cell"], check["methods"]["fluors"]
+        n = len(check["fluors"])
+        x = np.arange(n)
+        for offset, key in ((-0.2, "per_cell"), (0.2, "fluors")):
+            self.spread_plot.addItem(pg.BarGraphItem(x0=0, y=x + offset, width=check["methods"][key]["spread"],
+                                                     height=0.38, brush=self.COLORS[key], pen=None))
+        self.spread_plot.getAxis("left").setTicks([[(i, f) for i, f in enumerate(check["fluors"])]])
+        d = len(check["detectors"])
+        for offset, key in ((-0.2, "per_cell"), (0.2, "fluors")):
+            self.resid_plot.addItem(pg.BarGraphItem(x=np.arange(d) + offset,
+                                                    height=check["methods"][key]["residual_rms"],
+                                                    width=0.38, brush=self.COLORS[key], pen=None))
+        self.resid_plot.getAxis("bottom").setTicks([_detector_ticks(check["detectors"]), []])
+        a, b = per["spread"].sum(), flu["spread"].sum()
+        better = "per_cell" if a <= b else "fluors"
+        change = abs(a - b) / max(a, b, 1e-9) * 100
+        using = unmixing.AF_METHOD_LABELS.get(mode, "")
+        key = "  ".join(f"<span style='color:rgb{self.COLORS[k][:3]}'>&#9632;</span> "
+                        f"{unmixing.AF_METHOD_LABELS[k]}" for k in ("per_cell", "fluors"))
+        text = (f"{key}<br>Unstained cells ({check['n_events']:,} events) unmixed both ways. Every fluor should sit "
+                f"at 0, so lower bars are better. <b>{unmixing.AF_METHOD_LABELS[better]}</b> leaves "
+                f"{change:.0f}% less spread in total.")
+        if using and better != mode and change > 10:
+            text += f" You are using {using}; consider switching."
+        self.summary.setText(text)
