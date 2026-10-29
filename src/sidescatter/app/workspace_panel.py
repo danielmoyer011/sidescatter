@@ -119,7 +119,9 @@ class WorkspacePanel(QtWidgets.QWidget):
         self.groups.blockSignals(True)
         self.groups.clear()
         for name, members in self.ws.groups.items():
-            item = QtWidgets.QTreeWidgetItem([name, str(len(members)), _role(name)])
+            size = len(members) + sum(name == ALL_SAMPLES or name in m["groups"]
+                                      for m in self.ws.missing.values())
+            item = QtWidgets.QTreeWidgetItem([name, str(size), _role(name)])
             item.setData(0, ROLE, name)
             item.setIcon(0, _group_icon(name))
             item.setTextAlignment(1, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
