@@ -3,6 +3,7 @@
 import flowkit as fk
 import numpy as np
 import pytest
+from PySide6 import QtCore
 
 pytest.importorskip("pytestqt")
 
@@ -233,6 +234,53 @@ def test_spectrum_plot_type_in_graph_window(window, qtbot):
     v.type_combo.setCurrentText("Spectrum")
     assert v.spectrum.counts is not None
     assert v.spectrum.det_axis.names[:2] == ["V1", "V2"]
+    # Every detector gets its own label.
+    ticks = v.spectrum.det_axis.tickValues(0, 1, 100)
+    assert len(ticks) == 1 and len(ticks[0][1]) == len(v.spectrum.det_axis.names) == 42
     assert not v.tools["polygon"].isEnabled()
     v.start_gate("polygon")
     assert v.type_combo.currentText() == "Pseudocolor"
+
+
+def test_per_cell_autofluorescence_in_the_tab(qtbot):
+    tab = UnmixingTab(Workspace())
+    qtbot.addWidget(tab)
+    tab.resize(1400, 900)
+    tab.show()
+    tab.add_files(_demo_files())
+    assert tab.setup.af_mode == "per_cell" and tab.unmixer.per_cell_af
+    assert tab.af_lib_size.isVisibleTo(tab) and not tab.af_count.isVisibleTo(tab)
+    n_lib = len(tab.unmixer.af_library)
+
+    # Draw an AF population on the unstained cells with the mouse.
+    tab.tabs.setCurrentWidget(tab.af_view)
+    view = tab.af_view
+    assert view.file_combo.count() == 2  # PBMC and dead-cell unstained cells
+    view.file_combo.setCurrentText("PBMC_unstained.fcs")
+    assert view.spec.path.name == "PBMC_unstained.fcs" and view.draw_btn.isEnabled()
+    view.draw_btn.setChecked(True)
+    vb = view.plot.getViewBox()
+    (x0, x1), (y0, y1) = vb.viewRange()
+    corners = [(x0 + (x1 - x0) * fx, y0 + (y1 - y0) * fy) for fx, fy in ((0.5, 0.5), (0.95, 0.5), (0.95, 0.95))]
+    for cx, cy in corners:
+        pos = view.plot.mapFromScene(vb.mapViewToScene(QtCore.QPointF(cx, cy)))
+        qtbot.mouseClick(view.plot.viewport(), QtCore.Qt.LeftButton, pos=pos)
+    qtbot.mouseClick(view.plot.viewport(), QtCore.Qt.RightButton, pos=pos)
+    assert len(view.spec.af_gates) == 1 and not view.draw_btn.isChecked()
+    assert view.gate_list.count() == 1
+    assert any(f["af_gates"] for f in tab.ws.experiments[0]["files"])
+
+    # Only the drawn population (the dead-cell unstained has no gates, so it keeps its median).
+    tab.af_auto.setChecked(False)
+    assert len(tab.unmixer.af_library) == 2 < n_lib
+
+    tab.tabs.setCurrentWidget(tab.af_check_view)
+    assert "less spread" in tab.af_check_view.summary.text()
+
+    tab.af_mode.setCurrentIndex(tab.af_mode.findData("fluors"))
+    assert not tab.unmixer.per_cell_af and tab.af_count.isVisibleTo(tab)
+    tab.af_mode.setCurrentIndex(tab.af_mode.findData("per_cell"))
+    tab.af_auto.setChecked(True)
+    ids = tab.unmix_into_workspace()
+    sample = tab.ws.samples[next(i for i in ids if i.startswith("PBMC_full"))]
+    assert "AF Index" in sample.pnn_labels and "AF-A" in sample.pnn_labels

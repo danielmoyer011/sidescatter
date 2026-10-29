@@ -37,36 +37,48 @@ def subsample(n, limit=DISPLAY_EVENTS, seed=0):
 
 
 class DetectorAxis(pg.AxisItem):
-    """Detector names under a spectrum: every other one, slanted, like the instrument.
+    """Detector names under a spectrum, one label per detector, slanted like the instrument.
 
-    Every detector gets a tick; labels go on every other one (all of them when
-    there are few) and are drawn at an angle so long runs of names never clash.
-    With lasers_only, only the first detector of each laser is labelled, for
-    small plots.
+    Labels are drawn at an angle (upright in compact plots) and the font
+    shrinks when detectors are packed tightly, so long runs of names never
+    clash.
     """
 
-    def __init__(self, orientation="bottom", lasers_only=False, **kwargs):
+    def __init__(self, orientation="bottom", compact=False, **kwargs):
         super().__init__(orientation, **kwargs)
         self.names = []
-        self.labelled = []
-        self.lasers_only = lasers_only
-        self.setHeight(30 if lasers_only else 46)
+        self.compact = compact
+        self.angle = 90 if compact else LABEL_ANGLE
         self.setStyle(tickLength=-5)
+        self.setHeight(46)
 
     def set_names(self, names):
         """names: the detectors in plotting order."""
         self.names = [spectrum.short_name(n) for n in names]
-        if self.lasers_only:
-            self.labelled = [first for _, first, _ in spectrum.laser_groups(list(names), range(len(names)))]
-        else:
-            self.labelled = list(range(0, len(self.names), 1 if len(self.names) <= 12 else 2))
+        font = self._font(QtGui.QFont())
+        widest = max((QtGui.QFontMetrics(font).horizontalAdvance(n) for n in self.names), default=0)
+        drop = widest * np.sin(np.radians(self.angle)) + QtGui.QFontMetrics(font).height()
+        self.setHeight(int(drop) + 10)
         self.picture = None
         self.update()
+
+    def _font(self, base, spacing=None):
+        """The tick font, shrunk when detectors are closer together than a line of text."""
+        font = QtGui.QFont(self.style["tickFont"] or base)
+        size = font.pointSizeF() if font.pointSizeF() > 0 else 9.0
+        if self.compact:
+            size = min(size, 7.5)
+        if spacing is not None:
+            room = spacing * np.sin(np.radians(self.angle))
+            height = QtGui.QFontMetricsF(font).height() / (font.pointSizeF() if font.pointSizeF() > 0 else 9.0)
+            size = max(5.5, min(size, room / max(height, 1e-6) * 0.95))
+        font.setPointSizeF(size)
+        return font
 
     def tickValues(self, minVal, maxVal, size):
         if not self.names:
             return []
-        return [(2.0, [float(i) for i in self.labelled]), (1.0, [float(i) for i in range(len(self.names))])]
+        return [(1.0, [float(i) for i in range(len(self.names))])]
 
     def tickStrings(self, values, scale, spacing):
         return ["" for _ in values]
@@ -80,27 +92,23 @@ class DetectorAxis(pg.AxisItem):
         bounds = view.mapRectToItem(self, view.boundingRect())
         if hi <= lo:
             return
+        spacing = bounds.width() / (hi - lo)
         p.setClipping(False)
         p.setPen(self.textPen())
-        font = self.style["tickFont"] or p.font()
+        font = self._font(p.font(), spacing)
         p.setFont(font)
-        fm = QtGui.QFontMetrics(font)
-        angle = 0 if self.lasers_only else LABEL_ANGLE
-        for i in self.labelled:
+        fm = QtGui.QFontMetricsF(font)
+        for i, text in enumerate(self.names):
             if not lo <= i <= hi:
                 continue
             x = bounds.left() + (i - lo) / (hi - lo) * bounds.width()
-            text = self.names[i]
             w = fm.horizontalAdvance(text)
             p.save()
-            if angle:
-                p.translate(x + 3, 4)
-                p.rotate(-angle)
-                p.drawText(QtCore.QRectF(-w - 2, 0, w + 2, fm.height()),
-                           int(QtCore.Qt.AlignRight | QtCore.Qt.AlignTop), text)
-            else:
-                p.drawText(QtCore.QRectF(x - 2, 6, w + 4, fm.height()),
-                           int(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop), text)
+            # Rotate about the tick so each label ends right under its detector.
+            p.translate(x + fm.height() * 0.35, 4)
+            p.rotate(-self.angle)
+            p.drawText(QtCore.QRectF(-w - 2, 0, w + 2, fm.height()),
+                       int(QtCore.Qt.AlignRight | QtCore.Qt.AlignTop), text)
             p.restore()
 
 
@@ -293,7 +301,7 @@ class SignaturesView(QtWidgets.QWidget):
             label = QtWidgets.QLabel(ref.name)
             label.setObjectName("PlotTitle")
             label.setAlignment(QtCore.Qt.AlignCenter)
-            plot = _plot({"bottom": DetectorAxis("bottom", lasers_only=True)})
+            plot = _plot({"bottom": DetectorAxis("bottom", compact=True)})
             plot.getPlotItem().getAxis("bottom").set_names(ordered)
             plot.setLogMode(y=log)
             pen = self._pen(ref)

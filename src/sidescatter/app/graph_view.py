@@ -17,6 +17,7 @@ from . import icons, theme
 from ..core import fcs
 from ..core.workspace import ALL_SAMPLES, ROOT
 from .axes import TransformAxis
+from .boolean_editor import confirm_delete
 from .spectrum_plot import SpectrumPlot
 
 BINS = 256
@@ -605,9 +606,7 @@ class GraphView(QtWidgets.QWidget):
             self.refresh()
 
     def _delete_gate(self, child, path):
-        answer = QtWidgets.QMessageBox.question(
-            self, "Delete gate", f"Delete {child} and every population inside it, in all samples?")
-        if answer == QtWidgets.QMessageBox.Yes:
+        if confirm_delete(self, self.ws, child, path):
             self.ws.remove_gate(child, path)
             self.gatesChanged.emit()
             self.refresh()

@@ -97,6 +97,9 @@ class MainWindow(QtWidgets.QMainWindow):
                          "Group by\nKeyword…"),
             "rename": A("&Rename population…", "rename", self.panel.rename_selected, "F2",
                         "Rename\nPopulation…"),
+            "boolean": A("&Boolean gate…", "boolean", self.panel.make_boolean, "Ctrl+B",
+                         "Boolean\nGate…", tip="Combine the selected populations with AND, OR "
+                         "and NOT, or make all their combinations"),
             "delete": A("&Delete gate", "delete", self.panel.delete_selected, None, "Delete\nGate"),
             "remove": A("Re&move samples", "remove_sample", self.panel.remove_selected_samples, None,
                         "Remove\nSamples"),
@@ -123,7 +126,7 @@ class MainWindow(QtWidgets.QMainWindow):
         menus = (
             ("&File", ["new", "open", "save", "save_as", None, "add", "import", "demo", None,
                        "export", None, "quit"]),
-            ("&Edit", ["rename", "delete", "remove"]),
+            ("&Edit", ["boolean", "rename", "delete", "remove"]),
             ("&Workspace", ["add", "group", "keyword", None, "graph", "layout"]),
             ("&Tools", ["unmix", "export_exp", "table", "transform"]),
             ("&Help", ["suggest", None, "about", "license", "website"]),
@@ -149,7 +152,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         home = r.add_tab("Sidescatter")
         home.add_group("Navigate", [acts["new"], acts["add"], acts["group"], acts["table"]])
-        home.add_group("Experiment", [acts["keyword"], acts["graph"], acts["layout"], acts["demo"]])
+        home.add_group("Experiment", [acts["keyword"], acts["graph"], acts["boolean"], acts["layout"],
+                                      acts["demo"]])
         home.add_group("Cytometry", [acts["unmix"], acts["transform"], acts["import"]])
         home.add_group("Help", [acts["suggest"], acts["website"], acts["about"], acts["license"]])
 
@@ -160,12 +164,13 @@ class MainWindow(QtWidgets.QMainWindow):
         page.add_group("Application", [acts["quit"]])
 
         page = r.add_tab("Edit")
-        page.add_group("Populations", [acts["rename"], acts["delete"]])
+        page.add_group("Populations", [acts["boolean"], acts["rename"], acts["delete"]])
         page.add_group("Samples", [acts["remove"]])
 
         page = r.add_tab("Workspace")
         page.add_group("Samples", [acts["add"], acts["demo"]])
         page.add_group("Groups", [acts["group"], acts["keyword"]])
+        page.add_group("Gates", [acts["boolean"]])
         page.add_group("Graphs", [acts["graph"], acts["layout"], acts["export"]])
 
         page = r.add_tab("Tools")
@@ -298,6 +303,13 @@ class MainWindow(QtWidgets.QMainWindow):
         win.closed.connect(self._graph_closed)
         self.graphs.append(win)
         v.show_population(sample_id, name, parent_path)
+        if name is not None and self.ws.is_boolean(name, parent_path):
+            # nothing to draw for a Boolean gate: show it on its first input's axes
+            axes = self.ws.plot_axes(name, parent_path)
+            if len(axes) == 2:
+                v.set_axes(*axes)
+            elif len(axes) == 1:
+                v.set_axes(axes[0], v.y_combo.currentData())
         offset = 28 * ((len(self.graphs) - 1) % 8)
         top_left = self.mapToGlobal(QtCore.QPoint(self.width() // 3, 90))
         win.move(top_left + QtCore.QPoint(offset, offset))
