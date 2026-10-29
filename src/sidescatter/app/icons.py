@@ -278,6 +278,21 @@ def _(p):
         p.drawLine(QtCore.QPointF(x, 13), QtCore.QPointF(x, 24))
 
 
+@_register("boolean")
+def _(p):
+    """Boolean gate: two overlapping populations with their overlap filled."""
+    left, right = QtGui.QPainterPath(), QtGui.QPainterPath()
+    left.addEllipse(QtCore.QPointF(12, 16), 9, 9)
+    right.addEllipse(QtCore.QPointF(20, 16), 9, 9)
+    p.setPen(QtCore.Qt.NoPen)
+    _fill(p, theme.ACCENT, 200)
+    p.drawPath(left.intersected(right))
+    _pen(p, theme.ACCENT_DARK, 1.8)
+    p.drawPath(left)
+    _pen(p, theme.TEAL, 1.8)
+    p.drawPath(right)
+
+
 @_register("remove_sample")
 def _(p):
     _tube(p, 18, 6, liquid=theme.TEAL)

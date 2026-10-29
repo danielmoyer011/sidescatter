@@ -6,6 +6,7 @@ transform registered under its channel name, as FlowJo workspaces do.
 """
 
 import copy
+import itertools
 import json
 import zipfile
 from pathlib import Path
@@ -181,7 +182,8 @@ class Workspace:
         self.invalidate()
 
     def remove_gate(self, name, parent_path):
-        self.strategy.remove_gate(name, gate_path=tuple(parent_path))
+        """Remove a gate, everything inside it, and the Boolean gates that use any of those."""
+        _remove_with_booleans(self.strategy, name, tuple(parent_path))
         self.invalidate()
 
     def rename_gate(self, name, new_name, parent_path):
@@ -214,6 +216,126 @@ class Workspace:
         walk(ROOT)
         return out
 
+    # ----- Boolean gates ---------------------------------------------------
+
+    def is_boolean(self, name, parent_path):
+        return isinstance(self.get_gate(name, parent_path), fk.gates.BooleanGate)
+
+    def boolean_inputs(self, name, parent_path):
+        """(op, [(name, parent_path, negated), ...]) of a Boolean gate, as the editor shows it."""
+        gate = self.get_gate(name, parent_path)
+        refs = [(r["ref"], tuple(r["path"]), bool(r.get("complement", False))) for r in gate.gate_refs]
+        if gate.type == "not":  # GatingML NOT: one input, negated
+            return "and", [(n, p, True) for n, p, _ in refs[:1]]
+        return gate.type, refs
+
+    def boolean_parent(self, inputs):
+        """Where a Boolean gate on these inputs goes: the deepest population that
+        contains all of them (the top level if they share nothing)."""
+        parents = [tuple(p) for _, p, *_ in inputs]
+        common = parents[0]
+        for p in parents[1:]:
+            n = 0
+            while n < min(len(common), len(p)) and common[n] == p[n]:
+                n += 1
+            common = common[:n]
+        return common or ROOT
+
+    def boolean_candidates(self, exclude=None):
+        """Populations a Boolean gate may use as inputs. With exclude=(name, parent),
+        leaves out that gate, everything inside it, and every Boolean gate built on it
+        (so editing a gate can't make it depend on itself)."""
+        pops = self.population_paths()
+        if exclude is None:
+            return pops
+        own = tuple(exclude[1]) + (exclude[0],)
+        banned = [own] + [p + (n,) for n, p in _boolean_dependents(self.strategy, *exclude)]
+        return [(n, p) for n, p in pops if not any((p + (n,))[:len(b)] == b for b in banned)]
+
+    def add_boolean(self, inputs, op="and", name=None):
+        """Add a Boolean gate. inputs: [(name, parent_path, negated), ...]; op: "and" or "or".
+        Returns (name, parent_path) of the new population."""
+        inputs = _check_inputs(inputs, op)
+        parent = self.boolean_parent(inputs)
+        taken = {n for n, _ in self.children(parent)}
+        name = (name or "").strip() or boolean_name(inputs, op)
+        if name in taken:
+            raise ValueError(f"there is already a population called {name} there")
+        self.add_gate(_boolean_gate(name, inputs, op), parent)
+        return name, parent
+
+    def edit_boolean(self, name, parent_path, inputs, op="and", new_name=None):
+        """Change a Boolean gate's inputs, operator and name. Returns its new (name, parent_path)."""
+        parent_path = tuple(parent_path)
+        inputs = _check_inputs(inputs, op)
+        allowed = set(self.boolean_candidates(exclude=(name, parent_path)))
+        for n, p, _ in inputs:
+            if (n, tuple(p)) not in allowed:
+                raise ValueError(f"{name} can't use {n}: it is {name} itself, inside it, or built on it")
+        new_parent = self.boolean_parent(inputs)
+        new_name = (new_name or "").strip() or name
+        if new_parent == parent_path:
+            gate = self.get_gate(name, parent_path)
+            replacement = _boolean_gate(name, inputs, op)
+            gate.type, gate.gate_refs = replacement.type, replacement.gate_refs
+            self.strategy._rebuild_dag()
+            self.invalidate()
+        else:
+            if self.children(parent_path + (name,)):
+                raise ValueError(f"{name} has populations inside it, so its inputs must still "
+                                 "share the same parent population")
+            if name in {n for n, _ in self.children(new_parent)}:
+                raise ValueError(f"there is already a population called {name} there")
+            users = _boolean_dependents(self.strategy, name, parent_path)
+            if users:
+                raise ValueError(f"other Boolean gates use {name}, so its inputs must still "
+                                 "share the same parent population")
+            self.strategy.remove_gate(name, gate_path=parent_path)
+            self.add_gate(_boolean_gate(name, inputs, op), new_parent)
+        if new_name != name:
+            self.rename_gate(name, new_name, new_parent)
+        return new_name, new_parent
+
+    def boolean_combinations(self, inputs, include_all_negative=False):
+        """One AND gate for every +/- combination of the inputs (FlowJo's "make all
+        combinations"), e.g. IFNg+ TNF- IL-2+. Returns the new (name, parent_path)s."""
+        inputs = [(n, tuple(p)) for n, p, *_ in inputs]
+        if len(inputs) < 2:
+            raise ValueError("pick at least two populations to combine")
+        parent = self.boolean_parent(inputs)
+        taken = {n for n, _ in self.children(parent)}
+        made = []
+        for signs in itertools.product((False, True), repeat=len(inputs)):
+            if all(signs) and not include_all_negative:
+                continue
+            combo = [(n, p, neg) for (n, p), neg in zip(inputs, signs)]
+            name = _unique(combination_name(combo), taken)
+            self.strategy.add_gate(_boolean_gate(name, combo, "and"), parent)
+            made.append((name, parent))
+        self.invalidate()
+        return made
+
+    def boolean_dependents(self, name, parent_path):
+        """Boolean gates outside this population that use it or anything inside it,
+        and so would be deleted with it."""
+        own = tuple(parent_path) + (name,)
+        return [(n, p) for n, p in _boolean_dependents(self.strategy, name, tuple(parent_path))
+                if (p + (n,))[:len(own)] != own]
+
+    def plot_axes(self, name, parent_path):
+        """The channels a population's own gate is drawn on. For a Boolean gate, those of its
+        first input (following nested Boolean gates)."""
+        seen = set()
+        while name is not None and (name, tuple(parent_path)) not in seen:
+            seen.add((name, tuple(parent_path)))
+            gate = self.get_gate(name, parent_path)
+            if not isinstance(gate, fk.gates.BooleanGate):
+                return [d.dimension_ref if hasattr(d, "dimension_ref") else d.id
+                        for d in getattr(gate, "dimensions", [])]
+            first = gate.gate_refs[0]
+            name, parent_path = first["ref"], tuple(first["path"])
+        return []
+
     def invalidate(self, sample_id=None):
         self.revision += 1
         if sample_id is None:
@@ -235,7 +357,11 @@ class Workspace:
         path = tuple(parent_path) + (name,)
         have = set(self.samples[sample_id].pnn_labels)
         for i in range(1, len(path)):
-            if not _gate_channels(self.get_gate(path[i], path[:i])) <= have:
+            gate = self.get_gate(path[i], path[:i])
+            if not _gate_channels(gate) <= have:
+                return False
+            if isinstance(gate, fk.gates.BooleanGate) and not all(
+                    self.applies_to(sample_id, r["ref"], r["path"]) for r in gate.gate_refs):
                 return False
         return True
 
@@ -252,10 +378,7 @@ class Workspace:
             return self.strategy
         pruned = copy.deepcopy(self.strategy)
         for name, parent in drop:
-            try:
-                pruned.remove_gate(name, gate_path=parent)
-            except (KeyError, ValueError):
-                pass  # already removed with its parent
+            _remove_with_booleans(pruned, name, parent)
         return pruned
 
     def membership(self, sample_id, name=None, parent_path=ROOT):
@@ -484,6 +607,100 @@ class Workspace:
             if name != ALL_SAMPLES:
                 ws.groups[name] = list(fj.get_sample_ids(name))
         return ws
+
+
+def boolean_name(inputs, op="and"):
+    """ "CD4+ AND NOT Treg", "NOT Dump" """
+    word = f" {op.upper()} "
+    return word.join(("NOT " if neg else "") + n for n, _, neg in inputs)
+
+
+def combination_name(inputs):
+    """ "IFNg+ TNF- IL-2+" for one +/- combination of the inputs."""
+    return " ".join(n.rstrip("+-− ") + ("-" if neg else "+") for n, _, neg in inputs)
+
+
+def _check_inputs(inputs, op):
+    inputs = [(n, tuple(p), bool(neg)) for n, p, neg in inputs]
+    if op not in ("and", "or"):
+        raise ValueError("a Boolean gate is AND or OR")
+    if not inputs:
+        raise ValueError("pick the populations to combine")
+    if len(inputs) == 1 and not inputs[0][2]:
+        raise ValueError("pick at least two populations, or tick NOT for a single one")
+    if len({(n, p) for n, p, _ in inputs}) < len(inputs):
+        raise ValueError("each population can only be used once")
+    return inputs
+
+
+def _boolean_gate(name, inputs, op):
+    if len(inputs) == 1:  # GatingML NOT takes exactly one input
+        n, p, _ = inputs[0]
+        return fk.gates.BooleanGate(name, "not", [{"ref": n, "path": p, "complement": False}])
+    refs = [{"ref": n, "path": p, "complement": neg} for n, p, neg in inputs]
+    return fk.gates.BooleanGate(name, op, refs)
+
+
+def _boolean_dependents(strategy, name, parent_path):
+    """Every Boolean gate that must go when this gate goes: those inside it, and those
+    that use it, anything inside it, or another doomed Boolean gate (transitively)."""
+    doomed = [tuple(parent_path) + (name,)]
+    out = []
+
+    def inside(path):
+        return any(path[:len(d)] == d for d in doomed)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in list(strategy._dag.nodes):
+            if node in (ROOT, doomed[0]) or node in [p + (n,) for n, p in out]:
+                continue
+            try:
+                gate = strategy.get_gate(node[-1], node[:-1])
+            except Exception:
+                continue  # quadrants, refs to gates not added yet
+            if not isinstance(gate, fk.gates.BooleanGate):
+                continue
+            refs = [tuple(r["path"]) + (r["ref"],) for r in gate.gate_refs]
+            if inside(node) or any(inside(r) for r in refs):
+                out.append((node[-1], node[:-1]))
+                doomed.append(node)
+                changed = True
+    return out
+
+
+def _remove_with_booleans(strategy, name, parent_path):
+    """Remove a gate from a strategy, first removing the Boolean gates that depend on it
+    (FlowKit refuses to remove a gate a Boolean gate still uses)."""
+    pending = sorted(_boolean_dependents(strategy, name, parent_path),
+                     key=lambda np_: len(np_[1]), reverse=True)
+    while pending:
+        progress = False
+        for n, p in list(pending):
+            if p + (n,) not in strategy._dag.nodes:
+                pending.remove((n, p))  # went with an earlier removal
+                continue
+            try:
+                strategy.remove_gate(n, gate_path=p)
+            except fk.exceptions.GateTreeError:
+                continue  # still used by another Boolean gate; try again after it goes
+            pending.remove((n, p))
+            progress = True
+        if not progress and pending:
+            break
+    try:
+        strategy.remove_gate(name, gate_path=tuple(parent_path))
+    except (KeyError, ValueError):
+        pass  # already removed with its parent
+
+
+def _unique(name, taken):
+    out, n = name, 2
+    while out in taken:
+        out, n = f"{name} ({n})", n + 1
+    taken.add(out)
+    return out
 
 
 def _gate_channels(gate):
