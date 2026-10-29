@@ -24,6 +24,7 @@ class WorkspacePanel(QtWidgets.QWidget):
     populationActivated = QtCore.Signal(str, object, object)  # double-click: open a graph
     groupChanged = QtCore.Signal(str)
     analysisRequested = QtCore.Signal(str, object, object)  # UMAP/tSNE/FlowSOM on a population
+    locateRequested = QtCore.Signal()  # find samples whose FCS files have moved
     changed = QtCore.Signal()
 
     def __init__(self, workspace, parent=None):
@@ -71,8 +72,26 @@ class WorkspacePanel(QtWidgets.QWidget):
         split.setSizes([170, 600])
         split.setChildrenCollapsible(False)
 
+        # "3 samples' FCS files couldn't be found. [Locate files…]"
+        self.banner = QtWidgets.QFrame()
+        self.banner.setObjectName("MissingBanner")
+        self.banner.setStyleSheet(f"#MissingBanner {{ background: #FFF4E0; border: 1px solid #E8B84A; "
+                                  f"border-radius: 4px; }} #MissingBanner QLabel {{ color: {theme.INK}; }}")
+        self.banner_text = QtWidgets.QLabel()
+        self.banner_text.setWordWrap(True)
+        warn = QtWidgets.QLabel()
+        warn.setPixmap(self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxWarning).pixmap(18, 18))
+        self.locate_btn = QtWidgets.QPushButton("Locate files…")
+        self.locate_btn.clicked.connect(self.locateRequested)
+        row = QtWidgets.QHBoxLayout(self.banner)
+        row.setContentsMargins(8, 4, 8, 4)
+        row.addWidget(warn)
+        row.addWidget(self.banner_text, 1)
+        row.addWidget(self.locate_btn)
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.banner)
         layout.addWidget(split)
         # counts fill in as background gating finishes; one rebuild per burst
         self._rebuild_timer = QtCore.QTimer(self, singleShot=True, interval=60)
@@ -86,7 +105,16 @@ class WorkspacePanel(QtWidgets.QWidget):
 
     # ----- groups ----------------------------------------------------------
 
+    def update_banner(self):
+        n = len(self.ws.missing)
+        self.banner.setVisible(bool(n))
+        if n:
+            self.banner_text.setText(
+                f"{n} sample{'s' if n != 1 else ''}' FCS file{'s' if n != 1 else ''} couldn't be found. "
+                "Gates and settings are kept; point Sidescatter at the folder they moved to.")
+
     def rebuild_groups(self):
+        self.update_banner()
         current = self.current_group()
         self.groups.blockSignals(True)
         self.groups.clear()
@@ -142,6 +170,22 @@ class WorkspacePanel(QtWidgets.QWidget):
             item.setFont(0, font)
             self.tree.addTopLevelItem(item)
             self._add_children(item, sid, ROOT)
+        group = self.current_group()
+        for sid, m in self.ws.missing.items():
+            if group != ALL_SAMPLES and group not in m["groups"]:
+                continue
+            item = QtWidgets.QTreeWidgetItem([sid, "File not found", ""])
+            item.setData(0, ROLE, (sid, None, ROOT))
+            item.setFlags(QtCore.Qt.ItemIsEnabled)  # nothing to select, plot or drag
+            item.setIcon(0, self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxWarning))
+            src = m["source"]
+            where = src.get("path") or src.get("unmixed_from_path") or src.get("unmixed_from") \
+                or src.get("concatenated")
+            item.setToolTip(0, f"Couldn't find the file for this sample: {where}\n"
+                               "Double-click, or use Locate files…, to find it.")
+            for col in range(3):
+                item.setForeground(col, QtGui.QColor(theme.MUTED))
+            self.tree.addTopLevelItem(item)
         for it in self._items():
             key = self._key(it)
             if key in expanded or key[1] is None:
@@ -212,6 +256,9 @@ class WorkspacePanel(QtWidgets.QWidget):
             self.populationSelected.emit(*sel)
 
     def _on_double_click(self, item, _column):
+        if self._key(item)[0] in self.ws.missing:
+            self.locateRequested.emit()
+            return
         self.populationActivated.emit(*self._key(item))
 
     # ----- editing -----------------------------------------------------------
@@ -222,6 +269,11 @@ class WorkspacePanel(QtWidgets.QWidget):
             return
         sid, name, parent = self._key(item)
         menu = QtWidgets.QMenu(self)
+        if sid in self.ws.missing:
+            menu.addAction("Locate files…", self.locateRequested.emit)
+            menu.addAction("Remove sample", lambda: self._forget(sid))
+            menu.exec(self.tree.viewport().mapToGlobal(pos))
+            return
         menu.addAction("Open graph window", lambda: self.populationActivated.emit(sid, name, parent))
         menu.addAction("UMAP, tSNE and FlowSOM…", lambda: self.analysisRequested.emit(sid, name, parent))
         menu.addSeparator()
@@ -306,6 +358,11 @@ class WorkspacePanel(QtWidgets.QWidget):
 
     def _remove_sample(self, sid):
         self.ws.remove_sample(sid)
+        self.changed.emit()
+
+    def _forget(self, sid):
+        self.ws.forget_missing(sid)
+        self.update_banner()
         self.changed.emit()
 
 

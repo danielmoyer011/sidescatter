@@ -5,6 +5,7 @@ where the gating tools sit right above the plot. The Layout Editor arranges
 plots into printable figures.
 """
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from .. import __version__
 from ..core import fcs
 from ..core.fcs import find_fcs_files
+from ..core.versioning import RELEASES_URL, NewerWorkspaceError
 from ..core.workspace import ROOT, Workspace, default_tops, write_document
 from . import icons
 from .analysis_dialog import AnalysisDialog, HeatmapDialog
@@ -39,6 +41,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.ws = Workspace()
         self.path = None
+        self._backup_from = None  # (path, old format version) until the first save over it
         self.dirty = False
         self.edits = 0      # counts changes, so a background save knows if it caught them all
         self.ask_before_discard = True
@@ -51,6 +54,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.panel.populationActivated.connect(self.open_graph)
         self.panel.changed.connect(self._changed)
         self.panel.analysisRequested.connect(self.run_analysis)
+        self.panel.locateRequested.connect(self.locate_files)
         self.unmix_tab = UnmixingTab(self.ws)
         self.unmix_tab.unmixed.connect(self._after_unmix)
         self.unmix_tab.changed.connect(self._changed)
@@ -255,6 +259,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.qc_window is not None:
             self.qc_window.set_workspace(ws)
         self.path, self.dirty = path, False
+        # opened from an older format: the first save over it keeps the original
+        self._backup_from = (path, ws.upgraded_from) if path and ws.upgraded_from else None
         self._update_title()
 
     def _confirm_discard(self):
@@ -424,7 +430,22 @@ class MainWindow(QtWidgets.QMainWindow):
         job = run_job(f"Opening {Path(path).name}",
                       lambda job: Workspace.load(path, progress=job.progress),
                       on_done=lambda ws: self._set_workspace(ws, path), key=("open-workspace",))
-        return run_with_dialog(job, self)
+        return run_with_dialog(job, self, on_failure=self._newer_workspace)
+
+    def _newer_workspace(self, job):
+        """A file from a newer Sidescatter: say so plainly, and offer the update."""
+        if not isinstance(job.error, NewerWorkspaceError):
+            return False
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setWindowTitle("Newer workspace")
+        box.setText(str(job.error))
+        download = box.addButton("Download update", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.Close)
+        box.exec()
+        if box.clickedButton() is download:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(RELEASES_URL))
+        return True
 
     def save(self):
         """Save now, in the background. Finished work is saved; a running unmix
@@ -434,17 +455,68 @@ class MainWindow(QtWidgets.QMainWindow):
         self.unmix_tab.store()
         path, doc, edits = self.path, self.ws.to_document(), self.edits
         analyses = list(self.ws.analyses)
+        backup = self._backup_from
+        if backup is not None and Path(backup[0]).resolve() != Path(path).resolve():
+            backup = None  # saving somewhere else leaves the original as it was
 
-        def saved(_):
+        def work(job):
+            kept = None
+            if backup is not None and Path(path).exists():
+                kept = _backup_path(Path(path), backup[1])
+                shutil.copy2(path, kept)
+            write_document(path, doc, analyses)
+            return kept
+
+        def saved(kept):
             if self.edits == edits and self.path == path:
                 self.dirty = False
                 self._update_title()
+            if backup is not None:
+                self._backup_from = None
             busy = jobs().busy(prefix=("unmix",))
-            self.statusBar().showMessage(
-                f"Saved{' (unmix still running)' if busy else ''}.", 6000)
+            msg = f"Saved{' (unmix still running)' if busy else ''}."
+            if kept is not None:
+                msg += (f" This workspace was from an older Sidescatter, so the original "
+                        f"is kept as {kept.name}.")
+            self.statusBar().showMessage(msg, 15000 if kept else 6000)
 
-        return run_job(f"Saving {Path(path).name}", lambda job: write_document(path, doc, analyses),
+        return run_job(f"Saving {Path(path).name}", work,
                        on_done=saved, cancellable=False, key=("save", path))
+
+    def locate_files(self, folder=None):
+        """Find samples whose FCS files moved: one folder (searched with everything
+        below it) usually finds them all."""
+        if not self.ws.missing:
+            return None
+        if not folder:
+            start = str(Path(self.path).parent) if self.path else ""
+            folder = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Locate files: pick the folder the FCS files are in", start)
+        if not folder:
+            return None
+        ws, before = self.ws, len(self.ws.missing)
+
+        def work(job):
+            found = ws.find_missing(folder, progress=job.progress)
+            job.check_cancelled()
+            return ws.read_missing(found, progress=job.progress)
+
+        def done(loaded):
+            if ws is not self.ws:
+                return
+            ws.restore_missing(loaded)
+            self._changed()
+            left = len(ws.missing)
+            found = before - left
+            if left:
+                self.statusBar().showMessage(
+                    f"Found {found} of {before} samples. {left} still missing: try another folder.", 10000)
+            else:
+                self.statusBar().showMessage(f"Found all {before} samples.", 6000)
+
+        job = run_job(f"Locating files in {Path(folder).name}", work, on_done=done,
+                      key=("locate",))
+        return run_with_dialog(job, self)
 
     def save_as(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save workspace", "workspace.ssw",
@@ -790,3 +862,11 @@ class LicenseDialog(QtWidgets.QDialog):
         layout.addLayout(row)
         layout.addSpacing(8)
         layout.addWidget(buttons)
+
+
+def _backup_path(path, version):
+    """Name.v1-backup.ssw next to the workspace, never replacing an older backup."""
+    out, n = path.with_name(f"{path.stem}.v{version}-backup{path.suffix}"), 2
+    while out.exists():
+        out, n = path.with_name(f"{path.stem}.v{version}-backup ({n}){path.suffix}"), n + 1
+    return out
