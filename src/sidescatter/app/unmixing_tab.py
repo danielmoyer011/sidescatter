@@ -650,7 +650,7 @@ class UnmixingTab(QtWidgets.QWidget):
         self.preview_plot.addItem(img)
         self.preview_plot.setLabel("bottom", f"{self.unmixer.names[xi]} (asinh)")
         self.preview_plot.setLabel("left", f"{self.unmixer.names[yi]} (asinh)")
-        R = spectral.residuals(Y, A, self.unmixer.matrix)
+        R = self.unmixer.residuals(Y, A)
         rms = np.sqrt((R ** 2).mean(axis=0))
         self.resid_plot.addItem(pg.BarGraphItem(x=np.arange(len(rms)), height=rms, width=0.8,
                                                 brush=(242, 109, 91, 170)))

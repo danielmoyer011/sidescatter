@@ -356,20 +356,23 @@ class Workspace:
         self.add_sample(unmixed, {"unmixed_from": sample_id, "unmixer": unmixer_name}, group)
         return new_id
 
-    def unmix_file(self, path, unmixer_name, group=None, raw_sample=None):
+    def unmix_file(self, path, unmixer_name, group=None, raw_sample=None, af_source=None, progress=None):
         """Unmix a raw file that stays out of the workspace (the Unmixing tab's files).
 
         Only the unmixed sample is added; reopening the workspace unmixes the
-        raw file again from its path.
+        raw file again from its path. af_source: the unstained file whose
+        per-cell AF library entries this sample uses (None: all of them).
         """
         from .unmixing import unmix_sample
 
         path = Path(path)
         raw = raw_sample if raw_sample is not None else fcs.load_sample(path)
-        unmixed = unmix_sample(raw, self.unmixers[unmixer_name])
+        unmixed = unmix_sample(raw, self.unmixers[unmixer_name], af_source=af_source, progress=progress)
         unmixed.id = self._unique_id(f"{path.name} (unmixed)")
-        return self.add_sample(unmixed, {"unmixed_from_path": str(path.resolve()), "unmixer": unmixer_name},
-                               group)
+        src = {"unmixed_from_path": str(path.resolve()), "unmixer": unmixer_name}
+        if af_source and af_source != "shared":
+            src["af_source"] = str(af_source)
+        return self.add_sample(unmixed, src, group)
 
     def _raw_for(self, src, search_dirs=()):
         if "unmixed_from" in src:
@@ -382,7 +385,8 @@ class Workspace:
 
         for sid, src in list(self.sources.items()):
             if src.get("unmixer") == unmixer_name:
-                fresh = unmix_sample(self._raw_for(src), self.unmixers[unmixer_name])
+                fresh = unmix_sample(self._raw_for(src), self.unmixers[unmixer_name],
+                                     af_source=src.get("af_source"))
                 fresh.id = sid
                 self.samples[sid] = fresh
                 self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sid}
@@ -437,7 +441,7 @@ class Workspace:
 
             src = s["source"]
             raw = ws._raw_for(src, [Path(path).parent, *map(Path, search_dirs)])
-            sample = unmix_sample(raw, ws.unmixers[src["unmixer"]])
+            sample = unmix_sample(raw, ws.unmixers[src["unmixer"]], af_source=src.get("af_source"))
             sample.id = s["id"]
             ws.add_sample(sample, src)
 
