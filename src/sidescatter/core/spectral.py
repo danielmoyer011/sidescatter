@@ -93,16 +93,141 @@ def autofluorescence_signatures(unstained, n_signatures=1, n_iter=50, seed=0):
     return np.array([normalise(c) for c in centres])
 
 
+def _kmeans(X, k, n_iter=30, seed=0):
+    """Plain k-means with k-means++ starts. Returns (centres, labels)."""
+    rng = np.random.default_rng(seed)
+    k = min(k, len(X))
+    centres = [X[rng.integers(len(X))]]
+    dist = ((X - centres[0]) ** 2).sum(axis=1)
+    for _ in range(1, k):
+        if dist.sum() <= 0:
+            break
+        centres.append(X[rng.choice(len(X), p=dist / dist.sum())])
+        dist = np.minimum(dist, ((X - centres[-1]) ** 2).sum(axis=1))
+    centres = np.array(centres)
+    sq = (X ** 2).sum(axis=1)[:, None]
+    for _ in range(n_iter):
+        labels = (sq - 2 * X @ centres.T + (centres ** 2).sum(axis=1)[None, :]).argmin(axis=1)
+        new = np.array([X[labels == j].mean(axis=0) if np.any(labels == j) else centres[j]
+                        for j in range(len(centres))])
+        if np.allclose(new, centres):
+            break
+        centres = new
+    labels = (sq - 2 * X @ centres.T + (centres ** 2).sum(axis=1)[None, :]).argmin(axis=1)
+    return centres, labels
+
+
+def cosine(a, b):
+    """Cosine similarity of every row of a with every row of b."""
+    a = np.atleast_2d(a) / np.maximum(np.linalg.norm(np.atleast_2d(a), axis=1, keepdims=True), 1e-12)
+    b = np.atleast_2d(b) / np.maximum(np.linalg.norm(np.atleast_2d(b), axis=1, keepdims=True), 1e-12)
+    return a @ b.T
+
+
+def dedupe_spectra(spectra, threshold=0.99):
+    """Indices of the spectra to keep: each one is dropped when its cosine similarity
+    to an earlier kept one is above threshold, so put the most important first."""
+    keep = []
+    for i, s in enumerate(spectra):
+        if not keep or cosine(s, spectra[keep]).max() <= threshold:
+            keep.append(i)
+    return keep
+
+
+def af_library(unstained, max_spectra=30, fluor_signatures=None, duplicate_threshold=0.99,
+               max_events=20_000, seed=0):
+    """A library of autofluorescence spectra from unstained cells, for per-cell matching.
+
+    Events are clustered by spectral shape (peak-normalised) with k-means into
+    up to max_spectra groups; each group's median spectrum is one library
+    entry. The first entry is the median of all events. Entries closer than
+    duplicate_threshold (cosine similarity) to an earlier one are dropped, as
+    are entries that look like one of fluor_signatures (contamination from a
+    stained tube). Returns (library, n_events): (m, d) peak-normalised spectra,
+    largest group first, and how many clustered events each one stands for.
+    """
+    Y = np.asarray(unstained, dtype=np.float64)
+    if len(Y) > max_events:
+        Y = Y[np.sort(np.random.default_rng(seed).choice(len(Y), max_events, replace=False))]
+    # The dimmest events are mostly detector noise and have no usable shape.
+    total = Y.sum(axis=1)
+    Y = Y[total >= np.quantile(total, 0.1)]
+    spectra, sizes = [normalise(np.median(Y, axis=0))], [len(Y)]
+    if max_spectra > 1 and len(Y) >= 2 * max_spectra:
+        shapes = np.clip(Y, 0, None)
+        shapes = shapes / np.maximum(shapes.max(axis=1, keepdims=True), 1e-12)
+        _, labels = _kmeans(shapes, max_spectra - 1, seed=seed)
+        groups = sorted((np.flatnonzero(labels == j) for j in np.unique(labels)), key=len, reverse=True)
+        for g in groups:
+            if len(g) >= 5:
+                try:
+                    spectra.append(normalise(np.median(Y[g], axis=0)))
+                    sizes.append(len(g))
+                except ValueError:
+                    continue
+    spectra, sizes = np.array(spectra), np.array(sizes)
+    if fluor_signatures is not None and len(fluor_signatures):
+        clean = cosine(spectra, fluor_signatures).max(axis=1) < 0.99
+        clean[0] = True
+        spectra, sizes = spectra[clean], sizes[clean]
+    keep = dedupe_spectra(spectra, duplicate_threshold)
+    return spectra[keep], sizes[keep]
+
+
+def unmix_af_per_cell(Y, F, library, method="ols", background_var=None, allowed=None):
+    """Unmix with one autofluorescence spectrum per cell, picked from a library.
+
+    For every event and every library spectrum L_j, the model is
+    y = a @ F + c * L_j; the j that leaves the smallest least-squares residual
+    wins (AutoSpectral's approach). That is found in one pass: after removing
+    the part of L_j the fluors can explain (L_j_perp), the residual drops by
+    (y . L_j_perp)^2 / |L_j_perp|^2. Only positive AF amounts count.
+
+    F: (k, d) fluor signatures; library: (m, d). allowed: optional (m,) bool,
+    the library entries this sample may use.
+    Returns (A, af, index): fluor abundances (n, k), fitted AF amount (n,), and
+    the 1-based library entry used (0 when no AF fitted).
+    """
+    Y = np.asarray(Y, dtype=np.float64)
+    F = np.asarray(F, dtype=np.float64)
+    L = np.asarray(library, dtype=np.float64)
+    P = np.linalg.pinv(F)                      # (d, k)
+    L_perp = L - (L @ P) @ F                   # parts of each AF spectrum the fluors can't fit
+    norm2 = (L_perp ** 2).sum(axis=1)
+    usable = norm2 > 1e-8 * (L ** 2).sum(axis=1)
+    if allowed is not None:
+        usable &= np.asarray(allowed, bool)
+    proj = Y @ L_perp.T                        # (n, m), equal to y_perp . L_perp
+    gain = np.where((proj > 0) & usable, proj ** 2 / np.where(usable, norm2, 1.0), 0.0)
+    best = gain.argmax(axis=1)
+    rows = np.arange(len(Y))
+    fitted = gain[rows, best] > 0
+    af = np.where(fitted, proj[rows, best] / np.where(usable, norm2, 1.0)[best], 0.0)
+    Y_fluor = Y - af[:, None] * L[best]
+    if method == "wls":
+        # Photon noise comes from all the light, AF included, so weight by the raw event.
+        A = unmix_wls(Y_fluor, F, background_var, weights_from=Y)
+        # Refit the AF amount on what the weighted fit leaves, so it stays consistent.
+        R = Y - A @ F
+        L_best = L[best]
+        af = np.where(fitted, np.clip((R * L_best).sum(axis=1)
+                                      / np.maximum((L_best ** 2).sum(axis=1), 1e-12), 0, None), 0.0)
+    else:
+        A = Y_fluor @ P
+    return A, af, np.where(fitted, best + 1, 0)
+
+
 def unmix_ols(Y, M):
     """Ordinary least squares: A = Y @ pinv(M)."""
     return np.asarray(Y, dtype=np.float64) @ np.linalg.pinv(M)
 
 
-def unmix_wls(Y, M, background_var=None, chunk=50_000):
+def unmix_wls(Y, M, background_var=None, chunk=50_000, weights_from=None):
     """Weighted least squares with per-event, per-detector weights.
 
     Weight = 1 / (max(signal, 0) + background variance), i.e. Poisson-like
     photon noise plus detector background, so bright detectors don't dominate.
+    weights_from: events to take the signal from, when not Y itself.
     """
     Y = np.asarray(Y, dtype=np.float64)
     M = np.asarray(M, dtype=np.float64)
@@ -110,13 +235,17 @@ def unmix_wls(Y, M, background_var=None, chunk=50_000):
         background_var = np.ones(M.shape[1])
     background_var = np.maximum(np.asarray(background_var, dtype=np.float64), 1e-9)
 
-    out = np.empty((Y.shape[0], M.shape[0]))
+    k = M.shape[0]
+    # lhs[n] = M diag(w[n]) M.T for every event at once, as one matrix product:
+    # w (n, d) @ G (d, k*k), where G[:, i*k + j] = M[i] * M[j].
+    G = (M[:, None, :] * M[None, :, :]).reshape(k * k, -1).T
+    out = np.empty((Y.shape[0], k))
     for start in range(0, Y.shape[0], chunk):
         y = Y[start:start + chunk]
-        w = 1.0 / (np.clip(y, 0, None) + background_var)       # (n, d)
-        mw = M[None, :, :] * w[:, None, :]                     # (n, k, d)
-        lhs = mw @ M.T                                          # (n, k, k)
-        rhs = np.einsum("nkd,nd->nk", mw, y)                    # (n, k)
+        signal = y if weights_from is None else np.asarray(weights_from[start:start + chunk], np.float64)
+        w = 1.0 / (np.clip(signal, 0, None) + background_var)  # (n, d)
+        lhs = (w @ G).reshape(-1, k, k)                         # (n, k, k)
+        rhs = (w * y) @ M.T                                     # (n, k)
         out[start:start + chunk] = np.linalg.solve(lhs, rhs[..., None])[..., 0]
     return out
 
@@ -184,10 +313,31 @@ class Unmixer:
     # autofluorescence "AF-A") with the marker as the description. "name":
     # channels are the bare reference names, as in workspaces saved before.
     channel_style: str = "spectroflo"
+    # Per-cell autofluorescence: (m, d) library of AF spectra, one of which is
+    # fitted to each cell. When set, the single autofluorescence reference is
+    # the AF-A channel and an extra AF Index channel says which entry matched.
+    af_library: np.ndarray = None
+    af_sources: list = None  # file each library entry came from
 
     @property
     def names(self):
         return [r.name for r in self.references]
+
+    @property
+    def per_cell_af(self):
+        return self.af_library is not None
+
+    @property
+    def output_names(self):
+        """Names of the columns unmix() returns."""
+        return self.names + (["AF Index"] if self.per_cell_af else [])
+
+    def af_allowed(self, af_source=None):
+        """Library entries a sample may use: all of them, or those from one unstained file."""
+        if not self.per_cell_af or not af_source or not self.af_sources:
+            return None
+        allowed = np.array([s == af_source for s in self.af_sources])
+        return allowed if allowed.any() else None
 
     def channel_labels(self):
         """(PnN, PnS) of each unmixed channel, one per reference, never repeated."""
@@ -207,23 +357,54 @@ class Unmixer:
                 pnn, k = f"{base} {k}", k + 1
             seen.add(pnn)
             labels.append((pnn, pns))
+        if self.per_cell_af:
+            labels.append(("AF Index", "AF library entry"))
         return labels
 
     @property
     def matrix(self):
         return np.vstack([r.signature for r in self.references])
 
-    def unmix(self, Y):
-        M = self.matrix
-        if self.method == "wls":
-            A = unmix_wls(Y, M, self.background_var)
-        elif self.method == "ols":
-            A = unmix_ols(Y, M)
-        else:
+    def unmix(self, Y, af_source=None):
+        """Abundances, one column per output_names entry.
+
+        af_source: with per-cell AF, the unstained file whose library entries
+        this sample may use (None: the whole shared library).
+        """
+        if self.method not in ("ols", "wls"):
             raise ValueError(f"unknown unmixing method {self.method!r}")
+        if self.per_cell_af:
+            fluor = [i for i, r in enumerate(self.references) if not r.is_autofluorescence]
+            af_col = next(i for i, r in enumerate(self.references) if r.is_autofluorescence)
+            A_f, af, index = unmix_af_per_cell(Y, self.matrix[fluor], self.af_library, self.method,
+                                               self.background_var, self.af_allowed(af_source))
+            A = np.empty((len(A_f), len(self.references) + 1))
+            A[:, fluor] = A_f
+            A[:, af_col] = af
+            A[:, -1] = index
+        else:
+            M = self.matrix
+            A = unmix_wls(Y, M, self.background_var) if self.method == "wls" else unmix_ols(Y, M)
         if self.fine_tune is not None:
-            A = apply_fine_tune(A, self.fine_tune)
+            n = len(self.references)
+            A[:, :n] = apply_fine_tune(A[:, :n], self.fine_tune)
         return A
+
+    def reconstruct(self, A):
+        """The detector signal the model predicts from unmixed abundances A."""
+        n = len(self.references)
+        if not self.per_cell_af:
+            return A[:, :n] @ self.matrix
+        fluor = [i for i, r in enumerate(self.references) if not r.is_autofluorescence]
+        af_col = next(i for i, r in enumerate(self.references) if r.is_autofluorescence)
+        index = A[:, -1].astype(int)
+        spectra = np.vstack([np.zeros(self.af_library.shape[1]), self.af_library])[index]
+        return A[:, fluor] @ self.matrix[fluor] + A[:, [af_col]] * spectra
+
+    def residuals(self, Y, A=None):
+        """Per-event, per-detector residual Y - model(A)."""
+        A = self.unmix(Y) if A is None else A
+        return np.asarray(Y, dtype=np.float64) - self.reconstruct(A)
 
     def to_dict(self):
         return {
@@ -239,6 +420,8 @@ class Unmixer:
             else np.asarray(self.background_var).tolist(),
             "fine_tune": None if self.fine_tune is None else self.fine_tune.tolist(),
             "channel_style": self.channel_style,
+            "af_library": None if self.af_library is None else np.asarray(self.af_library).tolist(),
+            "af_sources": self.af_sources,
         }
 
     @classmethod
@@ -256,4 +439,6 @@ class Unmixer:
             else np.asarray(d["background_var"]),
             fine_tune=None if d.get("fine_tune") is None else np.asarray(d["fine_tune"]),
             channel_style=d.get("channel_style", "name"),
+            af_library=None if d.get("af_library") is None else np.asarray(d["af_library"]),
+            af_sources=d.get("af_sources"),
         )
