@@ -31,6 +31,9 @@ def main():
     import pyqtgraph as pg
 
     pg.setConfigOptions(antialias=True, imageAxisOrder="col-major")
+    from .app.axis_scales import load_saved_scales
+
+    load_saved_scales()
     window = MainWindow()
     window.show()
     splash.finish(window)

@@ -3,6 +3,8 @@
 import flowkit as fk
 import numpy as np
 
+from .scales import BiexTransform, SymLogTransform
+
 _TRANSFORMS = {
     "linear": (fk.transforms.LinearTransform, ("param_t", "param_a")),
     "log": (fk.transforms.LogTransform, ("param_t", "param_m")),
@@ -10,6 +12,8 @@ _TRANSFORMS = {
     "asinh": (fk.transforms.AsinhTransform, ("param_t", "param_m", "param_a")),
     "hyperlog": (fk.transforms.HyperlogTransform, ("param_t", "param_w", "param_m", "param_a")),
     "flowjo_biex": (fk.transforms.WSPBiexTransform, ("negative", "width", "positive", "max_value")),
+    "biex": (BiexTransform, ("negative", "width", "positive", "max_value")),
+    "neglog": (SymLogTransform, ("param_t", "param_n", "param_c")),
 }
 
 

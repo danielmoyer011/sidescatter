@@ -14,9 +14,10 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import icons, theme
-from ..core import fcs
+from ..core import fcs, scales
 from ..core.workspace import ALL_SAMPLES, ROOT
 from .axes import TransformAxis
+from .axis_scales import ScaleButton, scale_menu
 from .boolean_editor import confirm_delete
 from .gating import service as gating
 from .spectrum_plot import SpectrumPlot
@@ -71,7 +72,7 @@ class GraphView(QtWidgets.QWidget):
 
     gatesChanged = QtCore.Signal()
     populationShown = QtCore.Signal(str, object, object)  # sample_id, name, parent_path
-    transformRequested = QtCore.Signal(object)  # this view
+    transformRequested = QtCore.Signal(object, object)  # this view, channel
 
     def __init__(self, workspace, parent=None):
         super().__init__(parent)
@@ -91,7 +92,7 @@ class GraphView(QtWidgets.QWidget):
         self._data_items = []   # what the last full redraw plotted, shown faded while busy
         self._waiting = False   # gating results for this sample are being worked out
 
-        # ----- header: population, sample arrows, plot type, transform ------
+        # ----- header: population, sample arrows, plot type -----------------
         self.title = QtWidgets.QLabel()
         self.title.setObjectName("GraphTitle")
         self.count_label = QtWidgets.QLabel()
@@ -100,12 +101,6 @@ class GraphView(QtWidgets.QWidget):
         self.next_button = self._nav_button("›", "Next sample in the group", +1)
         self.type_combo = QtWidgets.QComboBox()
         self.type_combo.addItems(PLOT_TYPES)
-        self.transform_button = QtWidgets.QToolButton()
-        self.transform_button.setObjectName("GateTool")
-        self.transform_button.setIcon(icons.icon("axis_transform", 20))
-        self.transform_button.setIconSize(QtCore.QSize(20, 20))
-        self.transform_button.setToolTip("Axis transform (biexponential, log, linear…)")
-        self.transform_button.clicked.connect(lambda: self.transformRequested.emit(self))
         self.colour_combo = QtWidgets.QComboBox()
         self.colour_combo.setToolTip("Colour events by density, or by another channel's intensity "
                                      "(median on its display scale), as on a UMAP heat plot")
@@ -124,7 +119,6 @@ class GraphView(QtWidgets.QWidget):
         hl.addSpacing(6)
         hl.addWidget(self.count_label)
         hl.addStretch()
-        hl.addWidget(self.transform_button)
         hl.addWidget(self.colour_combo)
         hl.addWidget(self.type_combo)
 
@@ -161,9 +155,13 @@ class GraphView(QtWidgets.QWidget):
         gl.addStretch()
         self.tools["pointer"].setChecked(True)
 
-        # ----- plot with axis pickers ---------------------------------------
+        # ----- plot with axis pickers and their scale buttons ---------------
         self.x_combo = QtWidgets.QComboBox()
         self.y_combo = VerticalComboBox()
+        self.x_scale = ScaleButton()
+        self.y_scale = ScaleButton(vertical=True)
+        self.x_scale.clicked.connect(lambda: self.show_scale_menu("x"))
+        self.y_scale.clicked.connect(lambda: self.show_scale_menu("y"))
         for combo in (self.x_combo, self.y_combo):
             combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
             combo.setMinimumContentsLength(10)
@@ -181,6 +179,8 @@ class GraphView(QtWidgets.QWidget):
             ax.setPen(pg.mkPen(theme.BORDER_STRONG))
             ax.setTextPen(pg.mkPen(theme.MUTED))
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
+        self.x_axis.rightClicked.connect(lambda pos: self.show_scale_menu("x", pos))
+        self.y_axis.rightClicked.connect(lambda pos: self.show_scale_menu("y", pos))
         self.plot.viewport().installEventFilter(self)
         self.plot.viewport().setMouseTracking(True)
 
@@ -210,12 +210,24 @@ class GraphView(QtWidgets.QWidget):
         grid = QtWidgets.QGridLayout(canvas)
         grid.setContentsMargins(6, 8, 12, 6)
         grid.setSpacing(2)
-        grid.addWidget(self.y_combo, 0, 0, QtCore.Qt.AlignCenter)
+        y_picker = QtWidgets.QVBoxLayout()
+        y_picker.setSpacing(4)
+        y_picker.addStretch()
+        y_picker.addWidget(self.y_scale, 0, QtCore.Qt.AlignHCenter)
+        y_picker.addWidget(self.y_combo, 0, QtCore.Qt.AlignHCenter)
+        y_picker.addStretch()
+        grid.addLayout(y_picker, 0, 0)
         grid.addWidget(self.plot, 0, 1)
         self.spectrum = SpectrumPlot()
         self.spectrum.hide()
         grid.addWidget(self.spectrum, 0, 0, 1, 2)
-        grid.addWidget(self.x_combo, 1, 1, QtCore.Qt.AlignHCenter)
+        x_picker = QtWidgets.QHBoxLayout()
+        x_picker.setSpacing(4)
+        x_picker.addStretch()
+        x_picker.addWidget(self.x_combo)
+        x_picker.addWidget(self.x_scale)
+        x_picker.addStretch()
+        grid.addLayout(x_picker, 1, 1)
         grid.setColumnStretch(1, 1)
         grid.setRowStretch(0, 1)
 
@@ -320,6 +332,44 @@ class GraphView(QtWidgets.QWidget):
         name, parent = self.population
         return parent if name is None else parent + (name,)
 
+    # ----- axis scales -----------------------------------------------------
+
+    def show_scale_menu(self, axis, pos=None):
+        if self.sample_id is None or self.is_spectrum or (axis == "y" and self.is_histogram):
+            return
+        ch = (self.x_combo if axis == "x" else self.y_combo).currentData()
+        if ch is None:
+            return
+        menu = scale_menu(self, self.ws, ch, self.set_scale, self.restore_scale,
+                          lambda c: self.transformRequested.emit(self, c))
+        if pos is None:
+            button = self.x_scale if axis == "x" else self.y_scale
+            pos = button.mapToGlobal(QtCore.QPoint(0, button.height()) if axis == "x"
+                                     else QtCore.QPoint(button.width(), 0))
+        menu.exec(pos)
+
+    def set_scale(self, channel, kind):
+        """Show a channel on another scale (everywhere in the workspace); gates
+        keep selecting the same events."""
+        old = self.ws.transform(channel)
+        if scales.kind_of(old) == kind:
+            return
+        try:
+            new = scales.convert(old, kind)
+            self.ws.set_transform(channel, new)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Axis scale", str(exc))
+            return
+        self.refresh()
+        self.gatesChanged.emit()
+
+    def restore_scale(self, channel):
+        if self.ws.previous_transform(channel) is None:
+            return
+        self.ws.restore_previous_transform(channel)
+        self.refresh()
+        self.gatesChanged.emit()
+
     # ----- drawing ---------------------------------------------------------
 
     def refresh(self):
@@ -347,15 +397,22 @@ class GraphView(QtWidgets.QWidget):
         spectral = self.is_spectrum
         self.y_combo.setVisible(not self.is_histogram and not spectral)
         self.x_combo.setVisible(not spectral)
+        self.y_scale.setVisible(self.y_combo.isVisibleTo(self))
+        self.x_scale.setVisible(not spectral)
         self.plot.setVisible(not spectral)
         self.spectrum.setVisible(spectral)
-        self.transform_button.setEnabled(not spectral)
         self.colour_combo.setVisible(self.type_combo.currentText() in ("Pseudocolor", "Dot plot"))
         for mode, b in self.tools.items():
             needs_hist = next(s[2] for s in GATE_TOOLS if s and s[0] == mode)
             b.setEnabled(needs_hist is None or (not spectral and needs_hist == self.is_histogram))
         self.x_axis.set_transform(self.ws.transform(xch))
         self.y_axis.set_transform(None if self.is_histogram else self.ws.transform(ych))
+        for button, ch, axis in ((self.x_scale, xch, "X"), (self.y_scale, ych, "Y")):
+            xform = self.ws.transform(ch)
+            button.setText(scales.tag(xform))
+            button.setToolTip(f"{axis} axis scale: {scales.label(xform)}. Click to change it; "
+                              "right-clicking the axis works too.")
+            button.updateGeometry()
 
         trail = " › ".join([*parent[1:], name]) if name else "All events"
         self.title.setText(f"{self.sample_id}  ›  {trail}" if name else self.sample_id)

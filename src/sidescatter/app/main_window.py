@@ -8,7 +8,6 @@ plots into printable figures.
 import sys
 from pathlib import Path
 
-import flowkit as fk
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import __version__
@@ -17,6 +16,7 @@ from ..core.fcs import find_fcs_files
 from ..core.workspace import ROOT, Workspace, default_tops, write_document
 from . import icons
 from .analysis_dialog import AnalysisDialog, HeatmapDialog
+from .axis_scales import TransformWindow
 from .gating import service as gating
 from .graph_view import GraphWindow
 from .jobs import manager as jobs, run_job
@@ -648,17 +648,21 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         TableEditor(self.ws, samples, self).exec()
 
-    def edit_transform(self, view=None):
+    def edit_transform(self, view=None, channel=None):
+        """Open the Transform window for a graph's axis (the X axis from the ribbon)."""
         view = view or self.graph
         if view is None or view.sample_id is None:
             QtWidgets.QMessageBox.information(
                 self, "Axis transform", "Open a graph window first (double-click a population).")
             return
-        channels = [view.x_combo.currentData()]
-        if not view.is_histogram:
-            channels.append(view.y_combo.currentData())
-        dlg = TransformDialog(self.ws, channels, self)
-        if dlg.exec() == QtWidgets.QDialog.Accepted:
+        name, parent = view.population
+        try:
+            mask = self.ws.membership(view.sample_id, name, parent) if name else None
+        except KeyError:
+            mask = None
+        dlg = TransformWindow(self.ws, view.sample_id, mask,
+                              channel or view.x_combo.currentData(), self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted and dlg.pending:
             self._changed()
             view.refresh()
 
@@ -684,69 +688,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_website(self):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl(WEBSITE))
-
-
-class TransformDialog(QtWidgets.QDialog):
-    """Pick the display transform for the plotted channels."""
-
-    KINDS = ("Logicle (biexponential)", "Arcsinh", "Log", "Linear")
-
-    def __init__(self, workspace, channels, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Axis transform")
-        self.ws = workspace
-        self.channel = QtWidgets.QComboBox()
-        self.channel.addItems([c for c in dict.fromkeys(channels) if c])
-        self.kind = QtWidgets.QComboBox()
-        self.kind.addItems(self.KINDS)
-        self.top = QtWidgets.QDoubleSpinBox()
-        self.top.setRange(1, 1e9)
-        self.top.setDecimals(0)
-        self.width_ = QtWidgets.QDoubleSpinBox()
-        self.width_.setRange(0, 3)
-        self.width_.setSingleStep(0.1)
-        self.decades = QtWidgets.QDoubleSpinBox()
-        self.decades.setRange(1, 8)
-        self.decades.setSingleStep(0.1)
-        self.channel.currentTextChanged.connect(self._load)
-        form = QtWidgets.QFormLayout(self)
-        form.addRow("Channel", self.channel)
-        form.addRow("Scale", self.kind)
-        form.addRow("Top of scale (T)", self.top)
-        form.addRow("Linear width (W)", self.width_)
-        form.addRow("Decades (M)", self.decades)
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._apply)
-        buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
-        self._load(self.channel.currentText())
-
-    def _load(self, channel):
-        t = self.ws.transform(channel)
-        self.top.setValue(float(getattr(t, "param_t", 262144)))
-        self.width_.setValue(float(getattr(t, "param_w", 0.5)))
-        self.decades.setValue(float(getattr(t, "param_m", 4.5)))
-        names = {fk.transforms.LogicleTransform: 0, fk.transforms.AsinhTransform: 1,
-                 fk.transforms.LogTransform: 2, fk.transforms.LinearTransform: 3}
-        self.kind.setCurrentIndex(names.get(type(t), 0))
-
-    def _apply(self):
-        t, w, m = self.top.value(), self.width_.value(), self.decades.value()
-        kind = self.kind.currentIndex()
-        if kind == 0:
-            new = fk.transforms.LogicleTransform(param_t=t, param_w=w, param_m=m, param_a=0)
-        elif kind == 1:
-            new = fk.transforms.AsinhTransform(param_t=t, param_m=m, param_a=0)
-        elif kind == 2:
-            new = fk.transforms.LogTransform(param_t=t, param_m=m)
-        else:
-            new = fk.transforms.LinearTransform(param_t=t, param_a=0)
-        try:
-            self.ws.set_transform(self.channel.currentText(), new)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Transform", str(exc))
-            return
-        self.accept()
 
 
 class LicenseDialog(QtWidgets.QDialog):

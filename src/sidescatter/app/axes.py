@@ -3,6 +3,9 @@
 import flowkit as fk
 import numpy as np
 import pyqtgraph as pg
+from PySide6 import QtCore
+
+from ..core import scales
 
 _SUPERSCRIPT = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
 
@@ -32,8 +35,33 @@ def to_raw(xform, display):
     return xform.inverse(np.asarray(display, dtype=float).reshape(-1, 1)).ravel()
 
 
+def _decade_ticks(xform, lo, hi):
+    """Major (display, raw) and minor display positions of the decades between
+    lo and hi on screen, skipping values beyond the ends of the scale (which
+    some scales pin to the edge instead of placing)."""
+    rlo, rhi = scales.raw_range(xform)
+    slack = 1e-6 * (abs(rlo) + abs(rhi))
+    majors, minors = [], []
+    for exp in range(0, 9):
+        for sign in (1, -1):
+            for m in range(1, 10) if exp else (1,):
+                raw = sign * m * 10.0 ** exp if exp else 0.0
+                if not rlo - slack <= raw <= rhi + slack:
+                    continue
+                d = float(to_display(xform, [raw])[0])
+                if not (lo <= d <= hi and np.isfinite(d)):
+                    continue
+                if m == 1:
+                    majors.append((d, raw))
+                else:
+                    minors.append(d)
+    return sorted(set(majors)), minors
+
+
 class TransformAxis(pg.AxisItem):
     """Axis whose ticks sit at round data values: decades for log-like scales."""
+
+    rightClicked = QtCore.Signal(object)  # global QPoint, to open the scale menu there
 
     def __init__(self, orientation, **kwargs):
         super().__init__(orientation, **kwargs)
@@ -49,6 +77,13 @@ class TransformAxis(pg.AxisItem):
     def _is_linear(self):
         return self.xform is None or isinstance(self.xform, fk.transforms.LinearTransform)
 
+    def mouseClickEvent(self, event):
+        if event.button() == QtCore.Qt.RightButton:
+            event.accept()
+            self.rightClicked.emit(event.screenPos().toPoint())
+            return
+        super().mouseClickEvent(event)
+
     def tickValues(self, minVal, maxVal, size):
         if self.xform is None:
             return super().tickValues(minVal, maxVal, size)
@@ -63,19 +98,10 @@ class TransformAxis(pg.AxisItem):
                     self._labels = {round(d, 9): _si_label(r) for d, r in zip(ds, raws)}
                 out.append((spacing, ds))
             return out
-        majors, minors, self._labels = [], [], {}
-        for exp in range(0, 9):
-            for sign in (1, -1):
-                raw = sign * 10.0 ** exp if exp else 0.0
-                d = float(to_display(self.xform, [raw])[0])
-                if minVal <= d <= maxVal and np.isfinite(d):
-                    majors.append(d)
-                    self._labels[round(d, 9)] = _decade_label(raw)
-                if exp:
-                    for m in range(2, 10):
-                        dm = float(to_display(self.xform, [sign * m * 10.0 ** exp])[0])
-                        if minVal <= dm <= maxVal and np.isfinite(dm):
-                            minors.append(dm)
+        with np.errstate(all="ignore"):
+            found, minors = _decade_ticks(self.xform, minVal, maxVal)
+        majors = [d for d, _ in found]
+        self._labels = {round(d, 9): _decade_label(raw) for d, raw in found}
         # Drop decade labels that would overlap near zero on biexponential scales.
         majors.sort()
         spaced = []
@@ -116,18 +142,9 @@ def ticks(xform, lo=0.0, hi=1.0):
         raws = np.arange(np.ceil(rlo / step) * step, rhi + step * 1e-6, step)
         ds = raws if xform is None else to_display(xform, raws)
         return [(float(d), _si_label(round(float(r), 9))) for d, r in zip(ds, raws)], []
-    majors, minors = [], []
-    for exp in range(0, 9):
-        for sign in (1, -1):
-            raw = sign * 10.0 ** exp if exp else 0.0
-            d = float(to_display(xform, [raw])[0])
-            if lo <= d <= hi and np.isfinite(d):
-                majors.append((d, _decade_label(raw)))
-            if exp:
-                for m in range(2, 10):
-                    dm = float(to_display(xform, [sign * m * 10.0 ** exp])[0])
-                    if lo <= dm <= hi and np.isfinite(dm):
-                        minors.append(dm)
+    with np.errstate(all="ignore"):
+        found, minors = _decade_ticks(xform, lo, hi)
+    majors = [(d, _decade_label(raw)) for d, raw in found]
     majors.sort()
     spaced = []
     for d, label in majors:
