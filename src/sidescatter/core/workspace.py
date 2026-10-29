@@ -8,6 +8,7 @@ transform registered under its channel name, as FlowJo workspaces do.
 import copy
 import itertools
 import json
+import threading
 import zipfile
 from pathlib import Path
 
@@ -48,6 +49,10 @@ class Workspace:
         self.revision = 0        # bumped whenever gating results may have changed
         self._results = {}       # sample_id -> fk GatingResults
         self._display_cache = {}
+        self._sample_rev = {}    # sample_id -> bumped when only that sample's results change
+        # Background jobs read the caches while the window uses them; this guards
+        # filling them. Everything else changes only on the UI thread.
+        self._lock = threading.RLock()
 
     # ----- samples ---------------------------------------------------------
 
@@ -59,7 +64,9 @@ class Workspace:
             ids.append(sample.id)
         return ids
 
-    def add_sample(self, sample, source, group=None):
+    def add_sample(self, sample, source, group=None, tops=None):
+        """tops: the channels' display ranges from default_tops(), if a background
+        job already worked them out."""
         self.samples[sample.id] = sample
         self.sources[sample.id] = source
         self.groups[ALL_SAMPLES].append(sample.id)
@@ -68,16 +75,17 @@ class Workspace:
         has_spill = sample.compensation is not None or "spill" in sample.get_metadata() \
             or "spillover" in sample.get_metadata()
         self.compensation[sample.id] = "FCS" if has_spill else "uncompensated"
-        self._ensure_transforms(sample)
+        self._ensure_transforms(sample, tops)
         return sample.id
 
     def remove_sample(self, sample_id):
         for members in self.groups.values():
             if sample_id in members:
                 members.remove(sample_id)
-        for d in (self.samples, self.sources, self.compensation, self._results):
-            d.pop(sample_id, None)
-        self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sample_id}
+        with self._lock:
+            for d in (self.samples, self.sources, self.compensation, self._results):
+                d.pop(sample_id, None)
+            self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sample_id}
 
     def _unique_id(self, name):
         sample_id, n = name, 2
@@ -85,21 +93,13 @@ class Workspace:
             sample_id, n = f"{name} ({n})", n + 1
         return sample_id
 
-    def _ensure_transforms(self, sample):
-        spectral = fcs.is_spectral(sample) or sample.id.endswith("(unmixed)")
-        default_top = SPECTRAL_RANGE if spectral else CONVENTIONAL_RANGE
-        raw = sample.get_events(source="raw")
-        for ch in fcs.channels(sample):
-            if ch.pnn in self.strategy.transformations:
-                continue
-            values = raw[:, ch.index]
-            if ch.kind == "time":
-                top = float(np.nanmax(values)) or 1.0
-            else:
-                # $PnR is often wrong in exported files, so never let data run off-scale
-                pnr = float(sample.channels.loc[ch.index, "pnr"] or 0)
-                top = max(pnr if pnr > 1 else default_top, _next_pow2(np.nanpercentile(values, 99.9)))
-            self.strategy.add_transform(ch.pnn, default_transform(ch, top))
+    def _ensure_transforms(self, sample, tops=None):
+        missing = [ch for ch in fcs.channels(sample) if ch.pnn not in self.strategy.transformations]
+        if not missing:
+            return
+        tops = tops or default_tops(sample)
+        for ch in missing:
+            self.strategy.add_transform(ch.pnn, default_transform(ch, tops[ch.pnn]))
 
     def channels(self, sample_id):
         return fcs.channels(self.samples[sample_id])
@@ -337,18 +337,58 @@ class Workspace:
         return []
 
     def invalidate(self, sample_id=None):
-        self.revision += 1
-        if sample_id is None:
-            self._results.clear()
-        else:
-            self._results.pop(sample_id, None)
-        self.strategy.clear_cache()
+        with self._lock:
+            self.revision += 1
+            if sample_id is None:
+                self._results.clear()
+            else:
+                self._results.pop(sample_id, None)
+                self._sample_rev[sample_id] = self._sample_rev.get(sample_id, 0) + 1
+            self.strategy.clear_cache()
 
     def results(self, sample_id):
-        if sample_id not in self._results:
-            sample = self.samples[sample_id]
-            self._results[sample_id] = self._strategy_for(sample).gate_sample(sample)
-        return self._results[sample_id]
+        with self._lock:
+            if sample_id in self._results:
+                return self._results[sample_id]
+        token, strategy, sample = self.gating_snapshot(sample_id, copy_strategy=False)
+        res = strategy.gate_sample(sample)
+        self.store_results(sample_id, token, res)
+        return res
+
+    # Gating in the background: take a snapshot on the UI thread, gate it on a
+    # worker (compute_results touches nothing shared), then store_results back
+    # on the UI thread. Results for gates that changed meanwhile are dropped.
+
+    def gating_token(self, sample_id):
+        """Changes whenever this sample's gating results go stale."""
+        return self.revision, self._sample_rev.get(sample_id, 0), id(self.samples.get(sample_id))
+
+    def gating_snapshot(self, sample_id, copy_strategy=True):
+        """(token, strategy, sample) to gate on a worker thread."""
+        sample = self.samples[sample_id]
+        strategy = self._strategy_for(sample)
+        if copy_strategy and strategy is self.strategy:
+            strategy = copy.deepcopy(strategy)
+        return self.gating_token(sample_id), strategy, sample
+
+    @staticmethod
+    def compute_results(strategy, sample):
+        return strategy.gate_sample(sample)
+
+    def store_results(self, sample_id, token, results):
+        """Keep results computed from a snapshot, unless the gates changed since."""
+        with self._lock:
+            if sample_id not in self.samples or token != self.gating_token(sample_id):
+                return False
+            self._results[sample_id] = results
+            return True
+
+    def has_results(self, sample_id):
+        return sample_id in self._results
+
+    def is_ready(self, sample_id):
+        """Whether plotting this sample needs no more heavy work (gating and compensation)."""
+        return sample_id in self._results and (sample_id, "comp") in self._display_cache
 
     def applies_to(self, sample_id, name, parent_path=ROOT):
         """Whether a population can be computed for a sample (it has the gate's channels)."""
@@ -398,14 +438,15 @@ class Workspace:
     def compensated_events(self, sample_id):
         """Events after compensation (if the sample has a spillover matrix), untransformed."""
         key = (sample_id, "comp")
-        if key not in self._display_cache:
-            sample = self.samples[sample_id]
-            if self.compensation.get(sample_id) == "FCS" and sample.compensation is None:
-                spill = sample.get_metadata().get("spill") or sample.get_metadata().get("spillover")
-                sample.apply_compensation(spill)
-            source = "comp" if sample.compensation is not None else "raw"
-            self._display_cache[key] = sample.get_events(source=source)
-        return self._display_cache[key]
+        with self._lock:
+            if key not in self._display_cache:
+                sample = self.samples[sample_id]
+                if self.compensation.get(sample_id) == "FCS" and sample.compensation is None:
+                    spill = sample.get_metadata().get("spill") or sample.get_metadata().get("spillover")
+                    sample.apply_compensation(spill)
+                source = "comp" if sample.compensation is not None else "raw"
+                self._display_cache[key] = sample.get_events(source=source)
+            return self._display_cache[key]
 
     def display_values(self, sample_id, channel, mask=None):
         """Values for one channel on the display (transformed) scale."""
@@ -491,11 +532,16 @@ class Workspace:
         path = Path(path)
         raw = raw_sample if raw_sample is not None else fcs.load_sample(path)
         unmixed = unmix_sample(raw, self.unmixers[unmixer_name], af_source=af_source, progress=progress)
+        return self.add_unmixed(path, unmixer_name, unmixed, group, af_source)
+
+    def add_unmixed(self, path, unmixer_name, unmixed, group=None, af_source=None, tops=None):
+        """Add a sample unmixed from a raw file outside the workspace (see unmix_file)."""
+        path = Path(path)
         unmixed.id = self._unique_id(f"{path.name} (unmixed)")
         src = {"unmixed_from_path": str(path.resolve()), "unmixer": unmixer_name}
         if af_source and af_source != "shared":
             src["af_source"] = str(af_source)
-        return self.add_sample(unmixed, src, group)
+        return self.add_sample(unmixed, src, group, tops)
 
     def _raw_for(self, src, search_dirs=()):
         if "unmixed_from" in src:
@@ -511,14 +557,20 @@ class Workspace:
                 fresh = unmix_sample(self._raw_for(src), self.unmixers[unmixer_name],
                                      af_source=src.get("af_source"))
                 fresh.id = sid
-                self.samples[sid] = fresh
-                self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sid}
+                with self._lock:
+                    self.samples[sid] = fresh
+                    self._display_cache = {k: v for k, v in self._display_cache.items() if k[0] != sid}
                 self.invalidate(sid)
 
     # ----- save / load -----------------------------------------------------
 
     def save(self, path):
-        doc = {
+        write_document(path, self.to_document())
+
+    def to_document(self):
+        """Everything a workspace file holds, as plain JSON-ready data. Quick, and a
+        copy, so a background save never sees later edits."""
+        return copy.deepcopy({
             "format": "sidescatter-workspace",
             "version": FORMAT_VERSION,
             "samples": [
@@ -533,12 +585,12 @@ class Workspace:
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
             "layouts": [lay.to_dict() for lay in self.layouts],
             "experiments": self.experiments,
-        }
-        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("workspace.json", json.dumps(doc, indent=1))
+        })
 
     @classmethod
-    def load(cls, path, search_dirs=()):
+    def load(cls, path, search_dirs=(), progress=None):
+        """progress(fraction, text), if given, is called before each sample (and
+        may raise to stop loading)."""
         with zipfile.ZipFile(path) as zf:
             doc = json.loads(zf.read("workspace.json"))
         if doc.get("format") != "sidescatter-workspace":
@@ -550,9 +602,14 @@ class Workspace:
         ws.unmixers = {k: Unmixer.from_dict(v) for k, v in doc["unmixers"].items()}
 
         pending = []
+        total = max(len(doc["samples"]), 1)
+        step = 0
         for s in doc["samples"]:
             src = s["source"]
             if "path" in src:
+                if progress:
+                    progress(step / total, f"Loading {Path(src['path']).name}")
+                step += 1
                 p = _find_file(src["path"], [Path(path).parent, *map(Path, search_dirs)])
                 sample = fcs.load_sample(p, sample_id=s["id"])
                 ws.add_sample(sample, {"path": str(p)})
@@ -563,6 +620,9 @@ class Workspace:
             from .unmixing import unmix_sample
 
             src = s["source"]
+            if progress:
+                progress(step / total, f"Unmixing {s['id']}")
+            step += 1
             raw = ws._raw_for(src, [Path(path).parent, *map(Path, search_dirs)])
             sample = unmix_sample(raw, ws.unmixers[src["unmixer"]], af_source=src.get("af_source"))
             sample.id = s["id"]
@@ -578,8 +638,11 @@ class Workspace:
     # ----- FlowJo import ---------------------------------------------------
 
     @classmethod
-    def from_flowjo(cls, wsp_path, fcs_dir):
-        """Import a FlowJo 10 workspace: samples, groups, compensation, transforms, gates."""
+    def from_flowjo(cls, wsp_path, fcs_dir, progress=None):
+        """Import a FlowJo 10 workspace: samples, groups, compensation, transforms, gates.
+        progress(fraction, text), if given, is called before each sample."""
+        if progress:
+            progress(0.0, "Reading the FlowJo workspace and FCS files")
         fj = fk.Workspace(str(wsp_path), fcs_samples=str(fcs_dir))
         ws = cls()
         sample_ids = fj.get_sample_ids()
@@ -588,7 +651,9 @@ class Workspace:
 
         first_strategy = fj.get_gating_strategy(sample_ids[0])
         ws.strategy = copy.deepcopy(first_strategy)
-        for sid in sample_ids:
+        for i, sid in enumerate(sample_ids):
+            if progress:
+                progress(0.3 + 0.7 * i / len(sample_ids), f"Importing {sid}")
             sample = fj.get_sample(sid)
             ws.samples[sid] = sample
             ws.sources[sid] = {"path": str(Path(fcs_dir) / sid)}
@@ -705,6 +770,31 @@ def _unique(name, taken):
         out, n = f"{name} ({n})", n + 1
     taken.add(out)
     return out
+
+
+def write_document(path, doc):
+    """Write a workspace document (from Workspace.to_document) to a .ssw file.
+    Touches no workspace, so it can run on a worker thread."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("workspace.json", json.dumps(doc, indent=1))
+
+
+def default_tops(sample):
+    """{channel: top of its display range} for a new sample. Reads every event, so
+    background jobs work it out before handing the sample to the UI thread."""
+    spectral = fcs.is_spectral(sample) or sample.id.endswith("(unmixed)")
+    default_top = SPECTRAL_RANGE if spectral else CONVENTIONAL_RANGE
+    raw = sample.get_events(source="raw")
+    tops = {}
+    for ch in fcs.channels(sample):
+        values = raw[:, ch.index]
+        if ch.kind == "time":
+            tops[ch.pnn] = float(np.nanmax(values)) or 1.0
+        else:
+            # $PnR is often wrong in exported files, so never let data run off-scale
+            pnr = float(sample.channels.loc[ch.index, "pnr"] or 0)
+            tops[ch.pnn] = max(pnr if pnr > 1 else default_top, _next_pow2(np.nanpercentile(values, 99.9)))
+    return tops
 
 
 def _gate_channels(gate):

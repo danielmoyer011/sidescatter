@@ -9,6 +9,7 @@ pytest.importorskip("pytestqt")
 from PySide6 import QtCore  # noqa: E402
 
 from sidescatter.app import graph_view  # noqa: E402
+from sidescatter.app.jobs import wait_idle  # noqa: E402
 from sidescatter.app.main_window import DEMO_DIR, LicenseDialog, MainWindow  # noqa: E402
 from sidescatter.core.workspace import ROOT, Workspace  # noqa: E402
 
@@ -21,6 +22,7 @@ def window(qtbot):
     w.ask_before_discard = False
     qtbot.addWidget(w)
     w.add_samples([str(DEMO_DIR / SID)])
+    wait_idle()
     return w
 
 
@@ -146,6 +148,7 @@ def test_ellipse_roundtrip_and_save(window, view, tmp_path):
 
 def test_step_through_samples_keeps_population(window, view):
     window.add_samples([str(DEMO_DIR / SID)])  # a second copy
+    wait_idle()
     view.create_gate("rectangle", [[0.1, 0.1], [0.6, 0.6]], name="Rect")
     view.show_population(SID, "Rect", ROOT)
     view.step_sample(+1)

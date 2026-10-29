@@ -185,6 +185,7 @@ def test_editor_and_tree(qtbot, ws, monkeypatch):
     from PySide6 import QtWidgets
 
     from sidescatter.app.boolean_editor import BooleanDialog
+    from sidescatter.app.jobs import wait_idle
     from sidescatter.app.main_window import MainWindow
 
     win = MainWindow()
@@ -197,6 +198,7 @@ def test_editor_and_tree(qtbot, ws, monkeypatch):
     assert dlg.name_edit.text() == "A+ AND B+"
     dlg.set_negated(1, True)
     assert dlg.name_edit.text() == "A+ AND NOT B+"
+    wait_idle()  # the preview count arrives from a background job
     assert "Goes under Cells" in dlg.placement.text()
     expected = int((_mask(ws, "Cells") & _mask(ws, "A+", CELLS) & ~_mask(ws, "B+", CELLS)).sum())
     assert f"{expected:,} events" in dlg.placement.text()
@@ -206,6 +208,8 @@ def test_editor_and_tree(qtbot, ws, monkeypatch):
     assert dlg.made == [("A+ OR NOT B+", CELLS)]
 
     # it shows in the tree with its own icon and the usual statistics
+    win.panel.rebuild()
+    wait_idle()  # counts read "…" until background gating is done
     win.panel.rebuild()
     items = [it for it in win.panel._items() if it.text(0) == "A+ OR NOT B+"]
     assert items and not items[0].icon(0).isNull()
@@ -240,6 +244,7 @@ def test_editor_and_tree(qtbot, ws, monkeypatch):
     # double-clicking opens it on its first input's axes, and it can be gated further
     v = win.open_graph(SID, "A or B", CELLS)
     assert v.x_combo.currentData() == "V7-A"
+    wait_idle()
     assert v.count_label.text() == f"{ws.count(SID, 'A or B', CELLS):,} events"
     v.set_axes("FSC-A", "SSC-A")
     assert v.create_gate("rectangle", [(0.2, 0.2), (0.8, 0.8)], name="Inside")

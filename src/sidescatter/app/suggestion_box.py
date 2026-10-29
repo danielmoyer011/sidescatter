@@ -134,6 +134,13 @@ class SuggestionDialog(QtWidgets.QDialog):
     def kind(self):
         return KINDS[self.kind_buttons.checkedId()]
 
+    def prefill_bug(self, title, what):
+        """Start a bug report, e.g. from a failed background job."""
+        self.kind_buttons.button(KINDS.index("Bug")).setChecked(True)
+        self.title.setText(title)
+        self.what.setPlainText(what)
+        self._update()
+
     def _label(self, field, text):
         self.labels[field].setText(text)
 

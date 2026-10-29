@@ -11,7 +11,8 @@ import json
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import icons, theme
-from .layout_render import PlotCache, default_channels, export, paint_item, print_layout
+from .gating import service as gating
+from .layout_render import PlotCache, default_channels, export_job, paint_item, print_layout
 from .ribbon import Ribbon
 from .workspace_panel import POPULATION_MIME
 from ..core.layout import (GRID, MARGIN, PAGE_SIZES, PLOT_TYPES, TEXT_FIELDS, Layout, LayoutItem,
@@ -517,7 +518,10 @@ class LayoutWindow(QtWidgets.QWidget):
         self.current_population = current_population or (lambda: None)  # () -> (sid, name, parent)
         self.current_group = current_group or (lambda: ALL_SAMPLES)
         self.axes_for = lambda sid, name, parent: None  # main window fills this in
-        self.cache = PlotCache()
+        self.cache = PlotCache(lazy=True)
+        self._repaint_timer = QtCore.QTimer(self, singleShot=True, interval=60)
+        self._repaint_timer.timeout.connect(lambda: self.scene.update())
+        gating().ready.connect(self._results_ready)
         self.index = None
         self.graphics = {}
         self.tool = "select"
@@ -785,6 +789,10 @@ class LayoutWindow(QtWidgets.QWidget):
         self._update_scene_rect()
         self.selection_changed()
         self._update_status()
+
+    def _results_ready(self, ws, sample_id):
+        if ws is self.ws:
+            self._repaint_timer.start()  # plots that read "Calculating…" can draw now
 
     def refresh(self):
         """Redraw plots after the workspace changed (gates edited, samples added)."""
@@ -1125,16 +1133,12 @@ class LayoutWindow(QtWidgets.QWidget):
                                                     300, 72, 1200, 50)
             if not ok:
                 return None
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        try:
-            files = export(lay, self.ws, path, dpi=dpi, cache=self.cache)
-        except Exception as exc:
-            QtWidgets.QApplication.restoreOverrideCursor()
-            QtWidgets.QMessageBox.critical(self, "Export layout", f"Export failed:\n\n{exc}")
-            return None
-        QtWidgets.QApplication.restoreOverrideCursor()
-        self.status.setText(f"Exported {len(files)} file(s): " + ", ".join(f.name for f in files))
-        return files
+        self.status.setText(f"Exporting {lay.name}… (see the status bar)")
+
+        def done(files):
+            self.status.setText(f"Exported {len(files)} file(s): " + ", ".join(f.name for f in files))
+
+        return export_job(lay, self.ws, path, dpi=dpi, on_done=done)
 
     def print_dialog(self):
         from PySide6 import QtPrintSupport

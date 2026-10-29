@@ -9,6 +9,7 @@ from PySide6 import QtCore, QtWidgets
 
 from ..core.workspace import ROOT, boolean_name
 from . import icons, theme
+from .gating import service as gating
 
 
 def population_label(name, parent):
@@ -191,8 +192,13 @@ class BooleanDialog(QtWidgets.QDialog):
         self.ok_button.setEnabled(problem is None)
 
     def _preview_count(self, inputs, parent):
+        sid = self.sample_id
+        if not gating().ensure(self.ws, [sid]):
+            if not getattr(self, "_waiting", False):
+                self._waiting = True
+                gating().ready.connect(self._results_ready)
+            return "Counting events…"
         try:
-            sid = self.sample_id
             mask = self.ws.membership(sid, *(_split(parent)))
             hits = [self.ws.membership(sid, n, p) ^ neg for n, p, neg in inputs]
         except KeyError:
@@ -201,6 +207,10 @@ class BooleanDialog(QtWidgets.QDialog):
         for h in hits[1:]:
             combined = (combined | h) if self.op == "or" else (combined & h)
         return f"{int((mask & combined).sum()):,} events in {sid}."
+
+    def _results_ready(self, ws, sample_id):
+        if ws is self.ws and sample_id == self.sample_id:
+            self._update()
 
     # ----- results -----------------------------------------------------------
 

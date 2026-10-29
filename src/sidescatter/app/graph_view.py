@@ -17,6 +17,8 @@ from . import icons, theme
 from ..core.workspace import ALL_SAMPLES, ROOT
 from .axes import TransformAxis
 from .boolean_editor import confirm_delete
+from .gating import service as gating
+from .task_area import Spinner
 
 BINS = 256
 PSEUDOCOLOR = pg.ColorMap(*zip(*theme.PSEUDOCOLOR_STOPS))
@@ -42,6 +44,9 @@ GATE_TOOLS = (
     ("range", "Range gate: drag across the histogram", True),
     ("bisector", "Bisector: click where to split the histogram in two", True),
 )
+BUSY_AFTER_MS = 250   # fade the plot only if recalculating takes longer than this
+BUSY_OPACITY = 0.35
+
 HINTS = {
     "pointer": "Pick a gating tool above the plot. Drag a gate to move it, double-click inside "
                "a gate to open that population, right-click a gate to rename or delete it.",
@@ -78,6 +83,8 @@ class GraphView(QtWidgets.QWidget):
         self._closed_at = 0.0
         self._dragging = False
         self._draw_mode = None
+        self._data_items = []   # what the last full redraw plotted, shown faded while busy
+        self._waiting = False   # gating results for this sample are being worked out
 
         # ----- header: population, sample arrows, plot type, transform ------
         self.title = QtWidgets.QLabel()
@@ -165,6 +172,26 @@ class GraphView(QtWidgets.QWidget):
         self.plot.scene().sigMouseClicked.connect(self._on_scene_click)
         self.plot.viewport().installEventFilter(self)
         self.plot.viewport().setMouseTracking(True)
+
+        # "Calculating…" in the plot's corner while gates are recalculated
+        self.busy = QtWidgets.QWidget(self.plot)
+        self.busy.setObjectName("PlotBusy")
+        self.busy.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        self.busy.setStyleSheet(f"#PlotBusy {{ background: {theme.SURFACE}; border: 1px solid "
+                                f"{theme.BORDER}; border-radius: 4px; }}")
+        bl = QtWidgets.QHBoxLayout(self.busy)
+        bl.setContentsMargins(6, 3, 8, 3)
+        bl.setSpacing(5)
+        bl.addWidget(Spinner(14))
+        busy_label = QtWidgets.QLabel("Calculating…")
+        busy_label.setStyleSheet(f"color: {theme.MUTED}; background: transparent;")
+        bl.addWidget(busy_label)
+        self.busy.adjustSize()
+        self.busy.move(10, 8)
+        self.busy.hide()
+        self._busy_timer = QtCore.QTimer(self, singleShot=True, interval=BUSY_AFTER_MS)
+        self._busy_timer.timeout.connect(self._show_busy)
+        gating().ready.connect(self._results_ready)
 
         canvas = QtWidgets.QWidget()
         canvas.setAttribute(QtCore.Qt.WA_StyledBackground, True)
@@ -266,6 +293,9 @@ class GraphView(QtWidgets.QWidget):
     # ----- drawing ---------------------------------------------------------
 
     def refresh(self):
+        """Redraw. If the gating results aren't in yet, the last picture stays up
+        (faded, with a spinner) and the plot redraws itself when they arrive."""
+        old_data = self._data_items
         self.plot.clear()
         self._rois = []
         self._preview = self._close_preview = self._snap_ring = None
@@ -275,40 +305,75 @@ class GraphView(QtWidgets.QWidget):
             self.count_label.setText("")
             self.status.setText("This sample is no longer in the workspace.")
         if self.sample_id is None or self.x_combo.count() == 0:
+            self._set_waiting(False)
             return
         name, parent = self.population
-        try:
-            mask = self.ws.membership(self.sample_id, name, parent)
-        except KeyError:
+        if not self.ws.applies_to(self.sample_id, name, parent):
+            self._set_waiting(False)
             self.status.setText("This population doesn't apply to this sample.")
             return
+        ready = gating().ensure(self.ws, [self.sample_id])
         xch, ych = self.x_combo.currentData(), self.y_combo.currentData()
         self.y_combo.setVisible(not self.is_histogram)
         for mode, b in self.tools.items():
             needs_hist = next(s[2] for s in GATE_TOOLS if s and s[0] == mode)
             b.setEnabled(needs_hist is None or needs_hist == self.is_histogram)
-        x = self.ws.display_values(self.sample_id, xch, mask)
         self.x_axis.set_transform(self.ws.transform(xch))
+        self.y_axis.set_transform(None if self.is_histogram else self.ws.transform(ych))
 
         trail = " › ".join([*parent[1:], name]) if name else "All events"
         self.title.setText(f"{self.sample_id}  ›  {trail}" if name else self.sample_id)
-        self.count_label.setText(f"{int(mask.sum()):,} events")
         win = self.window()
         if win is not self and isinstance(win, GraphWindow):
             win.setWindowTitle(f"{self.sample_id}: {name or 'All events'}")
 
-        if self.is_histogram:
-            self.y_axis.set_transform(None)
-            self._draw_histogram(x)
+        if ready:
+            try:
+                mask = self.ws.membership(self.sample_id, name, parent)
+            except KeyError:
+                self.status.setText("This population doesn't apply to this sample.")
+                return
+            self.count_label.setText(f"{int(mask.sum()):,} events")
+            before = list(self.plot.getPlotItem().items)
+            x = self.ws.display_values(self.sample_id, xch, mask)
+            if self.is_histogram:
+                self._draw_histogram(x)
+            else:
+                self._draw_bivariate(x, self.ws.display_values(self.sample_id, ych, mask))
+            self._data_items = [it for it in self.plot.getPlotItem().items if it not in before]
         else:
-            y = self.ws.display_values(self.sample_id, ych, mask)
-            self.y_axis.set_transform(self.ws.transform(ych))
-            self._draw_bivariate(x, y)
+            self.count_label.setText("… events")
+            for it in old_data:
+                self.plot.addItem(it)
+        self._set_waiting(not ready)
         self.plot.setXRange(0, 1, padding=0.0)
         if not self.is_histogram:
             self.plot.setYRange(0, 1, padding=0.0)
         self._draw_gates(xch, None if self.is_histogram else ych)
         self.status.setText(HINTS[self._draw_mode or "pointer"])
+
+    def _set_waiting(self, on):
+        self._waiting = on
+        if on:
+            if not self.busy.isVisible() and not self._busy_timer.isActive():
+                self._busy_timer.start()
+            elif self.busy.isVisible():
+                self._show_busy()
+        else:
+            self._busy_timer.stop()
+            self.busy.hide()
+
+    def _show_busy(self):
+        if not self._waiting:
+            return
+        for it in self._data_items:
+            it.setOpacity(BUSY_OPACITY)
+        self.busy.show()
+        self.busy.raise_()
+
+    def _results_ready(self, ws, sample_id):
+        if self._waiting and ws is self.ws and sample_id == self.sample_id:
+            self.refresh()
 
     def _draw_bivariate(self, x, y):
         kind = self.type_combo.currentText()
@@ -384,11 +449,13 @@ class GraphView(QtWidgets.QWidget):
                 self._add_range_roi(*members[0])
 
     def _freq_text(self, child, path, short=False):
+        name = child.split(":")[0] if short else child
+        if not self.ws.has_results(self.sample_id):
+            return f"{name}\n…"
         try:
             freq = self.ws.statistic(self.sample_id, "Freq. of Parent", child, path)
         except KeyError:
             return child
-        name = child.split(":")[0] if short else child
         return f"{name}\n{freq:.2f}%"
 
     def _label(self, child, path, anchor, align=(0, 1), short=False):
