@@ -10,7 +10,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # macos-15-intel matches the Intel Mac installer build, so a dependency
+        # with no Intel Mac wheels fails here instead of at release time.
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     env:
       QT_QPA_PLATFORM: offscreen
