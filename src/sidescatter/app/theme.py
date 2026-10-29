@@ -278,6 +278,57 @@ QStatusBar::item {{
     padding: 3px 14px;
     margin: 2px 4px;
 }}
+/* ----- unmixing steps ----- */
+#StepBar {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+#StepButton {{
+    background: transparent;
+    color: {MUTED};
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-weight: 600;
+}}
+#StepButton:hover {{
+    color: {INK};
+    background: {WINDOW};
+}}
+#StepButton:checked {{
+    color: {ACCENT_DARK};
+    background: {ACCENT_SOFT};
+}}
+#StepArrow {{
+    color: {FAINT};
+}}
+#Segment {{
+    background: {SURFACE};
+    color: {INK};
+    border: 1px solid {BORDER_STRONG};
+    padding: 3px 12px;
+}}
+#Segment:checked {{
+    background: {ACCENT_SOFT};
+    color: {ACCENT_DARK};
+    border-color: {ACCENT};
+}}
+#PlotTitle {{
+    color: {INK};
+    font-weight: 600;
+}}
+#ControlRow {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+#ControlRowTitle {{
+    color: {INK};
+    font-size: 11pt;
+    font-weight: 600;
+}}
+
 QMenu {{
     background: {SURFACE};
     border: 1px solid {BORDER_STRONG};
