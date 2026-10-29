@@ -27,6 +27,12 @@ workflow familiar to FlowJo users.
     name (fluor, marker, beads/cells, unstained), FCS keywords, or the events
     themselves, and each stain is paired with the unstained control of the
     same kind, or with its own dim events;
+  - smart control clean-up, after AutoSpectral: saturated events and
+    doublets are dropped, only the brightest positives are used, and cell
+    controls subtract scatter-matched unstained cells instead of the average
+    unstained cell; every signature is checked against your own saved
+    spectra or one predicted from published dye spectra, and a control that
+    doesn't match is flagged;
   - signature viewer, similarity matrix and complexity index;
   - ordinary or weighted least squares, with autofluorescence handled per
     cell (each cell is matched to the best of a library of AF spectra from
@@ -134,6 +140,9 @@ machines; clone [FlowKit](https://github.com/whitews/FlowKit) into
   injected into synthetic runs.
 - Unmixing recovers known abundances exactly on synthetic data, and WLS beats
   OLS under photon noise.
+- On synthetic cell controls where the stained cells are bigger and brighter
+  in autofluorescence than the average unstained cell, scatter-matched
+  negatives get the signature at least 3 times closer to the true one.
 - On synthetic tissue-like data with four kinds of autofluorescence, per-cell
   AF matching leaves at least 4 times less spread on unstained cells than a
   single AF signature, and recovers stained cells at least twice as
@@ -159,6 +168,11 @@ GPL-3.0-or-later. Built on [FlowKit](https://github.com/whitews/FlowKit)
 (BSD-3), PySide6 (LGPL-3) and pyqtgraph (MIT). Demo data from
 [flowSpecs](https://github.com/jtheorell/flowSpecs) (MIT). The Sora typeface
 used in the logo and splash screen is under the SIL Open Font License 1.1.
+Dye spectra for the signature check come from [FPbase](https://www.fpbase.org)
+(free of copyright restrictions; refresh with `scripts/fetch_fpbase_spectra.py`).
+The control clean-up and per-cell autofluorescence follow the method of
+AutoSpectral (Burton et al. 2025, bioRxiv 10.1101/2025.10.27.684855),
+written independently in Python.
 
 Sidescatter is not affiliated with FlowJo, LLC, BD, or Cytek Biosciences.
 FlowJo is a trademark of Becton, Dickinson and Company.

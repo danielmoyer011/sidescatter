@@ -45,4 +45,4 @@ testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.setuptools.package-data]
-sidescatter = ["demo_data/spectral/*.fcs", "demo_data/spectral/*.csv", "demo_data/spectral/LICENSE-flowSpecs", "demo_data/spectral/controls/*.fcs", "resources/icons/*", "resources/fonts/*"]
+sidescatter = ["demo_data/spectral/*.fcs", "demo_data/spectral/*.csv", "demo_data/spectral/LICENSE-flowSpecs", "demo_data/spectral/controls/*.fcs", "resources/icons/*", "resources/fonts/*", "resources/spectra/*"]

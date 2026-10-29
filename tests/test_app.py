@@ -304,3 +304,50 @@ def test_per_cell_autofluorescence_in_the_tab(qtbot):
     ids = unmixed.args[0]
     sample = tab.ws.samples[next(i for i in ids if i.startswith("PBMC_full"))]
     assert "AF Index" in sample.pnn_labels and "AF-A" in sample.pnn_labels
+
+
+def test_smart_control_cleanup_and_spectrum_check(qtbot):
+    tab = UnmixingTab(Workspace())
+    qtbot.addWidget(tab)
+    tab.add_files(_demo_files())
+    wait_idle()
+    assert tab.setup.cleanup.enabled and tab.smart_check.isChecked()
+    assert all(r.cleanup is not None for r in tab.results)
+    assert "condition number" in tab.status.text()
+    tab.next_btn.click()
+    row = next(r for r in tab.rows if r.spec.name == "BV605")
+    assert "positive events used" in row.subtitle.text()
+    assert "passed" in row.check_label.text() and not row.use_anyway.isVisibleTo(tab)
+
+    # A control labelled as the wrong fluor is flagged, and can be accepted anyway.
+    row.spec.name = "BV421"
+    tab.recalculate(rebuild_rows=False)
+    result = next(r for r in tab.results if r.spec is row.spec)
+    assert result.flagged and "failed" in row.check_label.text()
+    assert "BV421" in tab.status.text()
+    row.use_anyway.click()
+    qtbot.waitUntil(lambda: row.spec.signature_choice == "accepted")
+    qtbot.wait(20)
+    assert not next(r for r in tab.results if r.spec is row.spec).flagged
+
+    # Saving a control makes it the reference for later checks.
+    row.spec.name, row.spec.signature_choice = "BV605", "auto"
+    tab.recalculate(rebuild_rows=False)
+    row.save_btn.click()
+    result = next(r for r in tab.results if r.spec is row.spec)
+    assert result.check.kind == "saved" and result.check.cosine > 0.9999
+    assert tab.library.path.exists()
+
+    # Reset to auto forgets the drawn ranges.
+    row.spec.positive_range = (1000.0, 5000.0)
+    tab.recalculate(rebuild_rows=False)
+    assert row.reset_btn.isEnabled()
+    row.reset_btn.click()
+    qtbot.waitUntil(lambda: row.spec.positive_range is None)
+
+    tab.next_btn.click()
+    assert tab.signatures.extras and "before control clean-up" in tab.signatures.extras_hint.text()
+
+    tab.smart_check.setChecked(False)
+    assert all(r.cleanup is None for r in tab.results)
+    assert not tab.smart_btn.isEnabled()

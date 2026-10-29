@@ -210,6 +210,15 @@ class SpectrumPlot(QtWidgets.QWidget):
         self.plot.setXRange(left, n_det - 0.5, padding=0)
         self.plot.setYRange(self.lo, 1.0, padding=0)
 
+    def add_line(self, raw_values, pen):
+        """A line across the detectors (raw units, file order), e.g. a reference spectrum."""
+        if not self.order:
+            return
+        y = spectrum.to_display(self.xform, np.asarray(raw_values, dtype=float)[self.order])
+        line = pg.PlotDataItem(np.arange(len(self.order)), np.clip(y, self.lo, 1.0), pen=pen)
+        line.setZValue(15)
+        self.plot.addItem(line)
+
 
 class SignaturesView(QtWidgets.QWidget):
     """Normalised signatures, overlaid or one small plot per fluor."""
@@ -227,12 +236,16 @@ class SignaturesView(QtWidgets.QWidget):
             group.addButton(b)
         self.together.setChecked(True)
         self.log_check = QtWidgets.QCheckBox("Log scale")
+        self.extras_hint = QtWidgets.QLabel()
+        self.extras_hint.setObjectName("Hint")
         bar = QtWidgets.QHBoxLayout()
         bar.setSpacing(0)
         bar.addWidget(self.together)
         bar.addWidget(self.each)
         bar.addSpacing(16)
         bar.addWidget(self.log_check)
+        bar.addSpacing(16)
+        bar.addWidget(self.extras_hint)
         bar.addStretch()
 
         self.overlay = _plot({"bottom": DetectorAxis("bottom")})
@@ -254,16 +267,24 @@ class SignaturesView(QtWidgets.QWidget):
         layout.addLayout(bar)
         layout.addWidget(self.stack, 1)
         self.small = []
-        self.references, self.names = [], []
+        self.references, self.names, self.extras = [], [], {}
         group.buttonClicked.connect(lambda b: self.stack.setCurrentIndex(int(b is self.each)))
         self.log_check.toggled.connect(lambda _: self.redraw())
 
     def clear(self):
         self.set_signatures([], [])
 
-    def set_signatures(self, references, names):
-        """references: spectral.Reference list; names: their detectors, in file order."""
+    def set_signatures(self, references, names, extras=None):
+        """references: spectral.Reference list; names: their detectors, in file order.
+
+        extras: {reference name: [(signature, QPen)]} drawn behind that fluor's
+        own plot in "One per fluor", e.g. the signature before control clean-up.
+        """
         self.references, self.names = list(references), list(names)
+        self.extras = dict(extras or {})
+        self.extras_hint.setText(
+            "One per fluor: grey dashed = before control clean-up, red dotted = reference spectrum"
+            if self.extras else "")
         self.redraw()
 
     def _values(self, sig, order):
@@ -308,6 +329,8 @@ class SignaturesView(QtWidgets.QWidget):
             color = QtGui.QColor(pen.color())
             color.setAlpha(45)
             y = self._values(ref.signature, order)
+            for sig, extra_pen in self.extras.get(ref.name, ()):
+                plot.plot(self._values(sig, order), pen=extra_pen)
             plot.plot(y, pen=pen, fillLevel=None if log else 0, brush=None if log else color)
             plot.setXRange(-0.5, len(order) - 0.5, padding=0)
             if not log:

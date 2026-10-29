@@ -22,3 +22,9 @@ def eight_color():
     if not d.exists():
         pytest.skip("FlowKit test data not available (set FLOWKIT_DATA)")
     return d
+
+
+@pytest.fixture(autouse=True)
+def _own_data_dir(tmp_path, monkeypatch):
+    """Keep the user's saved spectra library out of the tests."""
+    monkeypatch.setenv("SIDESCATTER_DATA_DIR", str(tmp_path / "sidescatter-data"))
