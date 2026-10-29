@@ -386,3 +386,17 @@ def test_boolean_gates_follow_their_inputs_into_qc_passed(tmp_path):
     ws.remove_qc()
     paths = dict(ws.population_paths())
     assert paths["A"] == ROOT and ws.count(sid, name, paths[name]) == before
+
+
+def test_analysis_population_follows_into_qc_passed(tmp_path):
+    from sidescatter.core import highdim
+
+    ws, sid, _, _ = _workspace(tmp_path, clog=True)
+    ws.add_gate(fk.gates.RectangleGate("Pop", [ws.make_dimension(sid, "C1-A", 0.0, 0.9)]))
+    st = ws.new_analysis_settings("Pop", ROOT, [sid])
+    record = highdim.Analysis(st, {}, {}, None, None)
+    ws.analyses.append(record)
+    ws.clean([sid])
+    assert record.settings.parent_path == ROOT + (QC_GATE,)
+    ws.remove_qc()
+    assert record.settings.parent_path == ROOT

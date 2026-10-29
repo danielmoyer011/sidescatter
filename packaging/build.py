@@ -20,6 +20,11 @@ args = [
     "--collect-data", "sidescatter",
     "--collect-data", "flowkit",
     "--collect-submodules", "flowkit",
+    # UMAP / tSNE / FlowSOM: openTSNE's compiled modules import each other in
+    # ways PyInstaller can't see; numba caches its compiled code per user.
+    "--collect-submodules", "openTSNE",
+    "--collect-submodules", "umap",
+    "--collect-submodules", "pynndescent",
     "--exclude-module", "PySide6.QtWebEngineCore",
     "--exclude-module", "PySide6.QtWebEngineWidgets",
     "--exclude-module", "PySide6.Qt3DCore",

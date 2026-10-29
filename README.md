@@ -66,6 +66,19 @@ workflow familiar to FlowJo users.
 - **Statistics**: count, frequency of parent/grandparent/total, mean, median,
   geometric mean, SD, rSD, CV, rCV and percentiles, in a table editor that
   exports CSV or Excel.
+- **UMAP, tSNE, PCA and FlowSOM** (Tools › UMAP / tSNE / FlowSOM, or right-click a
+  population): pick a population, the samples and the channels (fluorescence
+  ticked, autofluorescence, scatter and Time not). The samples are concatenated
+  and downsampled to an equal number each (20,000 by default, at most
+  1,000,000 in total), the methods run on each channel's display scale, and
+  every other event of the population is then placed on the finished map.
+  UMAP-1/2, TSNE-1/2, PCA-1/2, FlowSOM and FlowSOM meta are added to each
+  sample as channels you can plot and gate; each FlowSOM metacluster becomes
+  a population (rename it to "NK cells" and the name sticks), and a
+  Concatenated sample with a Sample ID channel shows the combined map. Colour
+  any plot by another channel's intensity, and see a heatmap of each
+  metacluster's medians (CSV export). Runs in the background with a progress
+  bar and Cancel; the seed is saved, so re-running gives the same map.
 - **Layout Editor** (Sidescatter › Layout Editor, Ctrl+L): drag populations
   from the sample table onto Letter or A4 pages to build figures from
   pseudocolor, dot, contour and histogram plots plus text boxes (with

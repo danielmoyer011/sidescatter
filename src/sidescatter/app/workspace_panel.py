@@ -22,6 +22,7 @@ class WorkspacePanel(QtWidgets.QWidget):
     populationSelected = QtCore.Signal(str, object, object)  # sample_id, name, parent_path
     populationActivated = QtCore.Signal(str, object, object)  # double-click: open a graph
     groupChanged = QtCore.Signal(str)
+    analysisRequested = QtCore.Signal(str, object, object)  # UMAP/tSNE/FlowSOM on a population
     changed = QtCore.Signal()
 
     def __init__(self, workspace, parent=None):
@@ -207,6 +208,7 @@ class WorkspacePanel(QtWidgets.QWidget):
         sid, name, parent = self._key(item)
         menu = QtWidgets.QMenu(self)
         menu.addAction("Open graph window", lambda: self.populationActivated.emit(sid, name, parent))
+        menu.addAction("UMAP, tSNE and FlowSOM…", lambda: self.analysisRequested.emit(sid, name, parent))
         menu.addSeparator()
         if name is not None:
             if self.ws.is_boolean(name, parent):
