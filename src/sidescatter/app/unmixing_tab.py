@@ -1,10 +1,12 @@
 """The Unmixing tab: raw files in, classified, unmixed, and packaged like SpectroFlo.
 
-Add or drop every raw file of an experiment. Each one is classified as an
-unstained or single-color reference (on beads or cells), a multicolor
-sample, or left out, and the table shows why. Fix anything that's wrong,
-check the signatures and the live preview, then unmix into the workspace or
-export a zipped experiment with Raw and Unmixed folders.
+Three steps, as on the instrument. 1 Select controls: add or drop every raw
+file of an experiment; each one is classified as an unstained or single-color
+reference (on beads or cells), a multicolor sample, or left out, and the table
+shows why. 2 Identify positives: one row per control with its scatter gate,
+the Positive and Negative ranges on its peak detector, and its spectrum.
+3 Check and unmix: signatures, similarity and a live preview, then unmix into
+the workspace or export a zipped experiment with Raw and Unmixed folders.
 """
 
 from pathlib import Path
@@ -16,7 +18,9 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from ..core import experiment, fcs, spectral, unmixing
 from ..core.experiment import Setup
 from . import theme
+from .control_rows import ControlRow
 from .graph_view import BINS, CLOSE_PEN, DRAW_PEN, GATE_PEN, PSEUDOCOLOR, SNAP_FILL, SNAP_RADIUS_PX
+from .spectrum_plot import SignaturesView
 
 COLS = ["File", "Role", "Fluor", "Marker", "Negative / AF", "Peak", "Positives", "Why"]
 C_FILE, C_ROLE, C_FLUOR, C_MARKER, C_NEG, C_PEAK, C_POS, C_WHY = range(len(COLS))
@@ -32,8 +36,7 @@ ROLE_CHOICES = [
 ROLE_COLORS = {"unstained": "#EEF0F6", "single_stain": "#E8F6F6", "sample": "#EEEEFB", "exclude": "#F6F7FB"}
 ASINH_COFACTOR = 2000.0
 PREVIEW_EVENTS = 50_000
-PALETTE = [(31, 119, 180), (255, 127, 14), (44, 160, 44), (214, 39, 40), (148, 103, 189),
-           (140, 86, 75), (227, 119, 194), (127, 127, 127), (188, 189, 34), (23, 190, 207)]
+STEPS = ("Select controls", "Identify positives", "Check and unmix")
 
 
 def _asinh(x):
@@ -61,6 +64,8 @@ class UnmixingTab(QtWidgets.QWidget):
         self.results = []
         self.problems = []
         self._preview_cache = {}
+        self.rows = []
+        self._rows_stale = True
         self.setAcceptDrops(True)
 
         # ----- experiment picker
@@ -88,7 +93,6 @@ class UnmixingTab(QtWidgets.QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        self.table.itemSelectionChanged.connect(self._show_control)
         self.table.itemChanged.connect(self._on_item_edited)
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_menu)
@@ -152,7 +156,9 @@ class UnmixingTab(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         self.status.setTextFormat(QtCore.Qt.RichText)
 
-        left = QtWidgets.QVBoxLayout()
+        select_page = QtWidgets.QWidget()
+        left = QtWidgets.QVBoxLayout(select_page)
+        left.setContentsMargins(0, 0, 0, 0)
         buttons = QtWidgets.QHBoxLayout()
         for b in (add_btn, folder_btn, remove_btn):
             buttons.addWidget(b)
@@ -163,26 +169,32 @@ class UnmixingTab(QtWidgets.QWidget):
         left.addLayout(options)
         left.addWidget(self.status)
 
-        # ----- workbench
+        # ----- step 2: one row per reference control
+        identify_page = QtWidgets.QWidget()
+        il = QtWidgets.QVBoxLayout(identify_page)
+        il.setContentsMargins(0, 0, 0, 0)
+        self.identify_hint = QtWidgets.QLabel()
+        self.identify_hint.setWordWrap(True)
+        self.identify_hint.setObjectName("Hint")
+        self.rows_box = QtWidgets.QWidget()
+        self.rows_layout = QtWidgets.QVBoxLayout(self.rows_box)
+        self.rows_layout.setContentsMargins(0, 0, 6, 0)
+        self.rows_layout.setSpacing(10)
+        self.rows_layout.addStretch()
+        rows_scroll = QtWidgets.QScrollArea()
+        rows_scroll.setWidgetResizable(True)
+        rows_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        rows_scroll.setWidget(self.rows_box)
+        il.addWidget(self.identify_hint)
+        il.addWidget(rows_scroll, 1)
+
+        # ----- step 3: signatures, similarity, live preview
         self.tabs = QtWidgets.QTabWidget()
-        self.sig_plot = pg.PlotWidget(background="w")
-        self.sig_plot.addLegend(offset=(-10, 10))
-        self.sig_plot.setLabel("left", "Normalised intensity")
-        self.tabs.addTab(self.sig_plot, "Signatures")
+        self.signatures = SignaturesView()
+        self.tabs.addTab(self.signatures, "Signatures")
 
         self.sim_table = QtWidgets.QTableWidget()
         self.tabs.addTab(self.sim_table, "Similarity")
-
-        self.ctrl_plot = pg.PlotWidget(background="w")
-        self.ctrl_plot.setLabel("bottom", "Peak detector (asinh scale)")
-        self.ctrl_hint = QtWidgets.QLabel(
-            "Select a single-color control. Drag the shaded region to choose which events count as positive.")
-        self.ctrl_hint.setWordWrap(True)
-        ctrl_box = QtWidgets.QWidget()
-        cl = QtWidgets.QVBoxLayout(ctrl_box)
-        cl.addWidget(self.ctrl_hint)
-        cl.addWidget(self.ctrl_plot)
-        self.tabs.addTab(ctrl_box, "Control gate")
 
         preview = QtWidgets.QWidget()
         pl = QtWidgets.QGridLayout(preview)
@@ -213,6 +225,34 @@ class UnmixingTab(QtWidgets.QWidget):
         self._af_check = None
         self.tabs.currentChanged.connect(self._af_tab_shown)
 
+        self.pages = QtWidgets.QStackedWidget()
+        for page in (select_page, identify_page, self.tabs):
+            self.pages.addWidget(page)
+
+        # ----- step bar
+        step_bar = QtWidgets.QWidget()
+        step_bar.setObjectName("StepBar")
+        step_bar.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        sl = QtWidgets.QHBoxLayout(step_bar)
+        sl.setContentsMargins(4, 4, 4, 4)
+        sl.setSpacing(2)
+        self.step_group = QtWidgets.QButtonGroup(self)
+        self.step_buttons = []
+        for i, label in enumerate(STEPS):
+            if i:
+                arrow = QtWidgets.QLabel("›")
+                arrow.setObjectName("StepArrow")
+                sl.addWidget(arrow)
+            b = QtWidgets.QToolButton()
+            b.setObjectName("StepButton")
+            b.setText(f"{i + 1}   {label}")
+            b.setCheckable(True)
+            self.step_group.addButton(b, i)
+            self.step_buttons.append(b)
+            sl.addWidget(b)
+        self.step_buttons[0].setChecked(True)
+        self.step_group.idClicked.connect(self.go_to_step)
+
         # ----- actions
         self.unmix_btn = QtWidgets.QPushButton("Unmix into workspace")
         self.unmix_btn.setToolTip("Add the unmixed samples (and references) to the workspace for gating")
@@ -221,25 +261,31 @@ class UnmixingTab(QtWidgets.QWidget):
         self.export_btn.setToolTip("Write a zipped experiment with Raw and Unmixed folders, like SpectroFlo")
         self.export_btn.clicked.connect(self.export)
         self.export_btn.setDefault(True)
+        self.back_btn = QtWidgets.QPushButton("‹  Back")
+        self.back_btn.clicked.connect(lambda: self.go_to_step(self.step - 1))
+        self.next_btn = QtWidgets.QPushButton("Next  ›")
+        self.next_btn.clicked.connect(lambda: self.go_to_step(self.step + 1))
 
-        split = QtWidgets.QSplitter()
-        lw = QtWidgets.QWidget()
-        lw.setLayout(left)
-        split.addWidget(lw)
-        split.addWidget(self.tabs)
-        split.setSizes([760, 540])
+        steps_row = QtWidgets.QHBoxLayout()
+        steps_row.addStretch()
+        steps_row.addWidget(step_bar)
+        steps_row.addStretch()
 
         bottom = QtWidgets.QHBoxLayout()
+        bottom.addWidget(self.back_btn)
         bottom.addStretch()
         bottom.addWidget(self.unmix_btn)
         bottom.addWidget(self.export_btn)
+        bottom.addWidget(self.next_btn)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.addLayout(top)
-        layout.addWidget(split, 1)
+        layout.addLayout(steps_row)
+        layout.addWidget(self.pages, 1)
         layout.addLayout(bottom)
 
+        self.go_to_step(0)
         self.set_workspace(workspace)
 
     # ----- setups ----------------------------------------------------------
@@ -558,7 +604,12 @@ class UnmixingTab(QtWidgets.QWidget):
 
     # ----- computing -------------------------------------------------------
 
-    def recalculate(self):
+    def recalculate(self, rebuild_rows=True):
+        """Rebuild the matrix from the current files and gates.
+
+        rebuild_rows False keeps the Identify rows (and whatever is being
+        dragged in them) and only redraws their histograms and spectra.
+        """
         self.problems = unmixing.check_specs(self.specs) if self.specs else []
         errors = [m for level, m in self.problems if level == "error"]
         self.unmixer, self.results = None, []
@@ -583,14 +634,21 @@ class UnmixingTab(QtWidgets.QWidget):
             self.table.item(row, C_PEAK).setText(r.peak_detector if r else "")
             self.table.item(row, C_POS).setText(f"{r.n_positive:,}" if r else "")
         self.table.blockSignals(False)
-        self.sig_plot.clear()
         self.sim_table.clear()
         self.sim_table.setRowCount(0)
         if ok:
-            self._draw_signatures()
+            self.signatures.set_signatures(self.unmixer.references, self.unmixer.detectors)
             self._draw_similarity()
-        self._show_control()
+        else:
+            self.signatures.clear()
         self._fill_preview()
+        if rebuild_rows:
+            self._rows_stale = True
+            if self.step == 1:
+                self._build_rows()
+        else:
+            for row in self.rows:
+                row.update_result(by_path.get(row.spec.path))
         self._af_check = None
         unstained = [s for s in self.specs if s.role == "unstained" and s.carrier == "cells"]
         self.af_view.set_data(unstained, self.samples, self.unmixer)
@@ -637,16 +695,6 @@ class UnmixingTab(QtWidgets.QWidget):
         lines += [f"<span style='color:#6A7187'>{m}</span>" for level, m in self.problems if level == "warning"]
         self.status.setText("<br>".join(lines))
 
-    def _draw_signatures(self):
-        um = self.unmixer
-        for i, ref in enumerate(um.references):
-            color = (90, 90, 90) if ref.is_autofluorescence else PALETTE[i % len(PALETTE)]
-            style = QtCore.Qt.DashLine if ref.is_autofluorescence else QtCore.Qt.SolidLine
-            self.sig_plot.plot(ref.signature, pen=pg.mkPen(color, width=2, style=style), name=ref.name)
-        ticks = [(i, d.replace("-A", "")) for i, d in enumerate(um.detectors)]
-        self.sig_plot.getAxis("bottom").setTicks([ticks[::2], ticks[1::2]])
-        self.sig_plot.setLabel("bottom", "Detector")
-
     def _draw_similarity(self):
         um = self.unmixer
         sim = spectral.similarity_matrix(um.matrix)
@@ -664,38 +712,69 @@ class UnmixingTab(QtWidgets.QWidget):
                 self.sim_table.setItem(i, j, item)
         self.sim_table.resizeColumnsToContents()
 
-    def _show_control(self):
-        self.ctrl_plot.clear()
-        rows = self._selected_rows()
-        if len(rows) != 1 or self.unmixer is None:
-            return
-        spec = self.specs[rows[0]]
-        result = next((r for r in self.results if r.spec.path == spec.path), None)
-        if result is None:
-            self.ctrl_hint.setText(f"{spec.path.name} is not a single-color control.")
-            return
-        peak = self.unmixer.detectors.index(result.peak_detector)
-        events = unmixing._detector_events(self.samples[spec.path], self.unmixer.detectors)
-        values = _asinh(events[:, peak])
-        counts, edges = np.histogram(values, bins=128)
-        self.ctrl_plot.plot(edges, counts, stepMode="center", fillLevel=0,
-                            brush=(91, 91, 214, 110), pen=pg.mkPen((60, 60, 160)))
-        pos_vals = values[result.positive_mask]
-        region = pg.LinearRegionItem((float(pos_vals.min()), float(pos_vals.max())), brush=(20, 163, 163, 50))
-        self.ctrl_plot.addItem(region)
-        self.ctrl_plot.setLabel("bottom", f"{result.peak_detector} (asinh scale)")
-        self.ctrl_hint.setText(
-            f"{spec.name}: {result.n_positive:,} positive events; negative from "
-            f"{result.negative_source}. Drag the shaded region to change the positives.")
+    # ----- steps ---------------------------------------------------------
 
-        def changed():
-            lo, hi = region.getRegion()
-            spec.positive_mask = (values >= lo) & (values <= hi)
-            if spec.positive_mask.sum() < 10:
-                spec.positive_mask = None
-            self.recalculate()
+    @property
+    def step(self):
+        return self.pages.currentIndex()
 
-        region.sigRegionChangeFinished.connect(changed)
+    def go_to_step(self, index):
+        index = max(0, min(index, len(STEPS) - 1))
+        self.pages.setCurrentIndex(index)
+        self.step_buttons[index].setChecked(True)
+        self.back_btn.setEnabled(index > 0)
+        self.next_btn.setVisible(index < len(STEPS) - 1)
+        self.next_btn.setDefault(index < len(STEPS) - 1)
+        self.export_btn.setDefault(index == len(STEPS) - 1)
+        if index == 1 and self._rows_stale:
+            self._build_rows()
+
+    def _negative_for(self, spec):
+        """(spec, sample) of the file a single stain takes its negatives from, if any."""
+        other = None
+        if spec.negative == "auto":
+            other = unmixing._matching_unstained(spec, self.specs)
+        elif spec.negative != "internal":
+            other = next((s for s in self.specs if str(s.path) == spec.negative), None)
+        if other is None or other.path not in self.samples:
+            return None
+        return other, self.samples[other.path]
+
+    def _build_rows(self):
+        """One row per reference control, single stains first, then unstained."""
+        for row in self.rows:
+            row.setParent(None)
+            row.deleteLater()
+        self.rows = []
+        self._rows_stale = False
+        if self.unmixer is None:
+            self.identify_hint.setText(
+                "Add single-color controls and fix the problems listed in step 1 first; "
+                "the controls appear here once a matrix can be built.")
+            return
+        self.identify_hint.setText(
+            "For each control, draw the scatter gate around the beads or cells, then drag the "
+            "Positive and Negative ranges on its peak detector. The spectrum shows the positive "
+            "events in every detector and updates as you go.")
+        by_path = {r.spec.path: r for r in self.results}
+        refs = [s for s in self.specs if s.role == "single_stain"] + [s for s in self.specs if s.role == "unstained"]
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            for spec in refs:
+                try:
+                    row = ControlRow(spec, self.samples[spec.path], self.unmixer.detectors,
+                                     by_path.get(spec.path), self._negative_for(spec))
+                except ValueError:
+                    continue   # detectors don't match the experiment; check_specs reports it
+                row.edited.connect(self._gate_edited)
+                self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
+                self.rows.append(row)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _gate_edited(self, spec):
+        self.recalculate(rebuild_rows=False)
+        self._mark_changed()
 
     # ----- preview ---------------------------------------------------------
 

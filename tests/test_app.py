@@ -194,6 +194,54 @@ def test_drop_without_fcs_only_warns(window, qtbot, tmp_path, monkeypatch):
     assert len(window.ws.samples) == before and warnings == ["No FCS files"]
 
 
+def test_unmixing_steps_and_identify_rows(qtbot):
+    tab = UnmixingTab(Workspace())
+    qtbot.addWidget(tab)
+    tab.add_files(_demo_files())
+    assert tab.step == 0 and not tab.rows
+    tab.next_btn.click()
+    assert tab.step == 1
+    names = [row.title.text() for row in tab.rows]
+    assert len(names) == 15 and names[0] == "AF647 (Beads)" and names[-1].startswith("Unstained")
+    row = tab.rows[0]
+    assert row.spectrum.counts is not None and row.spectrum.counts.shape[0] == len(tab.unmixer.detectors)
+    assert "Positive" in row._regions
+
+    # Dragging the Positive range rebuilds the matrix without rebuilding the rows.
+    region = row._regions["Positive"]
+    a, b = region.getRegion()
+    region.setRegion((a + (b - a) * 0.5, b))
+    region.sigRegionChangeFinished.emit(region)
+    qtbot.waitUntil(lambda: row.spec.positive_range is not None)
+    qtbot.wait(20)
+    assert tab.rows[0] is row
+    result = next(r for r in tab.results if r.spec is row.spec)
+    assert result.peak_detector == row.spec.gate_detector
+    assert tab.setup.to_dict()["files"][0]["positive_range"]
+
+    tab.next_btn.click()
+    assert tab.step == 2 and tab.next_btn.isHidden()
+    assert len(tab.signatures.references) == len(tab.unmixer.names)
+    tab.signatures.each.click()
+    assert tab.signatures.stack.currentIndex() == 1 and len(tab.signatures.small) == len(tab.unmixer.names)
+
+
+def test_spectrum_plot_type_in_graph_window(window, qtbot):
+    from sidescatter.app.graph_view import GraphView
+    v = GraphView(window.ws)
+    qtbot.addWidget(v)
+    v.show_population("PBMC_full_panel.fcs")
+    v.type_combo.setCurrentText("Spectrum")
+    assert v.spectrum.counts is not None
+    assert v.spectrum.det_axis.names[:2] == ["V1", "V2"]
+    # Every detector gets its own label.
+    ticks = v.spectrum.det_axis.tickValues(0, 1, 100)
+    assert len(ticks) == 1 and len(ticks[0][1]) == len(v.spectrum.det_axis.names) == 42
+    assert not v.tools["polygon"].isEnabled()
+    v.start_gate("polygon")
+    assert v.type_combo.currentText() == "Pseudocolor"
+
+
 def test_per_cell_autofluorescence_in_the_tab(qtbot):
     tab = UnmixingTab(Workspace())
     qtbot.addWidget(tab)
