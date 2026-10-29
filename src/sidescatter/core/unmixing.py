@@ -12,8 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import classify, fcs, spectral
-
+from . import classify, control_cleanup, fcs, spectra_library, spectral
 
 
 @dataclass
@@ -40,6 +39,12 @@ class ControlSpec:
     # y (detector names) and vertices [[x, y], ...] in raw detector units.
     af_gates: list = field(default_factory=list)
     af_source: str = "shared"       # samples: "shared" AF library, or an unstained file's path
+    # Control clean-up: drop positives with unusually high autofluorescence (cells only).
+    remove_high_af: bool = False
+    # Which signature to use when the spectra check flags this control: "auto" (the
+    # measured one, flagged), "accepted" (measured, flag dismissed) or "library"
+    # (your saved spectrum for this fluor).
+    signature_choice: str = "auto"
 
     @property
     def is_reference(self):
@@ -176,6 +181,19 @@ class ControlResult:
     n_negative: int
     in_gate: np.ndarray = None        # events inside the scatter gate
     negative_mask: np.ndarray = None  # internal negatives; None when another file is the negative
+    # Control clean-up (None when it is off): the events the signature came from,
+    # the signature the plain method gives, and what was removed.
+    used_mask: np.ndarray = None
+    basic_signature: np.ndarray = None
+    cleanup: dict = None              # saturated, doublets, high_af, used, background
+    check: object = None              # spectra_library.Check, or None with nothing to compare
+    measured_signature: np.ndarray = None  # before a library spectrum replaced it
+    signature_source: str = "measured"     # "measured" or "library"
+
+    @property
+    def flagged(self):
+        return (self.check is not None and not self.check.passed
+                and self.spec.signature_choice == "auto")
 
 
 def control_keep(sample, settings=None):
@@ -193,13 +211,74 @@ def control_keep(sample, settings=None):
     return ws.qc_keep(sid), res
 
 
+def _singlet_mask(sample):
+    """Events that aren't doublets by FSC-A/FSC-H; all events without both channels."""
+    names = {c.pnn.upper(): c.index for c in fcs.channels(sample)}
+    raw = sample.get_events(source="raw")
+    for a, h in (("FSC-A", "FSC-H"), ("FSC1-A", "FSC1-H")):
+        if a in names and h in names:
+            return control_cleanup.singlets(raw[:, names[a]], raw[:, names[h]])
+    return np.ones(sample.event_count, dtype=bool)
+
+
+def _scatter_xy(sample):
+    """(n, 2) forward and side scatter of every event, or None."""
+    pair = fcs.scatter_channels(sample)
+    if pair is None:
+        return None
+    raw = sample.get_events(source="raw")
+    return raw[:, [sample.get_channel_index(pair[0]), sample.get_channel_index(pair[1])]]
+
+
+def cleanup_masks(sample, detectors, settings):
+    """(not saturated, not a doublet) masks over every event; all True for steps turned off."""
+    n = sample.event_count
+    sat_ok = np.ones(n, dtype=bool)
+    if settings.saturation:
+        idx = _detector_index(sample, detectors)
+        top = sample.channels["pnr"].to_numpy(dtype=float)[idx]
+        sat_ok = control_cleanup.not_saturated(sample.get_events(source="raw")[:, idx], top)
+    single = _singlet_mask(sample) if settings.singlets else np.ones(n, dtype=bool)
+    return sat_ok, single
+
+
+def _pick_events(spec, events, in_gate, neg_events, names):
+    """Positive (and internal negative) events of a single stain: the automatic gate,
+    replaced by the ranges drawn in the Identify step. Returns
+    (positive mask, internal negative mask or None, peak index, negative events).
+    """
+    pos_sub, neg_sub, peak = spectral.auto_gate_control(events[in_gate], neg_events)
+    pos_mask = _expand(pos_sub, in_gate)
+    internal_neg = None if neg_sub is None else _expand(neg_sub, in_gate)
+    if spec.gate_detector in names:
+        peak = names.index(spec.gate_detector)
+    if spec.positive_range is not None:
+        drawn = in_gate & _range_mask(events[:, peak], spec.positive_range)
+        if drawn.sum() >= 10:
+            pos_mask = drawn
+    if spec.positive_mask is not None:
+        pos_mask = spec.positive_mask & in_gate
+    if neg_events is None:
+        if spec.negative_range is not None:
+            drawn = in_gate & _range_mask(events[:, peak], spec.negative_range)
+            if drawn.sum() >= 10:
+                internal_neg = drawn
+        neg_events = events[internal_neg]
+    return pos_mask, internal_neg, peak, neg_events
+
+
 def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None,
-                  af_mode="fluors", af_library_size=30, af_auto=True, keep=None):
+                  af_mode="fluors", af_library_size=30, af_auto=True, keep=None, cleanup=None,
+                  library=None, check_spectra=True):
     """Build an Unmixer from control specs.
 
     af_mode: "fluors" (n_autofluorescence AF signatures as extra fluors) or
     "per_cell" (an AF library of up to af_library_size spectra per unstained
     cells file, plus its drawn AF gates; af_auto=False keeps only the gates).
+    cleanup: control_cleanup.Settings; None or disabled uses the plain
+    median(positive) - median(negative) signature.
+    library: spectra_library.SpectraLibrary of your saved spectra (None: only
+    predicted spectra are used for the check). check_spectra False skips the check.
 
     Returns (unmixer, results) where results describes how each signature was
     derived so the UI can show it and let the user correct the gates.
@@ -209,6 +288,7 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     specs = [s for s in specs if s.is_reference]
     samples = {} if samples is None else samples
     keep = keep or {}
+    cleanup = cleanup if cleanup is not None and cleanup.enabled else None
 
     def sample_for(path):
         if path not in samples:
@@ -219,6 +299,7 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     detectors = fcs.detector_channels(first)
     names = [c.pnn for c in detectors]
     by_path = {s.path: s for s in specs}
+    cleaned = {}
 
     def det_events(spec):
         return _detector_events(sample_for(spec.path), names, spec.path.name)
@@ -227,57 +308,76 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
         k = keep.get(spec.path)
         return np.ones(n, dtype=bool) if k is None else k
 
-    def gated_events(spec):
-        """Detector events inside the file's scatter gate (all events without one) that
-        passed cleaning (when keep has the file)."""
-        events = det_events(spec)
-        mask = scatter_mask(sample_for(spec.path), spec.scatter_gate) & _kept(spec, len(events))
-        return events[mask]
+    def clean_masks(spec):
+        if spec.path not in cleaned:
+            cleaned[spec.path] = cleanup_masks(sample_for(spec.path), names, cleanup)
+        return cleaned[spec.path]
 
+    def gate_mask(spec, clean=False):
+        """Events inside the file's scatter gate (all events without one) that passed
+        cleaning (when keep has the file), and with clean, control clean-up."""
+        sample = sample_for(spec.path)
+        mask = scatter_mask(sample, spec.scatter_gate) & _kept(spec, sample.event_count)
+        if clean and cleanup is not None:
+            sat_ok, single = clean_masks(spec)
+            mask = mask & sat_ok & single
+        return mask
+
+    def gated_events(spec, clean=False):
+        return det_events(spec)[gate_mask(spec, clean)]
+
+    cell_unstained = next((s for s in specs if s.role == "unstained" and s.carrier == "cells"), None)
     references, results = [], []
     for spec in specs:
         if spec.role != "single_stain":
             continue
         events = det_events(spec)
-        in_gate = scatter_mask(sample_for(spec.path), spec.scatter_gate) & _kept(spec, len(events))
+        in_gate = gate_mask(spec)
 
-        neg_events, neg_source = None, "internal"
-        if spec.negative_mask is not None:
-            neg_events = events[spec.negative_mask & _kept(spec, len(events))]
-        elif spec.negative not in ("auto", "internal"):
-            other = by_path.get(Path(spec.negative)) or ControlSpec(Path(spec.negative), "")
-            neg_events, neg_source = gated_events(other), Path(spec.negative).name
-        elif spec.negative == "auto":
-            unstained = _matching_unstained(spec, specs)
-            if unstained is not None:
-                neg_events, neg_source = gated_events(unstained), unstained.path.name
+        neg_spec, neg_source = None, "internal"
+        if spec.negative_mask is None:
+            if spec.negative not in ("auto", "internal"):
+                neg_spec = by_path.get(Path(spec.negative)) or ControlSpec(Path(spec.negative), "")
+                neg_source = Path(spec.negative).name
+            elif spec.negative == "auto":
+                neg_spec = _matching_unstained(spec, specs)
+                if neg_spec is not None:
+                    neg_source = neg_spec.path.name
 
-        pos_sub, neg_sub, peak = spectral.auto_gate_control(events[in_gate], neg_events)
-        pos_mask = _expand(pos_sub, in_gate)
-        internal_neg = None if neg_sub is None else _expand(neg_sub, in_gate)
-        if spec.gate_detector in names:
-            peak = names.index(spec.gate_detector)
-        if spec.positive_range is not None:
-            drawn = in_gate & _range_mask(events[:, peak], spec.positive_range)
-            if drawn.sum() >= 10:
-                pos_mask = drawn
-        if spec.positive_mask is not None:
-            pos_mask = spec.positive_mask & in_gate
-        if neg_events is None:
-            if spec.negative_range is not None:
-                drawn = in_gate & _range_mask(events[:, peak], spec.negative_range)
-                if drawn.sum() >= 10:
-                    internal_neg = drawn
-            neg_events = events[internal_neg]
+        def negatives(clean):
+            if spec.negative_mask is not None:
+                return events[spec.negative_mask & _kept(spec, len(events))]
+            return None if neg_spec is None else gated_events(neg_spec, clean)
 
-        sig = spectral.extract_signature(events[pos_mask], neg_events)
-        references.append(spectral.Reference(spec.name, sig, source=spec.path.name, marker=spec.marker))
-        results.append(ControlResult(spec, sig, names[peak], pos_mask, neg_source,
-                                     int(pos_mask.sum()), len(neg_events), in_gate,
-                                     internal_neg if neg_source == "internal" else None))
+        pos_mask, internal_neg, peak, neg_events = _pick_events(
+            spec, events, in_gate, negatives(False), names)
+        basic = spectral.extract_signature(events[pos_mask], neg_events)
+        result = ControlResult(spec, basic, names[peak], pos_mask, neg_source, int(pos_mask.sum()),
+                               len(neg_events), in_gate,
+                               internal_neg if neg_source == "internal" else None)
+        if cleanup is not None:
+            unstained_Y = None
+            if spec.remove_high_af and spec.carrier == "cells" and cell_unstained is not None:
+                unstained_Y = gated_events(cell_unstained, True)
+            neg_xy = None
+            if neg_spec is not None and spec.negative_mask is None:
+                xy = _scatter_xy(sample_for(neg_spec.path))
+                neg_xy = None if xy is None else xy[gate_mask(neg_spec, True)]
+            _clean_signature(result, spec, events, peak, clean_masks(spec), cleanup,
+                             _scatter_xy(sample_for(spec.path)), negatives(True), neg_xy, unstained_Y)
+        if check_spectra:
+            result.check = spectra_library.check(spec.name, result.signature, names, library,
+                                                 spec.carrier)
+            if (spec.signature_choice == "library" and result.check is not None
+                    and result.check.kind == "saved"):
+                result.measured_signature = result.signature
+                result.signature = spectral.normalise(result.check.reference)
+                result.signature_source = "library"
+        references.append(spectral.Reference(spec.name, result.signature, source=spec.path.name,
+                                             marker=spec.marker))
+        results.append(result)
 
     background_var = None
-    cell_unstained = next((s for s in specs if s.role == "unstained" and s.carrier == "cells"), None)
     any_unstained = cell_unstained or next((s for s in specs if s.role == "unstained"), None)
     if any_unstained is not None:
         background_var = spectral.robust_sd(gated_events(any_unstained)) ** 2
@@ -286,6 +386,49 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
         unstained = [(s, gated_events(s)) for s in specs if s.role == "unstained" and s.carrier == "cells"]
         add_autofluorescence(unmixer, unstained, af_mode, n_autofluorescence, af_library_size, af_auto)
     return unmixer, results
+
+
+def _clean_signature(result, spec, events, peak, masks, cleanup, xy, neg_events, neg_xy,
+                     unstained_Y=None):
+    """Recalculate result's signature from cleaned events (see control_cleanup).
+
+    masks: (not saturated, not a doublet) over the control's events; xy: its
+    scatter, or None; neg_events / neg_xy: the cleaned negatives from another
+    file and their scatter (None with internal negatives); unstained_Y: the
+    unstained cells when high-AF positives are to be dropped.
+    """
+    sat_ok, single = masks
+    pos = result.positive_mask
+    info = {"saturated": int((pos & ~sat_ok).sum()), "doublets": int((pos & sat_ok & ~single).sum()),
+            "high_af": 0}
+    used = pos & sat_ok & single
+    if used.sum() < 10:
+        used = pos   # too few left; clean-up would do more harm than good
+    used = control_cleanup.brightest(events[:, peak], used, cleanup.brightest)
+    if unstained_Y is not None and len(unstained_Y) >= 50:
+        af_sig = spectral.normalise(np.median(unstained_Y, axis=0))
+        rough = spectral.extract_signature(events[used], unstained_Y)
+        drop = control_cleanup.high_af(events[used], rough, af_sig, unstained_Y)
+        if (~drop).sum() >= 10:
+            info["high_af"] = int(drop.sum())
+            used = _expand(~drop, used)
+    background = None
+    if neg_events is None:
+        neg_events = events[result.negative_mask] if result.negative_mask is not None else events[pos]
+    elif (cleanup.scatter_match and spec.carrier == "cells" and xy is not None and neg_xy is not None
+            and len(neg_events)):
+        k = max(1, int(cleanup.neighbours))
+        background = control_cleanup.matched_background(xy[used], neg_xy, neg_events, k)
+        info["background"] = (f"scatter-matched: {k} nearest unstained cell{'s' if k > 1 else ''} "
+                              f"in {result.negative_source}")
+    if background is None:
+        background = np.median(neg_events, axis=0)
+        info["background"] = f"median of {result.negative_source}"
+    info["used"] = int(used.sum())
+    result.basic_signature = result.signature
+    result.signature = control_cleanup.signature(events[used], background)
+    result.used_mask = used
+    result.cleanup = info
 
 
 AF_MODES = ("per_cell", "fluors")

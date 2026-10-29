@@ -16,7 +16,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..core import cleaning, experiment, fcs, spectral, unmixing
+from ..core import cleaning, control_cleanup, experiment, fcs, spectra_library, spectral, unmixing
 from ..core.experiment import Setup
 from ..core.workspace import default_tops
 from . import theme
@@ -69,6 +69,7 @@ class UnmixingTab(QtWidgets.QWidget):
         self.problems = []
         self._preview_cache = {}
         self._control_qc = {}      # (path, settings) -> (keep mask, cleaning.Result)
+        self.library = spectra_library.SpectraLibrary()   # spectra you saved from good controls
         self.rows = []
         self._rows_stale = True
         self.setAcceptDrops(True)
@@ -139,6 +140,15 @@ class UnmixingTab(QtWidgets.QWidget):
             "Remove margin events, clogs and bubbles from each control before its signature is "
             "calculated (uses the Clean data settings). A clog in a control skews its spectrum.")
         self.clean_check.toggled.connect(self._settings_changed)
+        self.smart_check = QtWidgets.QCheckBox("Smart control clean-up")
+        self.smart_check.setToolTip(
+            "Drop saturated events and doublets, use only the brightest positive events, subtract "
+            "scatter-matched unstained cells from cell controls, and check every signature against "
+            "a reference spectrum. Based on AutoSpectral (Burton et al. 2025).")
+        self.smart_check.toggled.connect(self._settings_changed)
+        self.smart_btn = QtWidgets.QPushButton("Settings…")
+        self.smart_btn.setAutoDefault(False)
+        self.smart_btn.clicked.connect(self._cleanup_settings)
         self.af_lib_size = QtWidgets.QSpinBox()
         self.af_lib_size.setRange(1, 60)
         self.af_lib_size.setValue(30)
@@ -161,7 +171,13 @@ class UnmixingTab(QtWidgets.QWidget):
         af_row.addWidget(self.af_auto)
         af_row.addStretch()
         options.addRow(af_row)
-        options.addRow(self.clean_check)
+        clean_row = QtWidgets.QHBoxLayout()
+        clean_row.addWidget(self.clean_check)
+        clean_row.addSpacing(16)
+        clean_row.addWidget(self.smart_check)
+        clean_row.addWidget(self.smart_btn)
+        clean_row.addStretch()
+        options.addRow(clean_row)
 
         self.status = QtWidgets.QLabel()
         self.status.setWordWrap(True)
@@ -334,6 +350,7 @@ class UnmixingTab(QtWidgets.QWidget):
             w.blockSignals(False)
         for w, v in ((self.af_check, self.setup.autofluorescence), (self.af_auto, self.setup.af_auto),
                      (self.clean_check, self.setup.clean_controls),
+                     (self.smart_check, self.setup.cleanup.enabled),
                      (self.af_lib_size, self.setup.af_library_size),
                      (self.af_mode, self.af_mode.findData(self.setup.af_mode))):
             w.blockSignals(True)
@@ -345,6 +362,7 @@ class UnmixingTab(QtWidgets.QWidget):
                 w.setValue(v)
             w.blockSignals(False)
         self._show_af_options()
+        self.smart_btn.setEnabled(self.setup.cleanup.enabled)
         setup = self.setup
         to_read = list(dict.fromkeys(s.path for s in setup.specs if s.path not in self.samples))
         if not to_read:
@@ -620,6 +638,8 @@ class UnmixingTab(QtWidgets.QWidget):
         self.setup.autofluorescence = self.af_check.isChecked()
         self.setup.n_autofluorescence = self.af_count.value()
         self.setup.clean_controls = self.clean_check.isChecked()
+        self.setup.cleanup.enabled = self.smart_check.isChecked()
+        self.smart_btn.setEnabled(self.setup.cleanup.enabled)
         mode_changed = self.setup.af_mode != self.af_mode.currentData()
         self.setup.af_mode = self.af_mode.currentData()
         self.setup.af_library_size = self.af_lib_size.value()
@@ -693,7 +713,8 @@ class UnmixingTab(QtWidgets.QWidget):
                     n_autofluorescence=self.setup.n_autofluorescence,
                     autofluorescence=self.setup.autofluorescence, samples=self.samples,
                     af_mode=self.setup.af_mode, af_library_size=self.setup.af_library_size,
-                    af_auto=self.setup.af_auto, keep={p: k for p, (k, _) in cleaned.items()})
+                    af_auto=self.setup.af_auto, keep={p: k for p, (k, _) in cleaned.items()},
+                    cleanup=self.setup.cleanup, library=self.library)
             except Exception as exc:
                 errors.append(f"Couldn't build the unmixing matrix: {exc}")
         self._cleaned = cleaned
@@ -710,7 +731,8 @@ class UnmixingTab(QtWidgets.QWidget):
         self.sim_table.clear()
         self.sim_table.setRowCount(0)
         if ok:
-            self.signatures.set_signatures(self.unmixer.references, self.unmixer.detectors)
+            self.signatures.set_signatures(self.unmixer.references, self.unmixer.detectors,
+                                           self._comparison_lines())
             self._draw_similarity()
         else:
             self.signatures.clear()
@@ -771,6 +793,15 @@ class UnmixingTab(QtWidgets.QWidget):
                 if sim[i, j] > 0.98:
                     text += " Pairs above 0.98 are very hard to separate."
             lines.append(text)
+            if self.results and all(r.basic_signature is not None for r in self.results):
+                now = np.linalg.cond(np.vstack([r.signature for r in self.results]))
+                before = np.linalg.cond(np.vstack([r.basic_signature for r in self.results]))
+                lines.append(f"Smart control clean-up: fluor matrix condition number {now:.2f} "
+                             f"(plain method {before:.2f}; lower is easier to unmix).")
+            flagged = [r.spec.name for r in self.results if r.flagged]
+            if flagged:
+                lines.append(f"<span style='color:#C2412D'>Spectrum check failed for {', '.join(flagged)}: "
+                             "see step 2.</span>")
         cleaned = getattr(self, "_cleaned", {})
         if cleaned:
             parts = [(p.name, 100 * (1 - k.mean())) for p, (k, _) in cleaned.items() if len(k)]
@@ -855,6 +886,7 @@ class UnmixingTab(QtWidgets.QWidget):
                 except ValueError:
                     continue   # detectors don't match the experiment; check_specs reports it
                 row.edited.connect(self._gate_edited)
+                row.save_requested.connect(self._save_to_library)
                 self.rows_layout.insertWidget(self.rows_layout.count() - 1, row)
                 self.rows.append(row)
         finally:
@@ -863,6 +895,48 @@ class UnmixingTab(QtWidgets.QWidget):
     def _gate_edited(self, spec):
         self.recalculate(rebuild_rows=False)
         self._mark_changed()
+
+    # ----- smart control clean-up and the spectra check ---------------------
+
+    def _cleanup_settings(self):
+        dialog = CleanupDialog(self.setup.cleanup, self)
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self.setup.cleanup = dialog.values()
+            self.recalculate()
+            self._mark_changed()
+
+    def _save_to_library(self, spec):
+        r = next((r for r in self.results if r.spec is spec), None)
+        if r is None or self.unmixer is None:
+            return
+        signature = r.measured_signature if r.measured_signature is not None else r.signature
+        self.library.add(spec.name, self.unmixer.detectors, signature, spec.carrier, spec.path.name)
+        try:
+            self.library.save()
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "Couldn't save the spectrum",
+                                          f"{self.library.path}\n\n{exc}")
+            return
+        if spec.signature_choice != "auto":
+            spec.signature_choice = "auto"
+            self._mark_changed()
+        self.recalculate(rebuild_rows=False)
+
+    def _comparison_lines(self):
+        """Per fluor, the lines the Signatures tab draws behind it: the signature
+        before control clean-up and the reference it was checked against."""
+        out = {}
+        before = pg.mkPen(theme.FAINT, width=1.6, style=QtCore.Qt.DashLine)
+        reference = pg.mkPen("#C2412D", width=1.6, style=QtCore.Qt.DotLine)
+        for r in self.results:
+            lines = []
+            if r.basic_signature is not None:
+                lines.append((r.basic_signature, before))
+            if r.check is not None:
+                lines.append((spectral.normalise(r.check.reference), reference))
+            if lines:
+                out[r.spec.name] = lines
+        return out
 
     # ----- preview ---------------------------------------------------------
 
@@ -1006,6 +1080,7 @@ class UnmixingTab(QtWidgets.QWidget):
         elif clean is None:
             clean = bool(self.ws.qc)
         specs, unmixer, samples = list(self.specs), self.unmixer, dict(self.samples)
+        results = list(self.results)
         um_name, af_settings = self.setup.name, dict(self.setup.af_settings)
         clean_settings = copy.deepcopy(self.ws.qc_settings) if clean else None
 
@@ -1014,7 +1089,7 @@ class UnmixingTab(QtWidgets.QWidget):
                 dest, name, specs, unmixer, as_zip=as_zip, samples=samples, unmixer_name=um_name,
                 progress=lambda done, total, text: job.progress(done / (total + 1), text),
                 af_settings=af_settings, clean_settings=clean_settings,
-                cleaning_report=qc_report.write_pdf)
+                cleaning_report=qc_report.write_pdf, control_results=results)
 
         job = run_job(f"Exporting {name}", work, on_done=self._exported, key=("export-experiment", id(self)))
         job.finished.connect(self._update_buttons)
@@ -1031,6 +1106,67 @@ class UnmixingTab(QtWidgets.QWidget):
         box.buttonClicked.connect(lambda b: b is show and QtGui.QDesktopServices.openUrl(
             QtCore.QUrl.fromLocalFile(str(result.path.parent))))
         box.show()
+
+
+class CleanupDialog(QtWidgets.QDialog):
+    """Settings of the smart control clean-up."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Smart control clean-up")
+        self.saturation = QtWidgets.QCheckBox("Drop events at a detector's full scale (saturated)")
+        self.saturation.setChecked(settings.saturation)
+        self.singlets = QtWidgets.QCheckBox("Drop doublets (high FSC-A / FSC-H)")
+        self.singlets.setChecked(settings.singlets)
+        self.brightest = QtWidgets.QSpinBox()
+        self.brightest.setRange(0, 1_000_000)
+        self.brightest.setSingleStep(100)
+        self.brightest.setValue(settings.brightest)
+        self.brightest.setSpecialValueText("All positive events")
+        self.brightest.setSuffix(" brightest positive events")
+        self.scatter = QtWidgets.QCheckBox("Scatter-matched negatives for cell controls")
+        self.scatter.setChecked(settings.scatter_match)
+        self.neighbours = QtWidgets.QSpinBox()
+        self.neighbours.setRange(1, 50)
+        self.neighbours.setValue(settings.neighbours)
+        self.neighbours.setSuffix(" nearest unstained cells")
+        self.scatter.toggled.connect(self.neighbours.setEnabled)
+        self.neighbours.setEnabled(settings.scatter_match)
+        note = QtWidgets.QLabel(
+            "Each positive cell's background is the average of the unstained cells closest to it in "
+            "forward and side scatter, so bigger, brighter-AF cells are compared with cells like "
+            "them. Beads keep the median of their unstained beads. Based on AutoSpectral "
+            "(Burton et al. 2025, bioRxiv 10.1101/2025.10.27.684855).")
+        note.setWordWrap(True)
+        note.setObjectName("Hint")
+        form = QtWidgets.QFormLayout()
+        form.addRow(self.saturation)
+        form.addRow(self.singlets)
+        form.addRow("Use", self.brightest)
+        form.addRow(self.scatter)
+        form.addRow("Average of", self.neighbours)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+                                             | QtWidgets.QDialogButtonBox.RestoreDefaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QtWidgets.QDialogButtonBox.RestoreDefaults).clicked.connect(self._defaults)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(note)
+        layout.addWidget(buttons)
+
+    def _defaults(self):
+        d = control_cleanup.Settings()
+        self.saturation.setChecked(d.saturation)
+        self.singlets.setChecked(d.singlets)
+        self.brightest.setValue(d.brightest)
+        self.scatter.setChecked(d.scatter_match)
+        self.neighbours.setValue(d.neighbours)
+
+    def values(self):
+        return control_cleanup.Settings(True, self.saturation.isChecked(), self.singlets.isChecked(),
+                                        self.brightest.value(), self.scatter.isChecked(),
+                                        self.neighbours.value())
 
 
 class ExportDialog(QtWidgets.QDialog):

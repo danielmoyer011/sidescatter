@@ -19,9 +19,10 @@ from .spectrum_plot import PSEUDOCOLOR, IntensityAxis, SpectrumPlot, _plot, subs
 
 SCATTER_BINS = 128
 HIST_BINS = 128
-ROW_HEIGHT = 300
+ROW_HEIGHT = 330
 POSITIVE = theme.TEAL
 NEGATIVE = theme.CORAL
+FLAG = "#C2412D"   # same red as the Unmixing tab's errors
 
 
 class SIAxis(pg.AxisItem):
@@ -40,7 +41,8 @@ def _region_label(text, color):
 class ControlRow(QtWidgets.QFrame):
     """Scatter gate, peak-detector ranges and spectrum for one reference control."""
 
-    edited = QtCore.Signal(object)   # the ControlSpec whose gates changed
+    edited = QtCore.Signal(object)   # the ControlSpec whose gates or choices changed
+    save_requested = QtCore.Signal(object)   # save this control's signature to your library
 
     def __init__(self, spec, sample, detectors, result=None, negative=None, parent=None):
         """detectors: raw detector names in file order (the unmixer's).
@@ -76,10 +78,39 @@ class ControlRow(QtWidgets.QFrame):
         self.scatter_title = self._plot_title()
         self.hist_title = self._plot_title()
 
+        # Second line: the spectra check and what to do about a flagged control.
+        self.check_label = QtWidgets.QLabel()
+        self.check_label.setTextFormat(QtCore.Qt.RichText)
+        self.check_label.setObjectName("Hint")
+        self.use_anyway = self._small_button("Use anyway", "Keep the measured signature and hide the flag",
+                                             lambda: self._choose("accepted"))
+        self.use_saved = self._small_button("Use saved spectrum",
+                                            "Unmix with the spectrum you saved for this fluor instead",
+                                            lambda: self._choose("library"))
+        self.use_measured = self._small_button("Use measured", "Go back to the signature from this control",
+                                               lambda: self._choose("auto"))
+        self.save_btn = self._small_button(
+            "Save to library", "Keep this signature as the reference for this fluor on this instrument "
+            "layout; later experiments are checked against it", lambda: self.save_requested.emit(self.spec))
+        self.reset_btn = self._small_button("Reset to auto", "Forget the Positive and Negative ranges drawn "
+                                            "here and use the automatic ones", self._reset)
+        self.high_af = QtWidgets.QCheckBox("Drop high-AF cells")
+        self.high_af.setToolTip("Leave out positive cells with more autofluorescence than almost all "
+                                "unstained cells (cell controls only; slower)")
+        self.high_af.setChecked(spec.remove_high_af)
+        self.high_af.toggled.connect(self._high_af_toggled)
+
         head = QtWidgets.QHBoxLayout()
         head.addWidget(self.title)
         head.addSpacing(10)
         head.addWidget(self.subtitle, 1)
+        head.addWidget(self.high_af)
+        head.addWidget(self.save_btn)
+        head.addWidget(self.reset_btn)
+        check_row = QtWidgets.QHBoxLayout()
+        check_row.addWidget(self.check_label, 1)
+        for b in (self.use_anyway, self.use_saved, self.use_measured):
+            check_row.addWidget(b)
         plots = QtWidgets.QHBoxLayout()
         plots.setSpacing(12)
         for title, plot, stretch in ((self.scatter_title, self.scatter, 2), (self.hist_title, self.hist, 2)):
@@ -92,12 +123,34 @@ class ControlRow(QtWidgets.QFrame):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.addLayout(head)
+        layout.addLayout(check_row)
         layout.addLayout(plots, 1)
 
         self._roi = None
         self._gate_label = None
         self.draw_scatter()
         self.update_result(result)
+
+    def _small_button(self, text, tip, slot):
+        b = QtWidgets.QPushButton(text)
+        b.setToolTip(tip)
+        b.setAutoDefault(False)
+        b.clicked.connect(slot)
+        return b
+
+    def _choose(self, choice):
+        self.spec.signature_choice = choice
+        self._emit_later()
+
+    def _reset(self):
+        for key in ("positive_range", "negative_range", "positive_mask", "negative_mask"):
+            setattr(self.spec, key, None)
+        self.spec.gate_detector = ""
+        self._emit_later()
+
+    def _high_af_toggled(self, on):
+        self.spec.remove_high_af = on
+        self._emit_later()
 
     @staticmethod
     def _plot_title():
@@ -196,16 +249,60 @@ class ControlRow(QtWidgets.QFrame):
         carrier = self.spec.carrier.capitalize()
         if self.is_single:
             self.title.setText(f"{self.spec.name} ({carrier})")
-            if self.result is None:
+            r = self.result
+            if r is None:
                 self.subtitle.setText(self.spec.path.name)
-            else:
+            elif r.cleanup is None:
                 self.subtitle.setText(
-                    f"{self.spec.path.name}  ·  {self.result.n_positive:,} positive events  ·  "
-                    f"negative: {self.result.negative_source}"
-                    + ("" if self.result.negative_mask is not None else " (dashed)"))
+                    f"{self.spec.path.name}  ·  {r.n_positive:,} positive events  ·  "
+                    f"negative: {r.negative_source}" + ("" if r.negative_mask is not None else " (dashed)"))
+            else:
+                c = r.cleanup
+                removed = [f"{c[k]:,} {label}" for k, label in
+                           (("saturated", "saturated"), ("doublets", "doublets"), ("high_af", "high-AF"))
+                           if c.get(k)]
+                self.subtitle.setText(
+                    f"{self.spec.path.name}  ·  {c['used']:,} of {r.n_positive:,} positive events used"
+                    + (f" (removed {', '.join(removed)})" if removed else "")
+                    + f"  ·  background: {c['background']}")
         else:
             self.title.setText(f"Unstained ({carrier})")
             self.subtitle.setText(self.spec.path.name)
+        self._update_check()
+
+    def _update_check(self):
+        r = self.result if self.is_single else None
+        check = r.check if r is not None else None
+        choice = self.spec.signature_choice
+        drawn = self.spec.positive_range is not None or self.spec.negative_range is not None
+        self.save_btn.setVisible(self.is_single and r is not None)
+        self.reset_btn.setVisible(self.is_single)
+        self.reset_btn.setEnabled(drawn)
+        self.high_af.setVisible(self.is_single and self.spec.carrier == "cells" and r is not None
+                                and r.cleanup is not None)
+        failed = check is not None and not check.passed
+        self.use_anyway.setVisible(failed and choice == "auto")
+        self.use_saved.setVisible(failed and choice == "auto" and check.kind == "saved")
+        self.use_measured.setVisible(check is not None and choice in ("accepted", "library")
+                                     and (failed or choice == "library"))
+        if check is None:
+            self.check_label.setText("Spectrum check: no reference for this fluor yet. "
+                                     "Save a good control to your library to check later ones."
+                                     if self.is_single and r is not None else "")
+            return
+        score = f"cosine {check.cosine:.2f} vs {check.label}"
+        if r.signature_source == "library":
+            self.check_label.setText(f"Using your saved spectrum. The measured one had {score}.")
+        elif check.passed:
+            self.check_label.setText(f"Spectrum check passed: {score}.")
+        elif choice == "accepted":
+            self.check_label.setText(f"Spectrum check below {check.threshold:.2f} ({score}); "
+                                     "using the measured signature anyway.")
+        else:
+            self.check_label.setText(
+                f"<span style='color:{FLAG}; font-weight:600'>Spectrum check failed: {score} "
+                f"(below {check.threshold:.2f}).</span> Check the gates and the tube; "
+                "the dashed line is the reference.")
 
     def _positive_sub(self, gate):
         """Displayed positive events, from the last build when there is one."""
@@ -318,8 +415,26 @@ class ControlRow(QtWidgets.QFrame):
                 bounds = self._negative_file_range
             if bounds is not None:
                 markers.append((bounds[0], bounds[1], color))
-        self.spectrum.set_title(f"{self.spec.name} positives")
-        self.spectrum.set_events(self.events[positives], self.detectors, self.top, markers)
+        used = self._used_events()
+        shown = self.events[positives] if used is None else used
+        what = "positives" if used is None else "positives used"
+        self.spectrum.set_title(f"{self.spec.name} {what}")
+        self.spectrum.set_events(shown, self.detectors, self.top, markers)
+        check = self.result.check if self.result is not None else None
+        if check is not None and (not check.passed or self.result.signature_source == "library") \
+                and len(shown):
+            # The reference, scaled to the positives' brightness at its peak.
+            ref = np.asarray(check.reference, dtype=float)
+            peak = int(np.argmax(ref))
+            level = float(np.median(shown[:, peak])) / max(ref[peak], 1e-9)
+            self.spectrum.add_line(ref * level, pg.mkPen(FLAG, width=2, style=QtCore.Qt.DashLine))
+
+    def _used_events(self):
+        """Every event the cleaned-up signature came from (a few hundred), at full resolution."""
+        if self.result is None or self.result.used_mask is None:
+            return None
+        raw = self.sample.get_events(source="raw")
+        return raw[self.result.used_mask][:, unmixing._detector_index(self.sample, self.detectors)]
 
     def _emit_later(self):
         # Let the dragged item finish its own signal before the row is redrawn.

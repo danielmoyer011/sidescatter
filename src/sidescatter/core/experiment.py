@@ -33,7 +33,7 @@ from pathlib import Path
 import flowio
 import numpy as np
 
-from . import fcs, spectral, unmixing
+from . import control_cleanup, fcs, spectral, unmixing
 
 RAW, UNMIXED = "Raw", "Unmixed"
 REFERENCE_GROUP, SAMPLES = "Reference Group", "Samples"
@@ -152,7 +152,41 @@ def residual_fraction(sample, unmixer, af_source=None):
     return float(np.median(np.abs(R).sum(axis=1) / np.maximum(np.abs(Y).sum(axis=1), 1e-9)))
 
 
-def qc_report(name, unmixer, specs, residuals, problems, af_check=None):
+def controls_text(results):
+    """Smart control clean-up and the spectra check, per single stain, for the QC report."""
+    results = [r for r in results or () if r.spec.role == "single_stain"]
+    if not results:
+        return []
+    lines = []
+    if any(r.cleanup is not None for r in results):
+        lines.append("Smart control clean-up (based on AutoSpectral, Burton et al. 2025):")
+        for r in results:
+            c = r.cleanup
+            if c is None:
+                continue
+            removed = ", ".join(f"{c[k]:,} {label}" for k, label in
+                                (("saturated", "saturated"), ("doublets", "doublets"),
+                                 ("high_af", "high-AF")) if c.get(k)) or "nothing"
+            change = spectral.cosine(r.signature[None], r.basic_signature[None])[0, 0]
+            lines.append(f"  {r.spec.name}: {c['used']:,} of {r.n_positive:,} positives used, "
+                         f"removed {removed}; background {c['background']}; "
+                         f"cosine to the plain signature {change:.3f}")
+        lines.append("")
+    checked = [r for r in results if r.check is not None]
+    lines.append("Spectrum check (cosine to the reference; below "
+                 f"{checked[0].check.threshold if checked else 0.9:.2f} is flagged):")
+    for r in results:
+        if r.check is None:
+            lines.append(f"  {r.spec.name}: no reference")
+            continue
+        state = ("used your saved spectrum" if r.signature_source == "library"
+                 else "ok" if r.check.passed else
+                 "below threshold, used anyway" if r.spec.signature_choice == "accepted" else "FLAGGED")
+        lines.append(f"  {r.spec.name}: {r.check.cosine:.3f} vs {r.check.label} ({state})")
+    return lines
+
+
+def qc_report(name, unmixer, specs, residuals, problems, af_check=None, control_results=None):
     names = unmixer.names
     sim = spectral.similarity_matrix(unmixer.matrix)
     lines = [f"Unmixing QC report: {name}",
@@ -171,6 +205,8 @@ def qc_report(name, unmixer, specs, residuals, problems, af_check=None):
     lines += [f"  {a} / {b}: {v:.3f}" for v, a, b in pairs[:5]] or ["  (only one component)"]
     lines += ["", "Residual after unmixing (median |residual| / |signal|; lower is better):"]
     lines += [f"  {f}: {v:.3f}" for f, v in residuals.items()] or ["  (no files)"]
+    if control_results:
+        lines += [""] + controls_text(control_results)
     if af_check is not None:
         lines += [""] + unmixing.af_check_text(af_check)
     if problems:
@@ -186,7 +222,7 @@ def qc_report(name, unmixer, specs, residuals, problems, af_check=None):
 
 def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
                       unmixer_name="Unmixing", progress=None, af_settings=None, clean_settings=None,
-                      cleaning_report=None):
+                      cleaning_report=None, control_results=None):
     """Write the experiment into dest_dir as <name>.zip or a <name>/ folder.
 
     specs: every file of the experiment (excluded ones are skipped). samples:
@@ -196,7 +232,8 @@ def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
     the QC report), e.g. n_autofluorescence and af_library_size.
     clean_settings: clean the unmixed samples (they get a QC passed population
     in the exported workspace); cleaning_report(path, pages) then writes the
-    data-cleaning PDF into QC/.
+    data-cleaning PDF into QC/. control_results: the ControlResults the
+    unmixer was built from, for the clean-up and spectra check in the QC report.
     Returns an ExportResult. Nothing is left behind if writing fails.
     """
     from .workspace import Workspace  # workspace imports unmixing; keep this module light
@@ -257,7 +294,8 @@ def export_experiment(dest_dir, name, specs, unmixer, as_zip=True, samples=None,
         if any(r.is_autofluorescence for r in unmixer.references):
             check = unmixing.af_check(included, unmixer, samples, **(af_settings or {}))
         (root / "QC report.txt").write_text(
-            qc_report(name, unmixer, specs, residuals, [("warning", w) for w in warnings], check),
+            qc_report(name, unmixer, specs, residuals, [("warning", w) for w in warnings], check,
+                      control_results),
             encoding="utf-8")
         if qc_pages and cleaning_report is not None:
             (root / "QC").mkdir()
@@ -312,6 +350,8 @@ class Setup:
     af_library_size: int = 30      # most automatic AF spectra per unstained file
     af_auto: bool = True           # False: only the hand-drawn AF gates
     clean_controls: bool = False   # drop clogs and bubbles from controls before signatures
+    # AutoSpectral-style control clean-up; setups saved before it existed keep it off.
+    cleanup: control_cleanup.Settings = field(default_factory=control_cleanup.Settings)
 
     @property
     def af_settings(self):
@@ -324,11 +364,13 @@ class Setup:
             "name": self.name, "method": self.method, "autofluorescence": self.autofluorescence,
             "n_autofluorescence": self.n_autofluorescence, "af_mode": self.af_mode,
             "af_library_size": self.af_library_size, "af_auto": self.af_auto,
-            "clean_controls": self.clean_controls,
+            "clean_controls": self.clean_controls, "cleanup": self.cleanup.to_dict(),
             "files": [{"path": str(s.path), "name": s.name, "role": s.role, "carrier": s.carrier,
                        "negative": s.negative, "marker": s.marker, "reasons": list(s.reasons),
                        "guessed_by": s.guessed_by, "af_gates": list(s.af_gates),
-                       "af_source": s.af_source, **_gates_to_dict(s)} for s in self.specs],
+                       "af_source": s.af_source, "remove_high_af": s.remove_high_af,
+                       "signature_choice": s.signature_choice, **_gates_to_dict(s)}
+                      for s in self.specs],
         }
 
     @classmethod
@@ -337,9 +379,13 @@ class Setup:
                                       marker=f.get("marker", ""), reasons=f.get("reasons", []),
                                       guessed_by=f.get("guessed_by", ""),
                                       af_gates=list(f.get("af_gates", [])),
-                                      af_source=f.get("af_source", "shared"), **_gates_from_dict(f))
+                                      af_source=f.get("af_source", "shared"),
+                                      remove_high_af=f.get("remove_high_af", False),
+                                      signature_choice=f.get("signature_choice", "auto"),
+                                      **_gates_from_dict(f))
                  for f in d["files"]]
         # Setups saved before per-cell AF existed keep AF as fluors.
         return cls(d["name"], specs, d.get("method", "wls"), d.get("autofluorescence", True),
                    d.get("n_autofluorescence", 1), d.get("af_mode", "fluors"),
-                   d.get("af_library_size", 30), d.get("af_auto", True), d.get("clean_controls", False))
+                   d.get("af_library_size", 30), d.get("af_auto", True), d.get("clean_controls", False),
+                   control_cleanup.Settings.from_dict(d.get("cleanup")))
