@@ -33,7 +33,7 @@ from pathlib import Path
 import flowio
 import numpy as np
 
-from . import control_cleanup, fcs, spectral, unmixing
+from . import control_cleanup, fcs, fluor_variants, spectral, unmixing
 
 RAW, UNMIXED = "Raw", "Unmixed"
 REFERENCE_GROUP, SAMPLES = "Reference Group", "Samples"
@@ -186,6 +186,22 @@ def controls_text(results):
     return lines
 
 
+def hotspots_text(unmixer, results, top=8):
+    """The largest entries of the error hotspot matrix, for the QC report."""
+    hs = unmixing.variant_hotspots(unmixer, results or [])
+    if hs is None:
+        return []
+    names, H = hs
+    pairs = sorted(((H[i, j], names[i], names[j]) for i in range(len(names)) for j in range(len(names))
+                    if i != j and np.isfinite(H[i, j])), reverse=True)
+    lines = ["Error hotspots: spread expected in a fluor (second) per unit of another fluor (first), "
+             "from the first fluor's per-cell variation" + (
+                 "; per-cell fluor variation is on to reduce it"
+                 if unmixer.per_cell_variants else "") + ":"]
+    lines += [f"  {a} -> {b}: {v:.4f}" for v, a, b in pairs[:top]]
+    return lines
+
+
 def qc_report(name, unmixer, specs, residuals, problems, af_check=None, control_results=None):
     names = unmixer.names
     sim = spectral.similarity_matrix(unmixer.matrix)
@@ -197,6 +213,9 @@ def qc_report(name, unmixer, specs, residuals, problems, af_check=None, control_
              "autofluorescence)",
              "Autofluorescence: " + (f"per-cell matching to a library of {len(unmixer.af_library)} spectra"
                                      if unmixer.per_cell_af else "signatures as fluors"),
+             "Per-cell fluor variation: " + (
+                 f"on, {sum(len(v) for v in unmixer.variants)} variants" if unmixer.per_cell_variants
+                 else "off"),
              f"Detectors: {len(unmixer.detectors)}",
              f"Complexity index: {spectral.complexity_index(unmixer.matrix):.2f}", ""]
     pairs = sorted(((sim[i, j], names[i], names[j]) for i in range(len(names))
@@ -207,6 +226,9 @@ def qc_report(name, unmixer, specs, residuals, problems, af_check=None, control_
     lines += [f"  {f}: {v:.3f}" for f, v in residuals.items()] or ["  (no files)"]
     if control_results:
         lines += [""] + controls_text(control_results)
+        hot = hotspots_text(unmixer, control_results)
+        if hot:
+            lines += [""] + hot
     if af_check is not None:
         lines += [""] + unmixing.af_check_text(af_check)
     if problems:
@@ -352,6 +374,8 @@ class Setup:
     clean_controls: bool = False   # drop clogs and bubbles from controls before signatures
     # AutoSpectral-style control clean-up; setups saved before it existed keep it off.
     cleanup: control_cleanup.Settings = field(default_factory=control_cleanup.Settings)
+    # Per-cell fluor variation: off by default (slower and newer).
+    variation: fluor_variants.Settings = field(default_factory=fluor_variants.Settings)
 
     @property
     def af_settings(self):
@@ -365,6 +389,7 @@ class Setup:
             "n_autofluorescence": self.n_autofluorescence, "af_mode": self.af_mode,
             "af_library_size": self.af_library_size, "af_auto": self.af_auto,
             "clean_controls": self.clean_controls, "cleanup": self.cleanup.to_dict(),
+            "variation": self.variation.to_dict(),
             "files": [{"path": str(s.path), "name": s.name, "role": s.role, "carrier": s.carrier,
                        "negative": s.negative, "marker": s.marker, "reasons": list(s.reasons),
                        "guessed_by": s.guessed_by, "af_gates": list(s.af_gates),
@@ -388,4 +413,5 @@ class Setup:
         return cls(d["name"], specs, d.get("method", "wls"), d.get("autofluorescence", True),
                    d.get("n_autofluorescence", 1), d.get("af_mode", "fluors"),
                    d.get("af_library_size", 30), d.get("af_auto", True), d.get("clean_controls", False),
-                   control_cleanup.Settings.from_dict(d.get("cleanup")))
+                   control_cleanup.Settings.from_dict(d.get("cleanup")),
+                   fluor_variants.Settings.from_dict(d.get("variation")))

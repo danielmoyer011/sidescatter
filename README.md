@@ -33,6 +33,10 @@ workflow familiar to FlowJo users.
     unstained cell; every signature is checked against your own saved
     spectra or one predicted from published dye spectra, and a control that
     doesn't match is flagged;
+  - per-cell fluor variation (also after AutoSpectral): each fluor's
+    control gives a set of slightly different spectra, each cell uses the
+    one that fits it, and a Hotspots table shows which fluors' variation
+    spreads into which;
   - signature viewer, similarity matrix and complexity index;
   - ordinary or weighted least squares, with autofluorescence handled per
     cell (each cell is matched to the best of a library of AF spectra from
@@ -143,6 +147,8 @@ machines; clone [FlowKit](https://github.com/whitews/FlowKit) into
 - On synthetic cell controls where the stained cells are bigger and brighter
   in autofluorescence than the average unstained cell, scatter-matched
   negatives get the signature at least 3 times closer to the true one.
+- On synthetic data where a fluor comes in several spectral variants, per-cell
+  fluor variation cuts the spread it causes in other fluors by at least 20%.
 - On synthetic tissue-like data with four kinds of autofluorescence, per-cell
   AF matching leaves at least 4 times less spread on unstained cells than a
   single AF signature, and recovers stained cells at least twice as

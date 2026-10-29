@@ -16,7 +16,8 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..core import cleaning, control_cleanup, experiment, fcs, spectra_library, spectral, unmixing
+from ..core import (cleaning, control_cleanup, experiment, fcs, fluor_variants, spectra_library,
+                   spectral, unmixing)
 from ..core.experiment import Setup
 from ..core.workspace import default_tops
 from . import theme
@@ -146,6 +147,12 @@ class UnmixingTab(QtWidgets.QWidget):
             "scatter-matched unstained cells from cell controls, and check every signature against "
             "a reference spectrum. Based on AutoSpectral (Burton et al. 2025).")
         self.smart_check.toggled.connect(self._settings_changed)
+        self.variation_check = QtWidgets.QCheckBox("Per-cell fluor variation")
+        self.variation_check.setToolTip(
+            "Let each cell use a slightly shifted version of a fluor's spectrum, picked from the "
+            "variation seen in that fluor's control. Cuts spillover spread, most in big panels (25+ "
+            "colours), but unmixing is slower. Based on AutoSpectral (Burton et al. 2025).")
+        self.variation_check.toggled.connect(self._settings_changed)
         self.smart_btn = QtWidgets.QPushButton("Settings…")
         self.smart_btn.setAutoDefault(False)
         self.smart_btn.clicked.connect(self._cleanup_settings)
@@ -176,6 +183,8 @@ class UnmixingTab(QtWidgets.QWidget):
         clean_row.addSpacing(16)
         clean_row.addWidget(self.smart_check)
         clean_row.addWidget(self.smart_btn)
+        clean_row.addSpacing(16)
+        clean_row.addWidget(self.variation_check)
         clean_row.addStretch()
         options.addRow(clean_row)
 
@@ -222,6 +231,17 @@ class UnmixingTab(QtWidgets.QWidget):
 
         self.sim_table = QtWidgets.QTableWidget()
         self.tabs.addTab(self.sim_table, "Similarity")
+
+        hot = QtWidgets.QWidget()
+        hl = QtWidgets.QVBoxLayout(hot)
+        hl.setContentsMargins(4, 6, 4, 4)
+        self.hot_hint = QtWidgets.QLabel()
+        self.hot_hint.setWordWrap(True)
+        self.hot_hint.setObjectName("Hint")
+        self.hot_table = QtWidgets.QTableWidget()
+        hl.addWidget(self.hot_hint)
+        hl.addWidget(self.hot_table, 1)
+        self.tabs.addTab(hot, "Hotspots")
 
         preview = QtWidgets.QWidget()
         pl = QtWidgets.QGridLayout(preview)
@@ -351,6 +371,7 @@ class UnmixingTab(QtWidgets.QWidget):
         for w, v in ((self.af_check, self.setup.autofluorescence), (self.af_auto, self.setup.af_auto),
                      (self.clean_check, self.setup.clean_controls),
                      (self.smart_check, self.setup.cleanup.enabled),
+                     (self.variation_check, self.setup.variation.enabled),
                      (self.af_lib_size, self.setup.af_library_size),
                      (self.af_mode, self.af_mode.findData(self.setup.af_mode))):
             w.blockSignals(True)
@@ -362,7 +383,7 @@ class UnmixingTab(QtWidgets.QWidget):
                 w.setValue(v)
             w.blockSignals(False)
         self._show_af_options()
-        self.smart_btn.setEnabled(self.setup.cleanup.enabled)
+        self.smart_btn.setEnabled(self.setup.cleanup.enabled or self.setup.variation.enabled)
         setup = self.setup
         to_read = list(dict.fromkeys(s.path for s in setup.specs if s.path not in self.samples))
         if not to_read:
@@ -639,7 +660,8 @@ class UnmixingTab(QtWidgets.QWidget):
         self.setup.n_autofluorescence = self.af_count.value()
         self.setup.clean_controls = self.clean_check.isChecked()
         self.setup.cleanup.enabled = self.smart_check.isChecked()
-        self.smart_btn.setEnabled(self.setup.cleanup.enabled)
+        self.setup.variation.enabled = self.variation_check.isChecked()
+        self.smart_btn.setEnabled(self.setup.cleanup.enabled or self.setup.variation.enabled)
         mode_changed = self.setup.af_mode != self.af_mode.currentData()
         self.setup.af_mode = self.af_mode.currentData()
         self.setup.af_library_size = self.af_lib_size.value()
@@ -714,7 +736,7 @@ class UnmixingTab(QtWidgets.QWidget):
                     autofluorescence=self.setup.autofluorescence, samples=self.samples,
                     af_mode=self.setup.af_mode, af_library_size=self.setup.af_library_size,
                     af_auto=self.setup.af_auto, keep={p: k for p, (k, _) in cleaned.items()},
-                    cleanup=self.setup.cleanup, library=self.library)
+                    cleanup=self.setup.cleanup, library=self.library, variation=self.setup.variation)
             except Exception as exc:
                 errors.append(f"Couldn't build the unmixing matrix: {exc}")
         self._cleaned = cleaned
@@ -736,6 +758,7 @@ class UnmixingTab(QtWidgets.QWidget):
             self._draw_similarity()
         else:
             self.signatures.clear()
+        self._draw_hotspots()
         self._fill_preview()
         if rebuild_rows:
             self._rows_stale = True
@@ -831,6 +854,38 @@ class UnmixingTab(QtWidgets.QWidget):
                 self.sim_table.setItem(i, j, item)
         self.sim_table.resizeColumnsToContents()
 
+    def _draw_hotspots(self):
+        """Error hotspot matrix: spread each fluor's variation is expected to cause in the others."""
+        self.hot_table.clear()
+        self.hot_table.setRowCount(0)
+        self.hot_table.setColumnCount(0)
+        hs = unmixing.variant_hotspots(self.unmixer, self.results) if self.unmixer is not None else None
+        if hs is None:
+            self.hot_hint.setText("Turn on Smart control clean-up or Per-cell fluor variation in step 1 "
+                                  "to see which fluors' variation spreads into which.")
+            return
+        names, H = hs
+        self.hot_hint.setText(
+            "Expected spread in each column's fluor per unit of the row's fluor, from the variation "
+            "in the row fluor's control (darker = more). Hotspots are the pairs to watch; per-cell "
+            "fluor variation " + ("is on to reduce them." if self.unmixer.per_cell_variants
+                                  else "(step 1) reduces them."))
+        n = len(names)
+        self.hot_table.setRowCount(n)
+        self.hot_table.setColumnCount(n)
+        self.hot_table.setHorizontalHeaderLabels(names)
+        self.hot_table.setVerticalHeaderLabels(names)
+        top = np.nanmax(H) if np.isfinite(H).any() else 1.0
+        for i in range(n):
+            for j in range(n):
+                v = H[i, j]
+                item = QtWidgets.QTableWidgetItem("" if not np.isfinite(v) else f"{v:.3f}")
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                if np.isfinite(v) and top > 0:
+                    item.setBackground(QtGui.QColor.fromHsvF(0.0, min(v / top, 1.0), 1.0))
+                self.hot_table.setItem(i, j, item)
+        self.hot_table.resizeColumnsToContents()
+
     # ----- steps ---------------------------------------------------------
 
     @property
@@ -899,9 +954,10 @@ class UnmixingTab(QtWidgets.QWidget):
     # ----- smart control clean-up and the spectra check ---------------------
 
     def _cleanup_settings(self):
-        dialog = CleanupDialog(self.setup.cleanup, self)
+        dialog = CleanupDialog(self.setup.cleanup, self, self.setup.variation)
         if dialog.exec() == QtWidgets.QDialog.Accepted:
             self.setup.cleanup = dialog.values()
+            self.setup.variation = dialog.variation(self.setup.variation.enabled)
             self.recalculate()
             self._mark_changed()
 
@@ -1111,7 +1167,7 @@ class UnmixingTab(QtWidgets.QWidget):
 class CleanupDialog(QtWidgets.QDialog):
     """Settings of the smart control clean-up."""
 
-    def __init__(self, settings, parent=None):
+    def __init__(self, settings, parent=None, variation=None):
         super().__init__(parent)
         self.setWindowTitle("Smart control clean-up")
         self.saturation = QtWidgets.QCheckBox("Drop events at a detector's full scale (saturated)")
@@ -1132,6 +1188,18 @@ class CleanupDialog(QtWidgets.QDialog):
         self.neighbours.setSuffix(" nearest unstained cells")
         self.scatter.toggled.connect(self.neighbours.setEnabled)
         self.neighbours.setEnabled(settings.scatter_match)
+        variation = variation or fluor_variants.Settings()
+        self.max_variants = QtWidgets.QSpinBox()
+        self.max_variants.setRange(4, 400)
+        self.max_variants.setValue(variation.max_variants)
+        self.max_variants.setSuffix(" variants per fluor")
+        self.min_cosine = QtWidgets.QDoubleSpinBox()
+        self.min_cosine.setRange(0.8, 0.9999)
+        self.min_cosine.setDecimals(3)
+        self.min_cosine.setSingleStep(0.005)
+        self.min_cosine.setValue(variation.min_cosine)
+        self.variant_channels = QtWidgets.QCheckBox("Add a \"<fluor> Variant\" channel per fluor (for checking)")
+        self.variant_channels.setChecked(variation.channels)
         note = QtWidgets.QLabel(
             "Each positive cell's background is the average of the unstained cells closest to it in "
             "forward and side scatter, so bigger, brighter-AF cells are compared with cells like "
@@ -1145,6 +1213,12 @@ class CleanupDialog(QtWidgets.QDialog):
         form.addRow("Use", self.brightest)
         form.addRow(self.scatter)
         form.addRow("Average of", self.neighbours)
+        title = QtWidgets.QLabel("Per-cell fluor variation")
+        title.setObjectName("ControlRowTitle")
+        form.addRow(title)
+        form.addRow("Up to", self.max_variants)
+        form.addRow("Keep variants with cosine ≥", self.min_cosine)
+        form.addRow(self.variant_channels)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
                                              | QtWidgets.QDialogButtonBox.RestoreDefaults)
         buttons.accepted.connect(self.accept)
@@ -1162,6 +1236,14 @@ class CleanupDialog(QtWidgets.QDialog):
         self.brightest.setValue(d.brightest)
         self.scatter.setChecked(d.scatter_match)
         self.neighbours.setValue(d.neighbours)
+        v = fluor_variants.Settings()
+        self.max_variants.setValue(v.max_variants)
+        self.min_cosine.setValue(v.min_cosine)
+        self.variant_channels.setChecked(v.channels)
+
+    def variation(self, enabled):
+        return fluor_variants.Settings(enabled, self.max_variants.value(), self.min_cosine.value(),
+                                       self.variant_channels.isChecked())
 
     def values(self):
         return control_cleanup.Settings(True, self.saturation.isChecked(), self.singlets.isChecked(),
