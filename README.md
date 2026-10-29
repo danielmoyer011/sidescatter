@@ -37,6 +37,10 @@ workflow familiar to FlowJo users.
     control gives a set of slightly different spectra, each cell uses the
     one that fits it, and a Hotspots table shows which fluors' variation
     spreads into which;
+  - AutoSpectral files: unmix with spectra AutoSpectral made (its
+    `table_spectra` CSVs, autofluorescence files included), or write this
+    experiment's spectra plus an AutoSpectral control file to run both tools
+    on the same controls;
   - signature viewer, similarity matrix and complexity index;
   - ordinary or weighted least squares, with autofluorescence handled per
     cell (each cell is matched to the best of a library of AF spectra from

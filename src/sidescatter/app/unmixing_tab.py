@@ -16,7 +16,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..core import (cleaning, control_cleanup, experiment, fcs, fluor_variants, spectra_library,
+from ..core import (autospectral_io, cleaning, control_cleanup, experiment, fcs, fluor_variants, spectra_library,
                    spectral, unmixing)
 from ..core.experiment import Setup
 from ..core.workspace import default_tops
@@ -185,6 +185,20 @@ class UnmixingTab(QtWidgets.QWidget):
         clean_row.addWidget(self.smart_btn)
         clean_row.addSpacing(16)
         clean_row.addWidget(self.variation_check)
+        clean_row.addSpacing(16)
+        self.autospectral_btn = QtWidgets.QToolButton()
+        self.autospectral_btn.setText("AutoSpectral files")
+        self.autospectral_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        menu = QtWidgets.QMenu(self.autospectral_btn)
+        menu.addAction("Import spectra…", self.import_spectra)
+        self.stop_import = menu.addAction("Stop using imported spectra", self.clear_imported)
+        menu.addSeparator()
+        self.export_as = menu.addAction("Export spectra and control file…", self.export_autospectral)
+        self.autospectral_btn.setMenu(menu)
+        self.autospectral_btn.setToolTip(
+            "Exchange spectra with AutoSpectral (R): unmix with spectra it made, or write this "
+            "experiment's spectra and an AutoSpectral control file to compare the two")
+        clean_row.addWidget(self.autospectral_btn)
         clean_row.addStretch()
         options.addRow(clean_row)
 
@@ -736,12 +750,14 @@ class UnmixingTab(QtWidgets.QWidget):
                     autofluorescence=self.setup.autofluorescence, samples=self.samples,
                     af_mode=self.setup.af_mode, af_library_size=self.setup.af_library_size,
                     af_auto=self.setup.af_auto, keep={p: k for p, (k, _) in cleaned.items()},
-                    cleanup=self.setup.cleanup, library=self.library, variation=self.setup.variation)
+                    cleanup=self.setup.cleanup, library=self.library, variation=self.setup.variation,
+                    imported=self.setup.imported)
             except Exception as exc:
                 errors.append(f"Couldn't build the unmixing matrix: {exc}")
         self._cleaned = cleaned
         ok = self.unmixer is not None
         self._update_buttons()
+        self._update_autospectral()
         self._show_status(errors)
         by_path = {r.spec.path: r for r in self.results}
         self.table.blockSignals(True)
@@ -821,6 +837,16 @@ class UnmixingTab(QtWidgets.QWidget):
                 before = np.linalg.cond(np.vstack([r.basic_signature for r in self.results]))
                 lines.append(f"Smart control clean-up: fluor matrix condition number {now:.2f} "
                              f"(plain method {before:.2f}; lower is easier to unmix).")
+            if self.setup.imported is not None:
+                used = sum(r.signature_source == "imported" for r in self.results)
+                extra = len(um.names) - len(self.results) - sum(r.is_autofluorescence for r in um.references)
+                text = (f"Imported AutoSpectral spectra ({self.setup.imported.path.name}): used for {used} "
+                        f"control(s)")
+                if extra > 0:
+                    text += f", plus {extra} fluor(s) without a control here"
+                if len(self.setup.imported.af) and self.setup.autofluorescence:
+                    text += f", and its {len(self.setup.imported.af)} AF spectra"
+                lines.append(text + ".")
             flagged = [r.spec.name for r in self.results if r.flagged]
             if flagged:
                 lines.append(f"<span style='color:#C2412D'>Spectrum check failed for {', '.join(flagged)}: "
@@ -977,6 +1003,58 @@ class UnmixingTab(QtWidgets.QWidget):
             spec.signature_choice = "auto"
             self._mark_changed()
         self.recalculate(rebuild_rows=False)
+
+    def import_spectra(self, path=None):
+        """Unmix with spectra from an AutoSpectral CSV (its table_spectra folder)."""
+        if path is None:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Import AutoSpectral spectra", str(Path.home()), "CSV files (*.csv)")
+            if not path:
+                return False
+        try:
+            spectra = autospectral_io.read_spectra(path)
+            if self.unmixer is not None:
+                spectra.on(self.unmixer.detectors)
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Couldn't import the spectra", str(exc))
+            return False
+        self.setup.imported = spectra
+        self._update_autospectral()
+        self.recalculate()
+        self._mark_changed()
+        return True
+
+    def clear_imported(self):
+        self.setup.imported = None
+        self._update_autospectral()
+        self.recalculate()
+        self._mark_changed()
+
+    def export_autospectral(self, folder=None):
+        """Write the spectra and an AutoSpectral control file for these controls."""
+        if self.unmixer is None:
+            return None
+        if folder is None:
+            folder = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Folder for the AutoSpectral files", str(Path.home()))
+            if not folder:
+                return None
+        try:
+            written = autospectral_io.export(folder, self.specs, self.unmixer, self.results)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(self, "Couldn't write the files", str(exc))
+            return None
+        if not getattr(self, "_quiet", False):
+            QtWidgets.QMessageBox.information(
+                self, "AutoSpectral files written",
+                "Wrote " + ", ".join(p.name for p in written) + f" to\n{folder}\n\n"
+                "The control file names your control files as they are on disk; point AutoSpectral's "
+                "control.dir at the folder that holds them.")
+        return written
+
+    def _update_autospectral(self):
+        self.stop_import.setEnabled(self.setup is not None and self.setup.imported is not None)
+        self.export_as.setEnabled(self.unmixer is not None)
 
     def _comparison_lines(self):
         """Per fluor, the lines the Signatures tab draws behind it: the signature

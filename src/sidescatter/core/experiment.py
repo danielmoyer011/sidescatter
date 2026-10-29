@@ -33,7 +33,7 @@ from pathlib import Path
 import flowio
 import numpy as np
 
-from . import control_cleanup, fcs, fluor_variants, spectral, unmixing
+from . import autospectral_io, control_cleanup, fcs, fluor_variants, spectral, unmixing
 
 RAW, UNMIXED = "Raw", "Unmixed"
 REFERENCE_GROUP, SAMPLES = "Reference Group", "Samples"
@@ -180,6 +180,7 @@ def controls_text(results):
             lines.append(f"  {r.spec.name}: no reference")
             continue
         state = ("used your saved spectrum" if r.signature_source == "library"
+                 else "used the imported AutoSpectral spectrum" if r.signature_source == "imported"
                  else "ok" if r.check.passed else
                  "below threshold, used anyway" if r.spec.signature_choice == "accepted" else "FLAGGED")
         lines.append(f"  {r.spec.name}: {r.check.cosine:.3f} vs {r.check.label} ({state})")
@@ -376,6 +377,8 @@ class Setup:
     cleanup: control_cleanup.Settings = field(default_factory=control_cleanup.Settings)
     # Per-cell fluor variation: off by default (slower and newer).
     variation: fluor_variants.Settings = field(default_factory=fluor_variants.Settings)
+    # Spectra imported from an AutoSpectral CSV, used instead of the controls' when present.
+    imported: autospectral_io.Spectra = None
 
     @property
     def af_settings(self):
@@ -390,6 +393,7 @@ class Setup:
             "af_library_size": self.af_library_size, "af_auto": self.af_auto,
             "clean_controls": self.clean_controls, "cleanup": self.cleanup.to_dict(),
             "variation": self.variation.to_dict(),
+            "imported": None if self.imported is None else self.imported.to_dict(),
             "files": [{"path": str(s.path), "name": s.name, "role": s.role, "carrier": s.carrier,
                        "negative": s.negative, "marker": s.marker, "reasons": list(s.reasons),
                        "guessed_by": s.guessed_by, "af_gates": list(s.af_gates),
@@ -414,4 +418,5 @@ class Setup:
                    d.get("n_autofluorescence", 1), d.get("af_mode", "fluors"),
                    d.get("af_library_size", 30), d.get("af_auto", True), d.get("clean_controls", False),
                    control_cleanup.Settings.from_dict(d.get("cleanup")),
-                   fluor_variants.Settings.from_dict(d.get("variation")))
+                   fluor_variants.Settings.from_dict(d.get("variation")),
+                   autospectral_io.Spectra.from_dict(d["imported"]) if d.get("imported") else None)
