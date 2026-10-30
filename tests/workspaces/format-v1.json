@@ -282,7 +282,10 @@
      ],
      "source": "str"
     }
-   ]
+   ],
+   "variant_channels": "bool",
+   "variant_thresholds": "null",
+   "variants": "null"
   }
  },
  "version": "number",

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import classify, control_cleanup, fcs, spectra_library, spectral
+from . import classify, control_cleanup, fcs, fluor_variants, spectra_library, spectral
 
 
 @dataclass
@@ -189,6 +189,8 @@ class ControlResult:
     check: object = None              # spectra_library.Check, or None with nothing to compare
     measured_signature: np.ndarray = None  # before a library spectrum replaced it
     signature_source: str = "measured"     # "measured" or "library"
+    spectra: np.ndarray = None        # background-subtracted positive events behind the signature
+    variants: np.ndarray = None       # (v, d) per-cell variants of this fluor, when worked out
 
     @property
     def flagged(self):
@@ -269,7 +271,7 @@ def _pick_events(spec, events, in_gate, neg_events, names):
 
 def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None,
                   af_mode="fluors", af_library_size=30, af_auto=True, keep=None, cleanup=None,
-                  library=None, check_spectra=True):
+                  library=None, check_spectra=True, variation=None):
     """Build an Unmixer from control specs.
 
     af_mode: "fluors" (n_autofluorescence AF signatures as extra fluors) or
@@ -279,6 +281,9 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     median(positive) - median(negative) signature.
     library: spectra_library.SpectraLibrary of your saved spectra (None: only
     predicted spectra are used for the check). check_spectra False skips the check.
+    variation: fluor_variants.Settings. Variants are worked out when it is
+    enabled or clean-up is on (for the error hotspot matrix), and used in
+    unmixing only when it is enabled.
 
     Returns (unmixer, results) where results describes how each signature was
     derived so the UI can show it and let the user correct the gates.
@@ -355,7 +360,10 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
         result = ControlResult(spec, basic, names[peak], pos_mask, neg_source, int(pos_mask.sum()),
                                len(neg_events), in_gate,
                                internal_neg if neg_source == "internal" else None)
-        if cleanup is not None:
+        if cleanup is None:
+            bright = control_cleanup.brightest(events[:, peak], pos_mask, 500)
+            result.spectra = events[bright] - np.median(neg_events, axis=0)
+        else:
             unstained_Y = None
             if spec.remove_high_af and spec.carrier == "cells" and cell_unstained is not None:
                 unstained_Y = gated_events(cell_unstained, True)
@@ -373,6 +381,10 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
                 result.measured_signature = result.signature
                 result.signature = spectral.normalise(result.check.reference)
                 result.signature_source = "library"
+        if (variation is not None and variation.enabled) or cleanup is not None:
+            v = variation or fluor_variants.Settings()
+            result.variants = fluor_variants.cached_variants(
+                str(spec.path), result.spectra, result.signature, v.max_variants, v.min_cosine)
         references.append(spectral.Reference(spec.name, result.signature, source=spec.path.name,
                                              marker=spec.marker))
         results.append(result)
@@ -385,7 +397,45 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     if autofluorescence and cell_unstained is not None:
         unstained = [(s, gated_events(s)) for s in specs if s.role == "unstained" and s.carrier == "cells"]
         add_autofluorescence(unmixer, unstained, af_mode, n_autofluorescence, af_library_size, af_auto)
+    if variation is not None and variation.enabled:
+        negatives = gated_events(any_unstained) if any_unstained is not None else None
+        add_variants(unmixer, results, negatives, variation.channels)
     return unmixer, results
+
+
+def add_variants(unmixer, results, negatives=None, channels=False, max_events=20_000):
+    """Give the unmixer each fluor's variants and the abundance above which a cell uses them.
+
+    negatives: unstained events; a fluor's threshold is 3 x its spread on them
+    (0, meaning every cell with any of it, without unstained events).
+    """
+    thresholds = np.zeros(len(unmixer.references))
+    if negatives is not None and len(negatives):
+        if len(negatives) > max_events:
+            rows = np.sort(np.random.default_rng(0).choice(len(negatives), max_events, replace=False))
+            negatives = negatives[rows]
+        A = unmixer.unmix(negatives)   # still without variants
+        thresholds = fluor_variants.positive_threshold(
+            spectral.robust_sd(A[:, :len(unmixer.references)]))
+    by_name = {r.spec.name: r for r in results}
+    empty = np.empty((0, len(unmixer.detectors)))
+    unmixer.variants = [empty if ref.is_autofluorescence or getattr(by_name.get(ref.name), "variants", None)
+                        is None else by_name[ref.name].variants for ref in unmixer.references]
+    unmixer.variant_thresholds = thresholds
+    unmixer.variant_channels = channels
+    return unmixer
+
+
+def variant_hotspots(unmixer, results):
+    """fluor_variants.hotspots for the fluors that have variants: (names, matrix) or None."""
+    by_name = {r.spec.name: r for r in results}
+    names = [r.name for r in unmixer.references if not r.is_autofluorescence]
+    sets = [by_name[n].variants if n in by_name and by_name[n].variants is not None
+            else np.empty((0, len(unmixer.detectors))) for n in names]
+    if not any(len(v) for v in sets):
+        return None
+    M = np.vstack([r.signature for r in unmixer.references if not r.is_autofluorescence])
+    return names, fluor_variants.hotspots(M, names, sets)
 
 
 def _clean_signature(result, spec, events, peak, masks, cleanup, xy, neg_events, neg_xy,
@@ -426,6 +476,7 @@ def _clean_signature(result, spec, events, peak, masks, cleanup, xy, neg_events,
         info["background"] = f"median of {result.negative_source}"
     info["used"] = int(used.sum())
     result.basic_signature = result.signature
+    result.spectra = events[used] - background
     result.signature = control_cleanup.signature(events[used], background)
     result.used_mask = used
     result.cleanup = info
@@ -542,6 +593,8 @@ def unmixed_events(sample, unmixer, keep_autofluorescence=True, af_source=None, 
               if keep_autofluorescence or not r.is_autofluorescence]
     if unmixer.per_cell_af and keep_autofluorescence:
         fluors.append(len(unmixer.references))  # AF Index
+    n_base = len(unmixer.references) + int(unmixer.per_cell_af)
+    fluors += range(n_base, len(unmixer.output_names))  # fluor Variant channels, if any
     if af_source == "shared":
         af_source = None
     labels = unmixer.channel_labels()
@@ -565,6 +618,8 @@ def unmixed_events(sample, unmixer, keep_autofluorescence=True, af_source=None, 
     meta["SIDESCATTER_UNMIXING"] = f"{unmixer.method.upper()}, {len(unmixer.references)} components"
     if unmixer.per_cell_af:
         meta["SIDESCATTER_UNMIXING"] += f", per-cell AF from {len(unmixer.af_library)} spectra"
+    if unmixer.per_cell_variants:
+        meta["SIDESCATTER_UNMIXING"] += ", per-cell fluor variation"
     return out, pnn, pns, ranges, meta
 
 

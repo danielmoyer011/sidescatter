@@ -351,3 +351,19 @@ def test_smart_control_cleanup_and_spectrum_check(qtbot):
     tab.smart_check.setChecked(False)
     assert all(r.cleanup is None for r in tab.results)
     assert not tab.smart_btn.isEnabled()
+
+
+def test_per_cell_fluor_variation_and_hotspots(qtbot):
+    tab = UnmixingTab(Workspace())
+    qtbot.addWidget(tab)
+    tab.add_files(_demo_files())
+    wait_idle()
+    assert not tab.setup.variation.enabled and not tab.unmixer.per_cell_variants
+    assert tab.hot_table.rowCount() == len([r for r in tab.unmixer.references if not r.is_autofluorescence])
+    tab.variation_check.setChecked(True)
+    assert tab.unmixer.per_cell_variants and tab.setup.to_dict()["variation"]["enabled"]
+    assert "is on" in tab.hot_hint.text()
+    tab.preview_sample.setCurrentIndex(0)
+    tab._draw_preview()
+    tab.smart_check.setChecked(False)
+    assert tab.smart_btn.isEnabled()   # still has the variation settings

@@ -318,6 +318,13 @@ class Unmixer:
     # the AF-A channel and an extra AF Index channel says which entry matched.
     af_library: np.ndarray = None
     af_sources: list = None  # file each library entry came from
+    # Per-cell fluor variation (fluor_variants): per reference, its (v, d)
+    # variant spectra (empty for autofluorescence), and the abundance above
+    # which a cell's variant is chosen. variant_channels adds one "<fluor>
+    # Variant" channel per fluor saying which variant each cell used (0: none).
+    variants: list = None
+    variant_thresholds: np.ndarray = None
+    variant_channels: bool = False
 
     @property
     def names(self):
@@ -328,9 +335,24 @@ class Unmixer:
         return self.af_library is not None
 
     @property
+    def per_cell_variants(self):
+        return self.variants is not None and any(len(v) for v in self.variants)
+
+    def _variant_refs(self):
+        """Indices of the references that can have variants (all but per-cell AF's)."""
+        return [i for i, r in enumerate(self.references)
+                if not (self.per_cell_af and r.is_autofluorescence)]
+
+    def _variant_names(self):
+        if not (self.per_cell_variants and self.variant_channels):
+            return []
+        return [f"{self.references[i].name} Variant" for i in self._variant_refs()
+                if not self.references[i].is_autofluorescence]
+
+    @property
     def output_names(self):
         """Names of the columns unmix() returns."""
-        return self.names + (["AF Index"] if self.per_cell_af else [])
+        return self.names + (["AF Index"] if self.per_cell_af else []) + self._variant_names()
 
     def af_allowed(self, af_source=None):
         """Library entries a sample may use: all of them, or those from one unstained file."""
@@ -359,6 +381,7 @@ class Unmixer:
             labels.append((pnn, pns))
         if self.per_cell_af:
             labels.append(("AF Index", "AF library entry"))
+        labels += [(n, "fluor variant") for n in self._variant_names()]
         return labels
 
     @property
@@ -385,9 +408,39 @@ class Unmixer:
         else:
             M = self.matrix
             A = unmix_wls(Y, M, self.background_var) if self.method == "wls" else unmix_ols(Y, M)
+        if self.per_cell_variants:
+            A = self._apply_variants(Y, A)
         if self.fine_tune is not None:
             n = len(self.references)
             A[:, :n] = apply_fine_tune(A[:, :n], self.fine_tune)
+        return A
+
+    def _apply_variants(self, Y, A):
+        """Per-cell fluor variants on top of the plain abundances A (see fluor_variants.refine)."""
+        from . import fluor_variants
+
+        Y = np.asarray(Y, dtype=np.float64)
+        cols = self._variant_refs()
+        M = self.matrix[cols]
+        fixed = None
+        if self.per_cell_af:
+            af_col = next(i for i, r in enumerate(self.references) if r.is_autofluorescence)
+            index = A[:, len(self.references)].astype(int)
+            spectra = np.vstack([np.zeros(self.af_library.shape[1]), self.af_library])[index]
+            fixed = A[:, [af_col]] * spectra
+
+        def unmix_fn(R):
+            if self.method == "wls":
+                return unmix_wls(R, M, self.background_var, weights_from=Y)
+            return unmix_ols(R, M)
+
+        sets = [np.asarray(self.variants[i]) for i in cols]
+        thresholds = (np.zeros(len(cols)) if self.variant_thresholds is None
+                      else np.asarray(self.variant_thresholds, dtype=float)[cols])
+        A, chosen = fluor_variants.refine(Y, A, M, cols, sets, thresholds, unmix_fn, fixed)
+        if self.variant_channels:
+            keep = [k for k, i in enumerate(cols) if not self.references[i].is_autofluorescence]
+            A = np.hstack([A, chosen[:, keep].astype(np.float64)])
         return A
 
     def reconstruct(self, A):
@@ -397,7 +450,7 @@ class Unmixer:
             return A[:, :n] @ self.matrix
         fluor = [i for i, r in enumerate(self.references) if not r.is_autofluorescence]
         af_col = next(i for i, r in enumerate(self.references) if r.is_autofluorescence)
-        index = A[:, -1].astype(int)
+        index = A[:, n].astype(int)
         spectra = np.vstack([np.zeros(self.af_library.shape[1]), self.af_library])[index]
         return A[:, fluor] @ self.matrix[fluor] + A[:, [af_col]] * spectra
 
@@ -422,6 +475,11 @@ class Unmixer:
             "channel_style": self.channel_style,
             "af_library": None if self.af_library is None else np.asarray(self.af_library).tolist(),
             "af_sources": self.af_sources,
+            "variants": None if self.variants is None
+            else [np.asarray(v).tolist() for v in self.variants],
+            "variant_thresholds": None if self.variant_thresholds is None
+            else np.asarray(self.variant_thresholds).tolist(),
+            "variant_channels": self.variant_channels,
         }
 
     @classmethod
@@ -441,4 +499,9 @@ class Unmixer:
             channel_style=d.get("channel_style", "name"),
             af_library=None if d.get("af_library") is None else np.asarray(d["af_library"]),
             af_sources=d.get("af_sources"),
+            variants=None if d.get("variants") is None
+            else [np.asarray(v, dtype=float).reshape(-1, len(d["detectors"])) for v in d["variants"]],
+            variant_thresholds=None if d.get("variant_thresholds") is None
+            else np.asarray(d["variant_thresholds"]),
+            variant_channels=d.get("variant_channels", False),
         )
