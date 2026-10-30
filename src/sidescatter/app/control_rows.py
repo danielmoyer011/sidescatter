@@ -12,7 +12,7 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtWidgets
 
-from ..core import fcs, spectrum, unmixing
+from ..core import fcs, spectral, spectrum, unmixing
 from . import theme
 from .axes import _si_label, to_raw
 from .spectrum_plot import PSEUDOCOLOR, IntensityAxis, SpectrumPlot, _plot, subsample
@@ -285,6 +285,13 @@ class ControlRow(QtWidgets.QFrame):
         self.use_saved.setVisible(failed and choice == "auto" and check.kind == "saved")
         self.use_measured.setVisible(check is not None and choice in ("accepted", "library")
                                      and (failed or choice == "library"))
+        if r is not None and r.signature_source == "imported":
+            measured = ""
+            if r.measured_signature is not None:
+                cos = spectral.cosine(r.signature[None], r.measured_signature[None])[0, 0]
+                measured = f" The one measured here has cosine {cos:.2f} to it."
+            self.check_label.setText(f"Using the imported AutoSpectral spectrum.{measured}")
+            return
         if check is None:
             self.check_label.setText("Spectrum check: no reference for this fluor yet. "
                                      "Save a good control to your library to check later ones."

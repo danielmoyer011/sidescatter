@@ -367,3 +367,21 @@ def test_per_cell_fluor_variation_and_hotspots(qtbot):
     tab._draw_preview()
     tab.smart_check.setChecked(False)
     assert tab.smart_btn.isEnabled()   # still has the variation settings
+
+
+def test_autospectral_files_in_the_tab(qtbot, tmp_path):
+    tab = UnmixingTab(Workspace())
+    qtbot.addWidget(tab)
+    tab.add_files(_demo_files())
+    wait_idle()
+    assert not tab.stop_import.isEnabled() and tab.export_as.isEnabled()
+    tab._quiet = True
+    written = tab.export_autospectral(tmp_path / "as")
+    assert len(written) == 3
+    assert tab.import_spectra(str(written[0]))
+    assert tab.setup.imported is not None and tab.stop_import.isEnabled()
+    assert "Imported AutoSpectral spectra" in tab.status.text()
+    assert all(r.signature_source == "imported" for r in tab.results)
+    tab.clear_imported()
+    assert tab.setup.imported is None
+    assert all(r.signature_source != "imported" for r in tab.results)

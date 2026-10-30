@@ -271,7 +271,7 @@ def _pick_events(spec, events, in_gate, neg_events, names):
 
 def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None,
                   af_mode="fluors", af_library_size=30, af_auto=True, keep=None, cleanup=None,
-                  library=None, check_spectra=True, variation=None):
+                  library=None, check_spectra=True, variation=None, imported=None):
     """Build an Unmixer from control specs.
 
     af_mode: "fluors" (n_autofluorescence AF signatures as extra fluors) or
@@ -284,6 +284,9 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     variation: fluor_variants.Settings. Variants are worked out when it is
     enabled or clean-up is on (for the error hotspot matrix), and used in
     unmixing only when it is enabled.
+    imported: autospectral_io.Spectra. Its spectra replace the signatures of
+    the controls with the same fluor name, fluors it has without a control
+    are added, and its autofluorescence rows replace the automatic AF.
 
     Returns (unmixer, results) where results describes how each signature was
     derived so the UI can show it and let the user correct the gates.
@@ -381,6 +384,13 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
                 result.measured_signature = result.signature
                 result.signature = spectral.normalise(result.check.reference)
                 result.signature_source = "library"
+        if imported is not None:
+            sig = imported.on(names).signature(spec.name)
+            if sig is not None:
+                if result.measured_signature is None:
+                    result.measured_signature = result.signature
+                result.signature = sig
+                result.signature_source = "imported"
         if (variation is not None and variation.enabled) or cleanup is not None:
             v = variation or fluor_variants.Settings()
             result.variants = fluor_variants.cached_variants(
@@ -389,6 +399,12 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
                                              marker=spec.marker))
         results.append(result)
 
+    if imported is not None:
+        mine = imported.on(names)
+        have = {_key(r.name) for r in references}
+        for name, sig in zip(mine.names, mine.fluors):
+            if _key(name) not in have:
+                references.append(spectral.Reference(name, sig, source=mine.path.name))
     background_var = None
     any_unstained = cell_unstained or next((s for s in specs if s.role == "unstained"), None)
     if any_unstained is not None:
@@ -397,10 +413,28 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     if autofluorescence and cell_unstained is not None:
         unstained = [(s, gated_events(s)) for s in specs if s.role == "unstained" and s.carrier == "cells"]
         add_autofluorescence(unmixer, unstained, af_mode, n_autofluorescence, af_library_size, af_auto)
+        if imported is not None and len(imported.af):
+            _use_imported_af(unmixer, imported.on(names), af_mode)
     if variation is not None and variation.enabled:
         negatives = gated_events(any_unstained) if any_unstained is not None else None
         add_variants(unmixer, results, negatives, variation.channels)
     return unmixer, results
+
+
+def _key(name):
+    return re.sub(r"[\s\-_.]", "", name).upper()
+
+
+def _use_imported_af(unmixer, imported, mode):
+    """Replace the automatic autofluorescence with an imported file's AF spectra."""
+    if mode == "per_cell":
+        unmixer.af_library = np.array(imported.af)
+        unmixer.af_sources = [str(imported.path)] * len(imported.af)
+        return
+    unmixer.references = [r for r in unmixer.references if not r.is_autofluorescence]
+    for i, sig in enumerate(imported.af):
+        label = "Autofluorescence" if len(imported.af) == 1 else f"Autofluorescence {i + 1}"
+        unmixer.references.append(spectral.Reference(label, sig, True, imported.path.name))
 
 
 def add_variants(unmixer, results, negatives=None, channels=False, max_events=20_000):
