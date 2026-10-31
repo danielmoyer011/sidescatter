@@ -26,6 +26,7 @@ from .jobs import manager as jobs, run_job
 from .graph_view import BINS, CLOSE_PEN, DRAW_PEN, GATE_PEN, PSEUDOCOLOR, SNAP_FILL, SNAP_RADIUS_PX
 from .spectrum_plot import SignaturesView
 from . import qc_report
+from .task_area import show_unreadable
 
 COLS = ["File", "Role", "Fluor", "Marker", "Negative / AF", "Peak", "Positives", "Why"]
 C_FILE, C_ROLE, C_FLUOR, C_MARKER, C_NEG, C_PEAK, C_POS, C_WHY = range(len(COLS))
@@ -490,8 +491,10 @@ class UnmixingTab(QtWidgets.QWidget):
                 job.progress(i / len(to_read), f"Reading {p.name}")
                 try:
                     loaded[p] = fcs.load_sample(p)
-                except (OSError, ValueError):
-                    bad.append(p.name)
+                except fcs.UnreadableFCS as e:
+                    bad.append((p.name, e.reason))
+                except (OSError, ValueError) as e:
+                    bad.append((p.name, f"couldn't be read ({e})"))
             return loaded, bad
 
         def done(out):
@@ -504,9 +507,7 @@ class UnmixingTab(QtWidgets.QWidget):
                 self._fill_table()
                 self.recalculate()
             self._mark_changed()
-            if bad:
-                QtWidgets.QMessageBox.warning(
-                    self, "Couldn't read files", f"Couldn't read {len(bad)} file(s):\n\n" + "\n".join(bad[:10]))
+            show_unreadable(self, bad, len(loaded))
 
         self.loading = run_job(f"Reading {len(new)} file{'s' if len(new) > 1 else ''}", work, on_done=done)
         return skipped

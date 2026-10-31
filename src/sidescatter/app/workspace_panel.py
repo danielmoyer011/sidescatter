@@ -170,6 +170,10 @@ class WorkspacePanel(QtWidgets.QWidget):
             font = item.font(0)
             font.setWeight(QtGui.QFont.DemiBold)
             item.setFont(0, font)
+            problems = getattr(self.ws.samples[sid], "load_warnings", None)
+            if problems:  # the file opened, but something about it looked wrong
+                item.setIcon(0, self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxWarning))
+                item.setToolTip(0, "This file opened with a warning:\n\n" + "\n\n".join(problems))
             self.tree.addTopLevelItem(item)
             self._add_children(item, sid, ROOT)
         group = self.current_group()
