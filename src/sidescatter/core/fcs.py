@@ -2,6 +2,7 @@
 
 import io
 import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,25 +76,26 @@ def find_fcs_files(paths):
     return unique, skipped
 
 
-def load_sample(path_or_data, sample_id=None, channel_labels=None, pns_labels=None, keywords=None):
+def load_sample(path_or_data, sample_id=None, channel_labels=None, pns_labels=None, keywords=None,
+                ranges=None, keep_spillover=False):
     """Load an FCS file (or an events array with channel_labels) as a FlowKit Sample.
 
     Full-resolution events are kept; subsampling is only used for plotting.
     An array goes through an in-memory FCS file, which keeps $PnS descriptions
     and keywords and avoids FlowKit's slow list conversion.
+
+    Files are checked first (see read_fcs): one that can't be read raises
+    UnreadableFCS saying why in plain words, and one that reads but looks wrong
+    gets its warnings in sample.load_warnings.
     """
     if isinstance(path_or_data, (str, Path)):
-        path = Path(path_or_data)
-        return fk.Sample(
-            str(path),
-            sample_id=sample_id or path.name,
-            ignore_offset_error=True,
-            subsample=20000,
-        )
+        return read_fcs(path_or_data, sample_id)
     fh = io.BytesIO()
-    write_fcs(fh, path_or_data, channel_labels, pns_labels, keywords)
+    write_fcs(fh, path_or_data, channel_labels, pns_labels, keywords, ranges, keep_spillover)
     fh.seek(0)
-    return fk.Sample(fh, sample_id=sample_id, subsample=20000)
+    sample = fk.Sample(fh, sample_id=sample_id, subsample=20000)
+    sample.load_warnings = []
+    return sample
 
 
 def channels(sample):
@@ -193,12 +195,13 @@ _LAYOUT_KEYWORDS = re.compile(
 _BLOCK = 100_000
 
 
-def write_fcs(target, events, pnn, pns=None, keywords=None, ranges=None):
+def write_fcs(target, events, pnn, pns=None, keywords=None, ranges=None, keep_spillover=False):
     """Write an FCS 3.1 file of 32-bit float events.
 
     target: a path or a binary file handle. keywords: extra TEXT keywords
     (for example the source file's $DATE and $CYT); layout keywords in it are
-    ignored. ranges: optional $PnR per channel (default 262144).
+    ignored, and so is any spillover matrix unless keep_spillover (it describes
+    the source file's detectors). ranges: optional $PnR per channel (default 262144).
     Events are written in blocks, so a large array is never copied whole.
     """
     events = np.asarray(events)
@@ -212,7 +215,8 @@ def write_fcs(target, events, pnn, pns=None, keywords=None, ranges=None):
     for key, value in (keywords or {}).items():
         key = str(key).upper()
         key = key if key.startswith("$") or not _is_standard(key) else "$" + key
-        if not _LAYOUT_KEYWORDS.match(key) and str(value) != "":
+        spill = keep_spillover and key.lstrip("$") in ("SPILL", "SPILLOVER")
+        if (spill or not _LAYOUT_KEYWORDS.match(key)) and str(value) != "":
             text[key] = str(value)
     for i in range(k):
         text[f"$P{i + 1}N"] = pnn[i]
@@ -265,3 +269,241 @@ _STANDARD = {"DATE", "CYT", "CYTSN", "BTIM", "ETIM", "TIMESTEP", "OP", "SRC", "S
 def _is_standard(key):
     """FlowKit drops the '$' from keywords; put it back on the standard FCS ones."""
     return key in _STANDARD or bool(re.match(r"^P\d+[A-Z]+$", key))
+
+
+# ----- reading odd and broken files ------------------------------------------
+#
+# FlowKit reads well-formed files. Before handing a file over, read_fcs checks
+# its header and keywords (cheap: the events aren't read), so a broken file is
+# refused with a reason a person can act on, and the quirks real instruments
+# produce are worked around. tests/data/fcs_corpus has one file per quirk.
+
+
+class UnreadableFCS(ValueError):
+    """An FCS file Sidescatter can't read. The message says why, in plain words."""
+
+    def __init__(self, path, reason):
+        self.path, self.reason = Path(path), reason
+        super().__init__(f"{Path(path).name}: {reason}")
+
+
+_RESOURCE_FORK = b"\x00\x05\x16\x07"
+
+
+def read_fcs(path, sample_id=None):
+    path = Path(path)
+    info = inspect_fcs(path)
+    if info["fallback"]:
+        sample = _decode(path, info, sample_id or path.name)
+    else:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # quirks are reported in load_warnings instead
+                sample = fk.Sample(str(path), sample_id=sample_id or path.name, ignore_offset_error=True,
+                                   ignore_offset_discrepancy=info["offsets_only_in_text"], subsample=20000)
+        except Exception:  # noqa: BLE001 - anything FlowKit trips on, read it ourselves
+            sample = _decode(path, info, sample_id or path.name)
+    sample.load_warnings = info["warnings"]
+    return sample
+
+
+def inspect_fcs(path):
+    """Check an FCS file's header and keywords without reading its events.
+
+    Raises UnreadableFCS for a file that can't be read. Otherwise returns what
+    reading it needs: the keywords, where the events are, warnings for the
+    user, and whether FlowKit can read it as it is ("fallback" if not).
+    """
+    path = Path(path)
+    size = path.stat().st_size
+    if size == 0:
+        raise UnreadableFCS(path, "the file is empty (0 bytes), probably an interrupted copy")
+    with open(path, "rb") as fh:
+        head = fh.read(58)
+        if head.startswith(_RESOURCE_FORK) or (path.name.startswith("._") and not head.startswith(b"FCS")):
+            raise UnreadableFCS(path, "not an FCS file: it's a hidden \"._\" file macOS makes when "
+                                      "copying to a USB stick or network drive. The real file has the "
+                                      "same name without \"._\".")
+        if not re.match(rb"FCS\d\.\d", head):
+            raise UnreadableFCS(path, "not an FCS file (it doesn't start with an FCS header)")
+        if len(head) < 58:
+            raise UnreadableFCS(path, "the file ends before its header does, probably an interrupted copy")
+        try:
+            offsets = [int(head[10 + 8 * i:18 + 8 * i].strip() or 0) for i in range(6)]
+        except ValueError:
+            raise UnreadableFCS(path, "the file's header is damaged") from None
+        text_start, text_end = offsets[0], offsets[1]
+        if text_end >= size:
+            raise UnreadableFCS(path, f"the file ends {_size(text_end + 1 - size)} early, before its "
+                                      "keywords do: probably an interrupted copy or download")
+        fh.seek(text_start)
+        text = parse_text(fh.read(text_end - text_start + 1))
+
+    version = head[3:6].decode()
+    for key in ("PAR", "TOT", "DATATYPE"):
+        if key not in text:
+            raise UnreadableFCS(path, f"the file is missing the ${key} keyword, so its events can't be read")
+    try:
+        par, tot = int(text["PAR"]), int(text["TOT"])
+    except ValueError:
+        raise UnreadableFCS(path, "the file's $PAR or $TOT keyword isn't a number") from None
+    if tot == 0:
+        raise UnreadableFCS(path, "the file contains no events")
+    datatype = text["DATATYPE"].upper()
+    if datatype == "A":
+        raise UnreadableFCS(path, "the events are stored as ASCII text, an old format Sidescatter can't "
+                                  "read yet")
+    if datatype not in ("I", "F", "D"):
+        raise UnreadableFCS(path, f"unknown event data type \"{datatype}\"")
+    bits = []
+    for i in range(1, par + 1):
+        try:
+            bits.append(int(text.get(f"P{i}B", "0")))
+        except ValueError:
+            bits.append(0)
+    allowed = {"I": (8, 16, 32), "F": (32,), "D": (64,)}[datatype]
+    odd = sorted({b for b in bits if b not in allowed})
+    if odd:
+        raise UnreadableFCS(path, f"the events are stored as {odd[0]}-bit values, which Sidescatter "
+                                  "can't read yet")
+
+    begin = int(text.get("BEGINDATA", "0") or 0) or offsets[2]
+    end = int(text.get("ENDDATA", "0") or 0) or offsets[3]
+    expected = tot * sum(bits) // 8
+    if size - begin < expected:
+        raise UnreadableFCS(path, f"the file ends {_size(expected - (size - begin))} early: probably an "
+                                  "interrupted copy or download")
+
+    warn, fallback = [], False
+    names = [text.get(f"P{i}N", f"P{i}") for i in range(1, par + 1)]
+    if end - begin + 1 != expected:
+        if end - begin + 1 != expected + 1:  # one byte over is common, and FlowKit handles it
+            fallback = True
+        warn.append("The file's data offsets are slightly off (a known instrument quirk); "
+                    f"Sidescatter read the {tot:,} events it says it has. Check them before trusting it.")
+    if int(text.get("NEXTDATA", "0") or 0):
+        fallback = True
+        warn.append("The file holds more than one dataset; only the first is loaded.")
+    if "MODE" not in text or any(f"P{i}R" not in text for i in range(1, par + 1)):
+        fallback = True  # FCS 3.2 dropped $MODE; some writers leave out $PnR
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        fallback = True
+        warn.append("Several channels have the same name ("
+                    + ", ".join(dupes) + "); the later ones are shown as e.g. "
+                    + f"\"{dupes[0]} (2)\".")
+    spill = _spill_keyword(text)
+    if spill is not None:
+        spill_names = _spill_names(text[spill])
+        missing = [n for n in spill_names if n not in names]
+        if spill_names is None or missing:
+            fallback = True
+            text.pop(spill)
+            warn.append("The spillover matrix names channels that aren't in the file ("
+                        + ", ".join((missing or ["unreadable"])[:4])
+                        + "), so it can't be used: the file opens uncompensated.")
+    return {"version": version, "text": text, "begin": begin, "par": par, "tot": tot, "bits": bits,
+            "datatype": datatype, "names": names, "warnings": warn, "fallback": fallback,
+            "offsets_only_in_text": offsets[2] == 0 and begin != 0}
+
+
+def parse_text(raw):
+    """The TEXT segment's keywords, upper-case and without "$". The first byte is
+    the delimiter; a doubled delimiter inside a value stands for itself."""
+    try:
+        s = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        s = raw.decode("latin-1")  # older instruments write their local code page
+    if not s:
+        return {}
+    d, out, buf, i = s[0], [], [], 1
+    while i < len(s):
+        c = s[i]
+        if c == d:
+            if i + 1 < len(s) and s[i + 1] == d and buf:  # escaped (keywords and values are never empty)
+                buf.append(d)
+                i += 2
+                continue
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+        i += 1
+    if buf and "".join(buf).strip(" \x00\r\n"):
+        out.append("".join(buf))
+    return {k.strip().upper().lstrip("$"): v for k, v in zip(out[::2], out[1::2])}
+
+
+def _spill_keyword(text):
+    for key in ("SPILLOVER", "SPILL", "$SPILLOVER", "$SPILL", "spillover", "spill", "$spillover", "$spill"):
+        if key in text:
+            return key
+    return None
+
+
+def _spill_names(value):
+    parts = [p.strip() for p in str(value).split(",")]
+    try:
+        n = int(parts[0])
+    except (ValueError, IndexError):
+        return None
+    return parts[1:n + 1] if len(parts) >= 1 + n + n * n else None
+
+
+def _decode(path, info, sample_id):
+    """Read the events ourselves, for files FlowKit can't take as they are."""
+    text, par, tot = info["text"], info["par"], info["tot"]
+    order = text.get("BYTEORD", "1,2,3,4").replace(" ", "")
+    endian = ">" if order.startswith(("4,3", "2,1", "8,7")) else "<"
+    bits = info["bits"]
+    if info["datatype"] == "I" and len(set(bits)) > 1:
+        raise UnreadableFCS(path, "the events mix integer sizes in a way Sidescatter can't read yet")
+    kind = {"I": "u", "F": "f", "D": "f"}[info["datatype"]]
+    dtype = np.dtype(f"{endian}{kind}{bits[0] // 8}")
+    events = np.fromfile(path, dtype=dtype, count=tot * par, offset=info["begin"]).reshape(tot, par)
+    events = events.astype(np.float64)
+
+    ranges = []
+    for i in range(par):
+        try:
+            r = float(text.get(f"P{i + 1}R", "0"))
+        except ValueError:
+            r = 0.0
+        if r <= 0:
+            r = float(2 ** bits[i]) if kind == "u" else 262144.0
+        ranges.append(r)
+        if kind == "u" and 2 ** bits[i] > r:  # FCS: bits above the range are ignored
+            events[:, i] = events[:, i].astype(np.uint64) & (int(2 ** np.ceil(np.log2(r))) - 1)
+        decades, log0 = _pne(text.get(f"P{i + 1}E", "0,0"))
+        if decades > 0:
+            events[:, i] = 10 ** (decades * events[:, i] / r) * (log0 or 1.0)
+        try:
+            gain = float(text.get(f"P{i + 1}G", "1") or 1)
+        except ValueError:
+            gain = 1.0
+        if gain not in (0.0, 1.0):
+            events[:, i] /= gain
+
+    names, seen = [], {}
+    for n in info["names"]:
+        seen[n] = seen.get(n, 0) + 1
+        names.append(n if seen[n] == 1 else f"{n} ({seen[n]})")
+    pns = [text.get(f"P{i}S", "") for i in range(1, par + 1)]
+    keywords = {k: v for k, v in text.items() if not re.match(r"^(P\d+[A-Z]|NEXTDATA)", k)}
+    return load_sample(events, sample_id, names, pns, keywords, ranges,
+                       keep_spillover=_spill_keyword(text) is not None)
+
+
+def _pne(value):
+    try:
+        a, b = (float(x) for x in str(value).split(",")[:2])
+        return a, b
+    except ValueError:
+        return 0.0, 0.0
+
+
+def _size(n):
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:,.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024

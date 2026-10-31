@@ -224,6 +224,23 @@ def show_failure(job, parent=None):
     manager().dismiss(job)
 
 
+def show_unreadable(parent, failures, added=0):
+    """Files that couldn't be read, each with its reason, after the rest were added.
+    failures: [(file name, reason)]."""
+    if not failures:
+        return
+    n = len(failures)
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(QtWidgets.QMessageBox.Warning)
+    box.setWindowTitle("Couldn't read files")
+    box.setText(f"<b>Couldn't read {n} file{'s' if n != 1 else ''}.</b>"
+                + (f" The other {added} {'were' if added != 1 else 'was'} added." if added else ""))
+    shown = failures[:12]
+    box.setInformativeText("\n\n".join(f"{name}: {reason}" for name, reason in shown)
+                           + (f"\n\n… and {n - len(shown)} more" if n > len(shown) else ""))
+    box.exec()
+
+
 def failure_text(job):
     return f"{job.title} failed: {job.text}\n\n{job.details}".strip()
 
