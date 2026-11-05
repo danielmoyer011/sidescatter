@@ -40,6 +40,10 @@
    }
   }
  ],
+ "comp_matrices": {
+  "{map}": {}
+ },
+ "custom_gates": [],
  "experiments": [
   {
    "af_auto": "bool",

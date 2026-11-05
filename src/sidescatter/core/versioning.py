@@ -59,7 +59,7 @@ def upgrade(doc):
 
 # Dicts at these places are keyed by data (sample ids, channel names...), not
 # by field names, so the fingerprint merges their values.
-_MAPS = {"transforms", "groups", "unmixers", "qc", "peaks", "margin_counts"}
+_MAPS = {"transforms", "groups", "unmixers", "qc", "peaks", "margin_counts", "comp_matrices"}
 
 
 def shape(value, key=""):

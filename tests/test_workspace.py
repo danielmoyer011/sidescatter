@@ -123,3 +123,20 @@ def test_flowjo_import_counts_close_to_flowjo(eight_color):
             assert abs(ours - fj) <= tolerance, (sid, parent, name, ours, fj)
             checked += 1
     assert checked >= 40
+
+
+def test_flowjo_import_survives_save_and_reopen(eight_color, tmp_path):
+    """The imported gates' compensation matrix and per-sample gates are saved too."""
+    ws = Workspace.from_flowjo(eight_color / "8_color_ICS.wsp", eight_color / "fcs_files")
+    custom = {(n, p): set(ws.strategy._get_gate_node(n, p).custom_gates)
+              for n, p in ws.population_paths()}
+    assert any(custom.values())  # this workspace has gates edited for single samples
+    before = {(s, n, p): ws.count(s, n, p) for s in ws.samples for n, p in ws.population_paths()}
+
+    ws.save(tmp_path / "imported.ssw")
+    back = Workspace.load(tmp_path / "imported.ssw", search_dirs=[eight_color / "fcs_files"])
+    assert set(back.strategy.comp_matrices) == set(ws.strategy.comp_matrices)
+    assert {(n, p): set(back.strategy._get_gate_node(n, p).custom_gates)
+            for n, p in back.population_paths()} == custom
+    assert {(s, n, p): back.count(s, n, p) for s in back.samples
+            for n, p in back.population_paths()} == before

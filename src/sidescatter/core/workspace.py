@@ -985,6 +985,10 @@ class Workspace:
             "transforms": {k: serialize.transform_to_dict(v)
                            for k, v in self.strategy.transformations.items()},
             "gates": [_gate_dict(self.get_gate(n, p), p) for n, p in self.population_paths()],
+            # Per-sample versions of a gate (FlowJo workspaces have them), and the
+            # compensation matrices imported gates refer to by name.
+            "custom_gates": self._custom_gate_dicts(),
+            "comp_matrices": {k: _matrix_dict(m) for k, m in self.strategy.comp_matrices.items()},
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
             "layouts": [lay.to_dict() for lay in self.layouts],
             "experiments": self.experiments,
@@ -992,6 +996,16 @@ class Workspace:
             "qc_settings": self.qc_settings.to_dict(),
             "analyses": [a.to_dict() for a in self.analyses],
         })
+
+    def _custom_gate_dicts(self):
+        out = []
+        for name, parent in self.population_paths():
+            node = self.strategy._get_gate_node(name, parent)
+            for sid, gate in node.custom_gates.items():
+                if isinstance(gate, (QCGate, fk.gates.Quadrant)):
+                    continue  # QC masks are rebuilt from ws.qc; quadrants go with their gate
+                out.append({"sample_id": sid, "gate": serialize.gate_to_dict(gate, parent)})
+        return out
 
     @classmethod
     def load(cls, path, search_dirs=(), progress=None):
@@ -1007,6 +1021,9 @@ class Workspace:
         ws.upgraded_from = saved_as if saved_as != doc["version"] else None
         for name, d in doc["transforms"].items():
             ws.strategy.add_transform(name, serialize.transform_from_dict(d))
+        for name, d in doc.get("comp_matrices", {}).items():
+            ws.strategy.add_comp_matrix(name, fk.Matrix(np.asarray(d["matrix"], dtype=float),
+                                                        d["detectors"], d.get("fluorochromes")))
         ws.unmixers = {k: Unmixer.from_dict(v) for k, v in doc["unmixers"].items()}
         dirs = [Path(path).parent, *map(Path, search_dirs)]
         groups = {k: list(v) for k, v in doc["groups"].items()}
@@ -1054,6 +1071,11 @@ class Workspace:
                 ws.strategy.add_gate(QCGate(g["name"]), ROOT)
             else:
                 ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]))
+        for c in doc.get("custom_gates", []):
+            g = c["gate"]
+            if c["sample_id"] in ws.samples or c["sample_id"] in ws.missing:
+                ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]),
+                                     sample_id=c["sample_id"])
         ws.layouts = [Layout.from_dict(d) for d in doc.get("layouts", [])]
         ws.qc_settings = cleaning.Settings.from_dict(doc.get("qc_settings", {}))
         ws.qc = {sid: cleaning.Result.from_dict(r) for sid, r in qc.items() if sid in ws.samples}
@@ -1209,6 +1231,11 @@ def _gate_dict(gate, parent_path):
     if isinstance(gate, QCGate):
         return {"name": gate.gate_name, "parent_path": list(parent_path), "type": "QCGate"}
     return serialize.gate_to_dict(gate, parent_path)
+
+
+def _matrix_dict(m):
+    return {"matrix": np.asarray(m.matrix, dtype=float).tolist(), "detectors": list(m.detectors),
+            "fluorochromes": list(m.fluorochromes) if m.fluorochromes is not None else None}
 
 
 def _move_layouts(layouts, old_prefix, new_prefix):
