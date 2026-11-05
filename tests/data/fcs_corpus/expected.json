@@ -1,0 +1,160 @@
+{
+ "._resource_fork.fcs": {
+  "outcome": "fail",
+  "words": "not an FCS file"
+ },
+ "backslash_delimiter.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "csv_renamed.fcs": {
+  "outcome": "fail",
+  "words": "not an FCS file"
+ },
+ "delimiter_in_value.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "duplicate_channel_names.fcs": {
+  "outcome": "warn",
+  "standard_events": true,
+  "words": "same name"
+ },
+ "empty.fcs": {
+  "outcome": "fail",
+  "words": "empty"
+ },
+ "enddata_off_by_one.fcs": {
+  "outcome": "warn",
+  "standard_events": true,
+  "words": "offsets"
+ },
+ "fcs20_int16_big.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "fcs20_int16_little.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "fcs30_int32_big.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "fcs31_double.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "fcs31_double_big.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "fcs31_float_big.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "fcs31_float_little.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "fcs31_int16_little.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "fcs32_float.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "header_only.fcs": {
+  "outcome": "fail",
+  "words": "ends"
+ },
+ "int16_junk_above_range.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "keywords_latin1.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "keywords_utf8.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "log_amplified.fcs": {
+  "outcome": "ok",
+  "standard_events": false,
+  "words": ""
+ },
+ "lowercase_keywords.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "missing_pnr.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "names_with_spaces_and_slashes.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "offsets_only_in_text.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "one_event.fcs": {
+  "outcome": "ok",
+  "standard_events": false,
+  "words": ""
+ },
+ "spill.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "spillover.fcs": {
+  "outcome": "ok",
+  "standard_events": true,
+  "words": ""
+ },
+ "spillover_unknown_channels.fcs": {
+  "outcome": "warn",
+  "standard_events": true,
+  "words": "spillover"
+ },
+ "truncated.fcs": {
+  "outcome": "fail",
+  "words": "ends"
+ },
+ "two_datasets.fcs": {
+  "outcome": "warn",
+  "standard_events": true,
+  "words": "one dataset"
+ },
+ "unsupported_10bit.fcs": {
+  "outcome": "fail",
+  "words": "-bit values"
+ },
+ "zero_events.fcs": {
+  "outcome": "fail",
+  "words": "no events"
+ }
+}

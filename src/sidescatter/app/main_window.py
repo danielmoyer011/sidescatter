@@ -27,7 +27,7 @@ from .qc_window import CleanDialog, QCWindow, run_cleaning
 from .ribbon import Ribbon
 from .suggestion_box import SuggestionDialog
 from .table_editor import TableEditor
-from .task_area import TaskArea, run_with_dialog
+from .task_area import TaskArea, run_with_dialog, show_unreadable
 from .unmixing_tab import UnmixingTab
 from .workspace_panel import WorkspacePanel
 
@@ -541,11 +541,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 job.progress(i / len(paths), f"Reading {Path(p).name}")
                 try:
                     sample = fcs.load_sample(p)
-                    loaded.append((p, sample, default_tops(sample)))
-                except MemoryError:
-                    raise
-                except Exception as exc:  # one bad file doesn't stop the others
-                    bad.append(fcs.describe_error(p, exc))
+                except fcs.UnreadableFCS as e:
+                    bad.append((Path(p).name, e.reason))
+                    continue
+                except Exception as e:  # noqa: BLE001 - one bad file never stops the rest
+                    bad.append((Path(p).name, f"couldn't be read ({e})"))
+                    continue
+                loaded.append((p, sample, default_tops(sample)))
             return loaded, bad
 
         def done(out):
@@ -557,10 +559,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 ws.add_sample(sample, {"path": str(Path(p).resolve())}, tops=tops)
             if loaded:
                 self._changed()
-                self.statusBar().showMessage(f"Added {len(loaded)} sample(s).", 6000)
-            if bad:
-                self.unreadable = bad
-                _warn_unreadable(self, bad)
+            warned = sum(bool(getattr(s, "load_warnings", None)) for _, s, _ in loaded)
+            self.statusBar().showMessage(
+                f"Added {len(loaded)} sample(s)."
+                + (f" {warned} opened with a warning: see the ⚠ next to it." if warned else ""), 8000)
+            show_unreadable(self, bad, len(loaded))
 
         return run_job(f"Adding {len(paths)} sample{'s' if len(paths) > 1 else ''}", work, on_done=done)
 
@@ -815,15 +818,6 @@ class LicenseDialog(QtWidgets.QDialog):
         layout.addLayout(row)
         layout.addSpacing(8)
         layout.addWidget(buttons)
-
-
-def _warn_unreadable(parent, bad):
-    """Say which files couldn't be read, and why (the rest were added)."""
-    shown = "\n".join(bad[:10]) + (f"\n… and {len(bad) - 10} more" if len(bad) > 10 else "")
-    QtWidgets.QMessageBox.warning(
-        parent, "Some files couldn't be read",
-        f"{len(bad)} file{'s' if len(bad) > 1 else ''} couldn't be read and "
-        f"{'were' if len(bad) > 1 else 'was'} left out:\n\n{shown}")
 
 
 def _backup_path(path, version):
