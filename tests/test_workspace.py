@@ -140,3 +140,24 @@ def test_flowjo_import_survives_save_and_reopen(eight_color, tmp_path):
             for n, p in back.population_paths()} == custom
     assert {(s, n, p): back.count(s, n, p) for s in back.samples
             for n, p in back.population_paths()} == before
+
+
+def test_column_gating_matches_flowkit(eight_color):
+    """Sidescatter's faster event preparation gives FlowKit's own results, compensated or not."""
+    ws = Workspace.from_flowjo(eight_color / "8_color_ICS.wsp", eight_color / "fcs_files")
+    sid = next(iter(ws.samples))
+    plain = fk.GatingStrategy()
+    for name, xform in ws.strategy.transformations.items():
+        plain.add_transform(name, xform)
+    for name, matrix in ws.strategy.comp_matrices.items():
+        plain.add_comp_matrix(name, matrix)
+    for name, parent in ws.population_paths():
+        node = ws.strategy._get_gate_node(name, parent)
+        if not isinstance(node.gate, fk.gates.Quadrant):
+            plain.add_gate(node.gate, parent)
+            for s, custom in node.custom_gates.items():
+                plain.add_gate(custom, parent, sample_id=s)
+    ours, theirs = ws.results(sid), plain.gate_sample(ws.samples[sid])
+    for name, parent in ws.population_paths():
+        assert np.array_equal(ours.get_gate_membership(name, gate_path=parent),
+                              theirs.get_gate_membership(name, gate_path=parent)), name

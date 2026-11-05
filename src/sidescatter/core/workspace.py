@@ -55,12 +55,62 @@ class QCGate(Gate):
 
 
 class Strategy(fk.GatingStrategy):
-    """FlowKit's gating strategy, minus copying every event to apply a QC gate."""
+    """FlowKit's gating strategy, minus copying every event for each gate.
+
+    FlowKit copies the whole event table (every channel) before transforming
+    the one or two channels a gate uses; with 64-detector files that copy was
+    most of the gating time. Here only the gate's own columns are copied.
+    """
 
     def _preprocess_sample_events(self, sample, gate, cache_events=False):
         if isinstance(gate, QCGate):
             return pd.DataFrame(index=pd.RangeIndex(sample.event_count))
+        fast = self._gate_columns(sample, gate)
+        if fast is not None:
+            return fast
         return super()._preprocess_sample_events(sample, gate, cache_events)
+
+    def _gate_columns(self, sample, gate):
+        """The gate's dimensions, compensated and transformed, as FlowKit would give them;
+        None for the rare cases left to FlowKit (ratio dimensions, fluorochrome labels)."""
+        pnn, pns = list(sample.pnn_labels), list(sample.pns_labels)
+        flowjo = [label.replace("/", "_") for label in pnn]
+        idx, ids, xforms, comps = [], [], [], set()
+        for dim in gate.dimensions:
+            if isinstance(dim, fk.RatioDimension):
+                return None
+            if dim.compensation_ref not in (None, "uncompensated"):
+                comps.add(dim.compensation_ref)
+            dim_id = dim.dimension_ref if isinstance(dim, fk.QuadrantDivider) else dim.id
+            for labels in (pnn, pns, flowjo):
+                if dim_id in labels:
+                    idx.append(labels.index(dim_id))
+                    break
+            else:
+                return None
+            ids.append(dim_id)
+            xforms.append(dim.transformation_ref)
+        if len(comps) > 1:
+            return None
+        if comps:
+            comp = next(iter(comps))
+            cached = self._cached_preprocessed_events.get(sample.id, {}).get((comp, None, None))
+            events = cached if cached is not None else self._compensate_sample(comps, sample)
+        else:
+            events = sample.get_events(source="raw")
+        cols = np.array(events[:, idx], dtype=np.float64)  # a copy of just these columns
+        cache = self._cached_preprocessed_events.setdefault(sample.id, {})
+        comp = next(iter(comps)) if comps else None
+        for k, ref in enumerate(xforms):
+            if ref is None:
+                continue
+            # Several gates often share a channel: transform each column once (until
+            # the gates or scales change, which clears the cache).
+            key = (comp, ref, idx[k])
+            if key not in cache:
+                cache[key] = self.transformations[ref].apply(cols[:, [k]])
+            cols[:, [k]] = cache[key]
+        return pd.DataFrame(cols, columns=ids)
 
 
 def default_transform(channel, top):
@@ -1045,8 +1095,8 @@ class Workspace:
                          f"{'Loading' if 'path' in s['source'] else 'Unmixing'} {name}")
             try:
                 sample = ws._read_sample(s["id"], s["source"], dirs)
-            except (FileNotFoundError, KeyError):
-                lost(s)
+            except (FileNotFoundError, KeyError, fcs.UnreadableFCS):
+                lost(s)  # kept, and Locate files can bring it back
                 continue
             ws.add_sample(sample, ws._resolved(s["source"], dirs))
             ws.compensation[s["id"]] = s["compensation"]
