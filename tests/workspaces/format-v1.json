@@ -40,6 +40,9 @@
    }
   }
  ],
+ "comp_matrices": {
+  "{map}": {}
+ },
  "experiments": [
   {
    "af_auto": "bool",

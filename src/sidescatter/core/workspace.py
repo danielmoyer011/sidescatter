@@ -263,7 +263,19 @@ class Workspace:
         self.invalidate()
 
     def get_gate(self, name, parent_path, sample_id=None):
-        return self.strategy.get_gate(name, tuple(parent_path), sample_id=sample_id)
+        """The gate defining a population. A quadrant of a QuadrantGate (from
+        GatingML) has no gate of its own: its QuadrantGate is returned."""
+        try:
+            return self.strategy.get_gate(name, tuple(parent_path), sample_id=sample_id)
+        except fk.exceptions.QuadrantReferenceError:
+            parent_path = tuple(parent_path)
+            return self.strategy.get_gate(parent_path[-1], parent_path[:-1], sample_id=sample_id)
+
+    def is_quadrant(self, name, parent_path):
+        """A quadrant of a QuadrantGate: saved, removed and renamed with that gate."""
+        parent_path = tuple(parent_path)
+        return len(parent_path) > 1 and isinstance(
+            self.strategy._get_gate_node(name, parent_path).gate, fk.gates.Quadrant)
 
     def children(self, parent_path=ROOT):
         """(name, path) of each child population of the population at parent_path."""
@@ -401,8 +413,8 @@ class Workspace:
             seen.add((name, tuple(parent_path)))
             gate = self.get_gate(name, parent_path)
             if not isinstance(gate, fk.gates.BooleanGate):
-                return [d.dimension_ref if hasattr(d, "dimension_ref") else d.id
-                        for d in getattr(gate, "dimensions", [])]
+                axes = [c for d in getattr(gate, "dimensions", []) for c in _dim_channels(d, self.strategy)]
+                return list(dict.fromkeys(axes))
             first = gate.gate_refs[0]
             name, parent_path = first["ref"], tuple(first["path"])
         return []
@@ -469,7 +481,7 @@ class Workspace:
         have = set(self.samples[sample_id].pnn_labels)
         for i in range(1, len(path)):
             gate = self.get_gate(path[i], path[:i])
-            if not _gate_channels(gate) <= have:
+            if not _gate_channels(gate, self.strategy) <= have:
                 return False
             if isinstance(gate, fk.gates.BooleanGate) and not all(
                     self.applies_to(sample_id, r["ref"], r["path"]) for r in gate.gate_refs):
@@ -484,7 +496,7 @@ class Workspace:
         """
         have = set(sample.pnn_labels)
         drop = [(n, p) for n, p in self.population_paths()
-                if not _gate_channels(self.get_gate(n, p)) <= have]
+                if not self.is_quadrant(n, p) and not _gate_channels(self.get_gate(n, p), self.strategy) <= have]
         if not drop:
             return self.strategy
         pruned = copy.deepcopy(self.strategy)
@@ -499,6 +511,10 @@ class Workspace:
             return np.ones(sample.event_count, dtype=bool)
         if not self.applies_to(sample_id, name, parent_path):
             raise KeyError(f"{name} does not apply to {sample_id}")
+        if isinstance(self.strategy._get_gate_node(name, tuple(parent_path)).gate, fk.gates.QuadrantGate):
+            # a QuadrantGate only splits its parent: together its quadrants are all of it
+            parent_path = tuple(parent_path)
+            return self.membership(sample_id, *(_split(parent_path)))
         return self.results(sample_id).get_gate_membership(name, gate_path=tuple(parent_path))
 
     def count(self, sample_id, name=None, parent_path=ROOT):
@@ -896,7 +912,7 @@ class Workspace:
                 gate = self.get_gate(gname, parent)
             except Exception:
                 continue  # removed with its parent already
-            if _gate_channels(gate) & added:
+            if not self.is_quadrant(gname, parent) and _gate_channels(gate, self.strategy) & added:
                 self.strategy.remove_gate(gname, gate_path=parent)
         if record.concatenated_id in self.samples:
             self.remove_sample(record.concatenated_id)
@@ -984,7 +1000,9 @@ class Workspace:
             "groups": groups,
             "transforms": {k: serialize.transform_to_dict(v)
                            for k, v in self.strategy.transformations.items()},
-            "gates": [_gate_dict(self.get_gate(n, p), p) for n, p in self.population_paths()],
+            "gates": [_gate_dict(self.get_gate(n, p), p) for n, p in self.population_paths()
+                      if not self.is_quadrant(n, p)],
+            "comp_matrices": {k: serialize.matrix_to_dict(m) for k, m in self.strategy.comp_matrices.items()},
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
             "layouts": [lay.to_dict() for lay in self.layouts],
             "experiments": self.experiments,
@@ -1007,6 +1025,8 @@ class Workspace:
         ws.upgraded_from = saved_as if saved_as != doc["version"] else None
         for name, d in doc["transforms"].items():
             ws.strategy.add_transform(name, serialize.transform_from_dict(d))
+        for name, d in doc.get("comp_matrices", {}).items():
+            ws.strategy.add_comp_matrix(name, serialize.matrix_from_dict(d))
         ws.unmixers = {k: Unmixer.from_dict(v) for k, v in doc["unmixers"].items()}
         dirs = [Path(path).parent, *map(Path, search_dirs)]
         groups = {k: list(v) for k, v in doc["groups"].items()}
@@ -1373,10 +1393,27 @@ def default_tops(sample):
     return tops
 
 
-def _gate_channels(gate):
+def _gate_channels(gate, strategy=None):
+    """The FCS channels a gate needs (see _dim_channels)."""
     if isinstance(gate, fk.gates.BooleanGate):
         return set()
-    return {d.dimension_ref if hasattr(d, "dimension_ref") else d.id for d in gate.dimensions}
+    return {c for d in gate.dimensions for c in _dim_channels(d, strategy)}
+
+
+def _dim_channels(dim, strategy=None):
+    """The FCS channels behind one gate dimension. A ratio dimension needs both
+    channels of its ratio; a dimension named after a compensation matrix's
+    fluorochrome is that matrix's detector (a GatingML gate on compensated
+    "FITC" means detector FL1-H)."""
+    xforms = strategy.transformations if strategy is not None else {}
+    matrices = strategy.comp_matrices if strategy is not None else {}
+    if isinstance(dim, fk.RatioDimension):
+        return list(getattr(xforms.get(dim.ratio_ref), "dimensions", []))
+    name = dim.dimension_ref if hasattr(dim, "dimension_ref") else dim.id
+    m = matrices.get(dim.compensation_ref)
+    if m is not None and m.fluorochromes is not None and name in list(m.fluorochromes):
+        name = list(m.detectors)[list(m.fluorochromes).index(name)]
+    return [name]
 
 
 def _next_pow2(x):
