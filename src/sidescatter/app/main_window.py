@@ -534,21 +534,31 @@ class MainWindow(QtWidgets.QMainWindow):
         ws = self.ws
 
         def work(job):
-            loaded = []
+            loaded, bad = [], []
             for i, p in enumerate(paths):
                 job.progress(i / len(paths), f"Reading {Path(p).name}")
-                sample = fcs.load_sample(p)
-                loaded.append((p, sample, default_tops(sample)))
-            return loaded
+                try:
+                    sample = fcs.load_sample(p)
+                    loaded.append((p, sample, default_tops(sample)))
+                except MemoryError:
+                    raise
+                except Exception as exc:  # one bad file doesn't stop the others
+                    bad.append(fcs.describe_error(p, exc))
+            return loaded, bad
 
-        def done(loaded):
+        def done(out):
+            loaded, bad = out
             if ws is not self.ws:
                 return
             for p, sample, tops in loaded:
                 sample.id = ws._unique_id(Path(p).name)
                 ws.add_sample(sample, {"path": str(Path(p).resolve())}, tops=tops)
-            self._changed()
-            self.statusBar().showMessage(f"Added {len(loaded)} sample(s).", 6000)
+            if loaded:
+                self._changed()
+                self.statusBar().showMessage(f"Added {len(loaded)} sample(s).", 6000)
+            if bad:
+                self.unreadable = bad
+                _warn_unreadable(self, bad)
 
         return run_job(f"Adding {len(paths)} sample{'s' if len(paths) > 1 else ''}", work, on_done=done)
 
@@ -803,6 +813,15 @@ class LicenseDialog(QtWidgets.QDialog):
         layout.addLayout(row)
         layout.addSpacing(8)
         layout.addWidget(buttons)
+
+
+def _warn_unreadable(parent, bad):
+    """Say which files couldn't be read, and why (the rest were added)."""
+    shown = "\n".join(bad[:10]) + (f"\n… and {len(bad) - 10} more" if len(bad) > 10 else "")
+    QtWidgets.QMessageBox.warning(
+        parent, "Some files couldn't be read",
+        f"{len(bad)} file{'s' if len(bad) > 1 else ''} couldn't be read and "
+        f"{'were' if len(bad) > 1 else 'was'} left out:\n\n{shown}")
 
 
 def _backup_path(path, version):

@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import flowio.exceptions
 import flowkit as fk
 import numpy as np
 import pandas as pd
@@ -75,6 +76,37 @@ def find_fcs_files(paths):
     return unique, skipped
 
 
+class UnreadableFCS(ValueError):
+    """A file that isn't a readable FCS file, with the reason in plain words."""
+
+    def __init__(self, name, reason):
+        self.name, self.reason = name, reason
+        super().__init__(f"{name}: {reason}")
+
+
+def _reason(exc):
+    text = str(exc).lower()
+    if "invalid literal" in text or "not an fcs" in text or "fcs version" in text or "header" in text:
+        return "it isn't an FCS file (or its header is damaged)"
+    if "greater than file size" in text or "truncat" in text or "end of file" in text:
+        return "the file is cut short (incomplete copy or download?)"
+    return str(exc) or type(exc).__name__
+
+
+def describe_error(path, exc):
+    """One line saying why a file couldn't be read, for a message listing several."""
+    name = Path(path).name
+    if isinstance(exc, UnreadableFCS):
+        return str(exc)
+    if isinstance(exc, FileNotFoundError):
+        return f"{name}: the file can't be found"
+    if isinstance(exc, PermissionError):
+        return f"{name}: no permission to read it"
+    if isinstance(exc, MemoryError):
+        return f"{name}: not enough memory to load it"
+    return f"{name}: {_reason(exc)}"
+
+
 def load_sample(path_or_data, sample_id=None, channel_labels=None, pns_labels=None, keywords=None):
     """Load an FCS file (or an events array with channel_labels) as a FlowKit Sample.
 
@@ -84,12 +116,23 @@ def load_sample(path_or_data, sample_id=None, channel_labels=None, pns_labels=No
     """
     if isinstance(path_or_data, (str, Path)):
         path = Path(path_or_data)
-        return fk.Sample(
-            str(path),
-            sample_id=sample_id or path.name,
-            ignore_offset_error=True,
-            subsample=20000,
-        )
+        try:
+            # Offsets that disagree between HEADER and TEXT are common in older
+            # instruments' files, and FlowJo opens them: use the TEXT ones.
+            return fk.Sample(
+                str(path),
+                sample_id=sample_id or path.name,
+                ignore_offset_error=True,
+                ignore_offset_discrepancy=True,
+                subsample=20000,
+            )
+        except flowio.exceptions.MultipleDataSetsError:
+            raise UnreadableFCS(path.name, "it holds several data sets in one file, which "
+                                "Sidescatter can't read yet; export each tube as its own FCS file") from None
+        except (OSError, MemoryError):
+            raise
+        except Exception as exc:
+            raise UnreadableFCS(path.name, _reason(exc)) from exc
     fh = io.BytesIO()
     write_fcs(fh, path_or_data, channel_labels, pns_labels, keywords)
     fh.seek(0)

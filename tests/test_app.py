@@ -186,6 +186,42 @@ def test_drop_files_and_folders_adds_samples(window, qtbot, tmp_path, monkeypatc
     assert len(warnings) == 1 and "readme.csv" in warnings[0]
 
 
+def _bad_fcs_files(folder):
+    """A truncated FCS file, a text file named .fcs, and a file whose HEADER and TEXT
+    disagree on where the data starts (readable: FlowJo opens those too)."""
+    import shutil
+    from sidescatter.core.fcs import write_fcs
+    folder.mkdir(parents=True, exist_ok=True)
+    good = sorted((DEMO_DIR / "controls").glob("*.fcs"))[0]
+    shutil.copy(good, folder / "good.fcs")
+    (folder / "truncated.fcs").write_bytes(good.read_bytes()[:5000])
+    (folder / "notes.fcs").write_text("not data")
+    write_fcs(folder / "offsets.fcs", np.ones((100, 3), dtype="f4"), ["FSC-A", "SSC-A", "B1-A"])
+    raw = bytearray((folder / "offsets.fcs").read_bytes())
+    raw[26:34] = f"{int(raw[26:34]) - 8:>8}".encode()
+    (folder / "offsets.fcs").write_bytes(bytes(raw))
+    return folder
+
+
+def test_bad_files_are_skipped_with_a_reason(window, qtbot, tmp_path, monkeypatch):
+    from PySide6 import QtWidgets
+    warnings = []
+    monkeypatch.setattr(QtWidgets.QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
+    folder = _bad_fcs_files(tmp_path / "mixed")
+    window.add_dropped([folder])
+    wait_idle()
+    assert {"good.fcs", "offsets.fcs"} <= set(window.ws.samples)
+    assert len(warnings) == 1
+    assert "truncated.fcs: the file is cut short" in warnings[0]
+    assert "notes.fcs: it isn't an FCS file" in warnings[0]
+
+    warnings.clear()
+    window.unmix_tab.add_files([folder])
+    wait_idle()
+    assert {s.path.name for s in window.unmix_tab.specs} == {"good.fcs", "offsets.fcs"}
+    assert len(warnings) == 1 and "truncated.fcs" in warnings[0]
+
+
 def test_drop_on_plot_reaches_window(window, qtbot, tmp_path, monkeypatch):
     import shutil
     from PySide6 import QtWidgets

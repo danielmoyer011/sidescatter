@@ -412,8 +412,10 @@ class UnmixingTab(QtWidgets.QWidget):
                 job.progress(i / len(to_read), f"Reading {Path(path).name}")
                 try:
                     loaded[path] = fcs.load_sample(path)
-                except (OSError, ValueError):
-                    pass
+                except MemoryError:
+                    raise
+                except Exception:
+                    pass  # reported below as missing
             return loaded
 
         def done(loaded):
@@ -491,8 +493,10 @@ class UnmixingTab(QtWidgets.QWidget):
                 job.progress(i / len(to_read), f"Reading {p.name}")
                 try:
                     loaded[p] = fcs.load_sample(p)
-                except (OSError, ValueError):
-                    bad.append(p.name)
+                except MemoryError:
+                    raise
+                except Exception as exc:  # one bad file doesn't stop the others
+                    bad.append(fcs.describe_error(p, exc))
             return loaded, bad
 
         def done(out):
