@@ -6,9 +6,11 @@ transform registered under its channel name, as FlowJo workspaces do.
 """
 
 import copy
+import hashlib
 import itertools
 import json
 import os
+import re
 import tempfile
 import threading
 import zipfile
@@ -33,6 +35,7 @@ CONVENTIONAL_RANGE = 262144.0
 
 
 QC_GATE = "QC passed"
+CACHE_KEYWORD = "SIDESCATTER_CACHE_KEY"  # in each cached unmixed file: what it was made from
 
 
 class QCGate(Gate):
@@ -145,6 +148,7 @@ class Workspace:
         # found: {"id", "source", "compensation", "groups", "qc"}. Kept so saving
         # doesn't lose it, and so Locate files can bring it back.
         self.missing = {}
+        self._cache_files = set()  # (file, key) of unmixed cache files known to be current
         self.upgraded_from = None  # the older format version this was opened from
         self.revision = 0        # bumped whenever gating results may have changed
         self._results = {}       # sample_id -> fk GatingResults
@@ -1010,7 +1014,77 @@ class Workspace:
     # ----- save / load -----------------------------------------------------
 
     def save(self, path):
+        writes = self.unmixed_cache(path)
+        write_unmixed_cache(writes)
         write_document(path, self.to_document(), self.analyses)
+
+    # Unmixed samples are kept as FCS files in "<workspace name> files/unmixed/" next to
+    # the workspace, so reopening reads them instead of unmixing every raw file again.
+    # Each remembers what it was made from (the matrix, the raw file's size and date,
+    # the AF source); anything different and the raw file is unmixed again.
+
+    def unmixed_cache(self, path):
+        """The unmixed samples whose cache file next to the workspace at path is missing
+        or out of date, as [(file, sample)] for write_unmixed_cache. Points each unmixed
+        sample's source at its cache file. Quick; call it on the UI thread before saving."""
+        path = Path(path)
+        folder = f"{path.stem} files"
+        writes = []
+        for sid, src in self.sources.items():
+            if "unmixer" not in src or sid not in self.samples:
+                continue
+            key = self._unmix_key(src)
+            if key is None:
+                src.pop("cache", None)
+                continue
+            entry = {"file": f"{folder}/unmixed/{_safe_name(sid)}.fcs", "key": key}
+            target = path.parent / entry["file"]
+            src["cache"] = entry
+            if (str(target), key) in self._cache_files and target.exists():
+                continue  # written (or read) this session, and nothing changed since
+            writes.append((target, self.samples[sid], key, self._cache_files))
+        return writes
+
+    def _unmix_key(self, src):
+        """What an unmixed sample was made from, hashed; None if that can't be told."""
+        unmixer = self.unmixers.get(src.get("unmixer"))
+        raw = src.get("unmixed_from_path") or self.sources.get(src.get("unmixed_from"), {}).get("path")
+        if unmixer is None or raw is None:
+            return None
+        try:
+            st = Path(raw).stat()
+        except OSError:
+            return None
+        text = json.dumps([unmixer.to_dict(), src.get("af_source"), st.st_size, st.st_mtime_ns],
+                          sort_keys=True)
+        return hashlib.blake2b(text.encode(), digest_size=16).hexdigest()
+
+    def _cached_unmixed(self, sample_id, src, search_dirs):
+        """The sample from its cache file, if it is there and still matches; else None."""
+        cache = src.get("cache")
+        if not cache or not search_dirs:
+            return None
+        target = Path(search_dirs[0]) / cache["file"]
+        if not target.exists():
+            return None
+        found = dict(src)
+        if "unmixed_from_path" in src:
+            try:
+                found["unmixed_from_path"] = str(_find_file(src["unmixed_from_path"], search_dirs))
+            except FileNotFoundError:
+                return None
+        elif src.get("unmixed_from") not in self.sources:
+            return None
+        if self._unmix_key(found) != cache["key"]:
+            return None
+        try:
+            sample = fcs.load_sample(target, sample_id=sample_id)
+        except Exception:
+            return None  # a damaged cache file: unmix again
+        if sample.get_metadata().get(CACHE_KEYWORD.lower()) != cache["key"]:
+            return None  # the file holds an older unmix
+        self._cache_files.add((str(target), cache["key"]))
+        return sample
 
     def to_document(self):
         """Everything a workspace file holds, as plain JSON-ready data. Quick, and a
@@ -1140,6 +1214,9 @@ class Workspace:
             return fcs.load_sample(_find_file(src["path"], search_dirs), sample_id=sample_id)
         from .unmixing import unmix_sample
 
+        cached = self._cached_unmixed(sample_id, src, search_dirs)
+        if cached is not None:
+            return cached
         if "unmixed_from" in src and raws and src["unmixed_from"] in raws:
             raw = raws[src["unmixed_from"]]
         else:
@@ -1392,6 +1469,40 @@ def _unique(name, taken):
         out, n = f"{name} ({n})", n + 1
     taken.add(out)
     return out
+
+
+def _safe_name(name):
+    """A sample id as a file name that works on every system."""
+    out = "".join(c if c.isalnum() or c in " ._-()+" else "_" for c in name).strip(" .")
+    return out[:150] or "sample"
+
+
+def write_unmixed_cache(writes, progress=None):
+    """Write unmixed samples (from Workspace.unmixed_cache) as FCS files. Each is
+    written to a temporary file and swapped in, so a cut-short write is never used.
+    Safe on a worker thread. Computed channels (UMAP...) are left out: they're saved
+    with their analysis."""
+    for i, (target, sample, key, written) in enumerate(writes):
+        if progress:
+            progress(i, len(writes), target.name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        keep = [i for i, n in enumerate(sample.pnn_labels) if fcs._channel_kind(n) != "derived"]
+        events = sample.get_events(source="raw")[:, keep]
+        meta = {k: v for k, v in fcs.keywords(sample).items() if not re.match(r"^p\d+[a-z]+$", k)}
+        meta[CACHE_KEYWORD] = key
+        tmp = target.with_name(f".{target.name}.tmp")
+        try:
+            fcs.write_fcs(tmp, events, [sample.pnn_labels[i] for i in keep],
+                          [sample.pns_labels[i] for i in keep], meta,
+                          [sample.channels.loc[i, "pnr"] for i in keep])
+            os.replace(tmp, target)
+            written.add((str(target), key))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def write_document(path, doc, analyses=()):

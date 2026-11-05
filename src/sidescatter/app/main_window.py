@@ -15,7 +15,7 @@ from .. import __version__
 from ..core import fcs
 from ..core.fcs import find_fcs_files
 from ..core.versioning import RELEASES_URL, NewerWorkspaceError
-from ..core.workspace import ROOT, Workspace, default_tops, write_document
+from ..core.workspace import ROOT, Workspace, default_tops, write_document, write_unmixed_cache
 from . import icons
 from .analysis_dialog import AnalysisDialog, HeatmapDialog
 from .axis_scales import TransformWindow
@@ -453,6 +453,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.path is None:
             return self.save_as()
         self.unmix_tab.store()
+        cache = self.ws.unmixed_cache(self.path)  # unmixed samples, so reopening is quick
         path, doc, edits = self.path, self.ws.to_document(), self.edits
         analyses = list(self.ws.analyses)
         backup = self._backup_from
@@ -464,6 +465,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if backup is not None and Path(path).exists():
                 kept = _backup_path(Path(path), backup[1])
                 shutil.copy2(path, kept)
+            write_unmixed_cache(cache, lambda i, n, name: job.progress(i / (n + 1), f"Saving {name}"))
             write_document(path, doc, analyses)
             return kept
 
