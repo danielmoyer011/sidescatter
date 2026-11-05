@@ -27,7 +27,7 @@ from .qc_window import CleanDialog, QCWindow, run_cleaning
 from .ribbon import Ribbon
 from .suggestion_box import SuggestionDialog
 from .table_editor import TableEditor
-from .task_area import TaskArea, run_with_dialog
+from .task_area import TaskArea, run_with_dialog, show_unreadable
 from .unmixing_tab import UnmixingTab
 from .workspace_panel import WorkspacePanel
 
@@ -534,21 +534,34 @@ class MainWindow(QtWidgets.QMainWindow):
         ws = self.ws
 
         def work(job):
-            loaded = []
+            loaded, bad = [], []
             for i, p in enumerate(paths):
                 job.progress(i / len(paths), f"Reading {Path(p).name}")
-                sample = fcs.load_sample(p)
+                try:
+                    sample = fcs.load_sample(p)
+                except fcs.UnreadableFCS as e:
+                    bad.append((Path(p).name, e.reason))
+                    continue
+                except Exception as e:  # noqa: BLE001 - one bad file never stops the rest
+                    bad.append((Path(p).name, f"couldn't be read ({e})"))
+                    continue
                 loaded.append((p, sample, default_tops(sample)))
-            return loaded
+            return loaded, bad
 
-        def done(loaded):
+        def done(out):
+            loaded, bad = out
             if ws is not self.ws:
                 return
             for p, sample, tops in loaded:
                 sample.id = ws._unique_id(Path(p).name)
                 ws.add_sample(sample, {"path": str(Path(p).resolve())}, tops=tops)
-            self._changed()
-            self.statusBar().showMessage(f"Added {len(loaded)} sample(s).", 6000)
+            if loaded:
+                self._changed()
+            warned = sum(bool(getattr(s, "load_warnings", None)) for _, s, _ in loaded)
+            self.statusBar().showMessage(
+                f"Added {len(loaded)} sample(s)."
+                + (f" {warned} opened with a warning: see the ⚠ next to it." if warned else ""), 8000)
+            show_unreadable(self, bad, len(loaded))
 
         return run_job(f"Adding {len(paths)} sample{'s' if len(paths) > 1 else ''}", work, on_done=done)
 
