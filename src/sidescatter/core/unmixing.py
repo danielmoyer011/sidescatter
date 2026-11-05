@@ -6,6 +6,8 @@ beads, cells with unstained cells) when one exists, otherwise the dim events
 inside the control itself. Unstained cells also supply autofluorescence.
 """
 
+import copy
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -271,7 +273,7 @@ def _pick_events(spec, events, in_gate, neg_events, names):
 
 def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=True, samples=None,
                   af_mode="fluors", af_library_size=30, af_auto=True, keep=None, cleanup=None,
-                  library=None, check_spectra=True, variation=None, imported=None):
+                  library=None, check_spectra=True, variation=None, imported=None, progress=None):
     """Build an Unmixer from control specs.
 
     af_mode: "fluors" (n_autofluorescence AF signatures as extra fluors) or
@@ -292,6 +294,8 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
     derived so the UI can show it and let the user correct the gates.
     samples: optional {path: loaded Sample}, filled in as files are loaded.
     keep: optional {path: mask of events to use}, e.g. the events that passed cleaning.
+    progress: optional progress(fraction, text), called before each control (it may
+    raise to stop the build).
     """
     specs = [s for s in specs if s.is_reference]
     samples = {} if samples is None else samples
@@ -336,12 +340,12 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
 
     cell_unstained = next((s for s in specs if s.role == "unstained" and s.carrier == "cells"), None)
     references, results = [], []
-    for spec in specs:
-        if spec.role != "single_stain":
-            continue
-        events = det_events(spec)
-        in_gate = gate_mask(spec)
-
+    variants_on = (variation is not None and variation.enabled) or cleanup is not None
+    vset = (variation or fluor_variants.Settings()) if variants_on else None
+    singles = [s for s in specs if s.role == "single_stain"]
+    for n_done, spec in enumerate(singles):
+        if progress:
+            progress(n_done / max(len(singles), 1), f"Unmixing matrix: {spec.path.name}")
         neg_spec, neg_source = None, "internal"
         if spec.negative_mask is None:
             if spec.negative not in ("auto", "internal"):
@@ -351,6 +355,25 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
                 neg_spec = _matching_unstained(spec, specs)
                 if neg_spec is not None:
                     neg_source = neg_spec.path.name
+
+        # A control's signature depends only on its own file and gates, its negative
+        # and the clean-up settings, so editing one control redoes just that one.
+        high_af = cleanup is not None and spec.remove_high_af and spec.carrier == "cells"
+        key = (tuple(names), _spec_key(spec, sample_for(spec.path), keep.get(spec.path)),
+               None if neg_spec is None else _spec_key(neg_spec, sample_for(neg_spec.path),
+                                                       keep.get(neg_spec.path)),
+               repr(cleanup),
+               _spec_key(cell_unstained, sample_for(cell_unstained.path), keep.get(cell_unstained.path))
+               if high_af and cell_unstained is not None else None)
+        cached = _control_cache.get(key)
+        if cached is not None:
+            result = copy.copy(cached)
+            result.spec = spec
+            _finish_control(result, spec, names, library, imported, check_spectra,
+                            vset, references, results)
+            continue
+        events = det_events(spec)
+        in_gate = gate_mask(spec)
 
         def negatives(clean):
             if spec.negative_mask is not None:
@@ -376,28 +399,11 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
                 neg_xy = None if xy is None else xy[gate_mask(neg_spec, True)]
             _clean_signature(result, spec, events, peak, clean_masks(spec), cleanup,
                              _scatter_xy(sample_for(spec.path)), negatives(True), neg_xy, unstained_Y)
-        if check_spectra:
-            result.check = spectra_library.check(spec.name, result.signature, names, library,
-                                                 spec.carrier)
-            if (spec.signature_choice == "library" and result.check is not None
-                    and result.check.kind == "saved"):
-                result.measured_signature = result.signature
-                result.signature = spectral.normalise(result.check.reference)
-                result.signature_source = "library"
-        if imported is not None:
-            sig = imported.on(names).signature(spec.name)
-            if sig is not None:
-                if result.measured_signature is None:
-                    result.measured_signature = result.signature
-                result.signature = sig
-                result.signature_source = "imported"
-        if (variation is not None and variation.enabled) or cleanup is not None:
-            v = variation or fluor_variants.Settings()
-            result.variants = fluor_variants.cached_variants(
-                str(spec.path), result.spectra, result.signature, v.max_variants, v.min_cosine)
-        references.append(spectral.Reference(spec.name, result.signature, source=spec.path.name,
-                                             marker=spec.marker))
-        results.append(result)
+        if len(_control_cache) >= 128:
+            _control_cache.clear()
+        _control_cache[key] = copy.copy(result)
+        _finish_control(result, spec, names, library, imported, check_spectra,
+                        vset, references, results)
 
     if imported is not None:
         mine = imported.on(names)
@@ -419,6 +425,57 @@ def build_unmixer(specs, method="ols", n_autofluorescence=1, autofluorescence=Tr
         negatives = gated_events(any_unstained) if any_unstained is not None else None
         add_variants(unmixer, results, negatives, variation.channels)
     return unmixer, results
+
+
+_control_cache = {}
+
+
+def _fingerprint(value):
+    """Something hashable that changes whenever value does (masks are hashed)."""
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        data = np.packbits(value) if value.dtype == bool else np.ascontiguousarray(value)
+        return (value.shape, str(value.dtype),
+                hashlib.blake2b(data.tobytes(), digest_size=16).hexdigest())
+    return repr(value)
+
+
+def _spec_key(spec, sample, keep=None):
+    """A control's file, gates and negative choice, for the control cache."""
+    return (str(spec.path), id(sample), sample.event_count, spec.role, spec.carrier, spec.negative,
+            _fingerprint(spec.positive_mask), _fingerprint(spec.negative_mask),
+            _fingerprint(spec.scatter_gate), spec.gate_detector, _fingerprint(spec.positive_range),
+            _fingerprint(spec.negative_range), spec.remove_high_af, _fingerprint(keep))
+
+
+def _finish_control(result, spec, names, library, imported, check_spectra, variation,
+                    references, results):
+    """The quick last steps for a control, never cached because they depend on its fluor
+    name and your library: the spectra check, saved or imported spectra, variants, and
+    its reference. variation: fluor_variants.Settings when variants are worked out."""
+    if check_spectra:
+        result.check = spectra_library.check(spec.name, result.signature, names, library,
+                                             spec.carrier)
+        if (spec.signature_choice == "library" and result.check is not None
+                and result.check.kind == "saved"):
+            result.measured_signature = result.signature
+            result.signature = spectral.normalise(result.check.reference)
+            result.signature_source = "library"
+    if imported is not None:
+        sig = imported.on(names).signature(spec.name)
+        if sig is not None:
+            if result.measured_signature is None:
+                result.measured_signature = result.signature
+            result.signature = sig
+            result.signature_source = "imported"
+    if variation is not None:
+        result.variants = fluor_variants.cached_variants(
+            str(spec.path), result.spectra, result.signature, variation.max_variants,
+            variation.min_cosine)
+    references.append(spectral.Reference(spec.name, result.signature, source=spec.path.name,
+                                         marker=spec.marker))
+    results.append(result)
 
 
 def _key(name):

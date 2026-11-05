@@ -190,3 +190,28 @@ def test_default_name(demo_files):
     specs = unmixing.guess_files(demo_files)
     assert experiment.default_name(specs) == "PBMC full panel"
     assert experiment.safe_name('a/b:c*?') == "a_b_c__"
+
+
+def test_editing_one_control_rebuilds_only_that_control(demo_files, monkeypatch):
+    """Unchanged controls come from the cache, and give the same signatures."""
+    samples = {}
+    specs = unmixing.guess_files(demo_files, samples)
+    first, _ = unmixing.build_unmixer(specs, samples=samples)
+    calls = []
+    real = unmixing._pick_events
+    monkeypatch.setattr(unmixing, "_pick_events", lambda spec, *a: calls.append(spec.path) or real(spec, *a))
+
+    again, _ = unmixing.build_unmixer(specs, samples=samples)
+    assert calls == [] and np.allclose(again.matrix, first.matrix)
+
+    stain = next(s for s in specs if s.role == "single_stain")
+    stain.positive_range = (1e4, 1e7)
+    edited, results = unmixing.build_unmixer(specs, samples=samples)
+    assert calls == [stain.path]
+    i = edited.names.index(stain.name)
+    others = [k for k in range(len(first.names)) if k != i]
+    assert np.allclose(edited.matrix[others], first.matrix[others])
+
+    stain.name = stain.name + " renamed"  # names aren't part of the cached work
+    renamed, _ = unmixing.build_unmixer(specs, samples=samples)
+    assert calls == [stain.path] and stain.name in renamed.names

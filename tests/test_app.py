@@ -48,6 +48,7 @@ def test_unmixing_tab_classifies_unmixes_and_exports(window, qtbot, tmp_path, mo
     assert tab.preview_sample.currentText() == "PBMC_full_panel.fcs"
 
     tab.method.setCurrentIndex(tab.method.findData("ols"))
+    wait_idle()
     assert tab.unmixer.method == "ols" and tab.setup.method == "ols"
 
     with qtbot.waitSignal(tab.unmixed, timeout=120000) as unmixed:
@@ -81,6 +82,7 @@ def test_changing_roles_on_several_rows(qtbot):
     tab._select_rows(rows)
     exclude = [label for label, _, _ in ROLE_CHOICES].index("Exclude")
     tab.table.cellWidget(rows[0], 1).setCurrentIndex(exclude)
+    wait_idle()
     assert all(tab.specs[r].role == "exclude" for r in rows)
     assert len(tab.unmixer.names) == 13 - len(rows)
     assert all(tab.table.cellWidget(r, 1).currentText() == "Exclude" for r in rows)
@@ -89,9 +91,11 @@ def test_changing_roles_on_several_rows(qtbot):
 
     # Giving two controls the same fluor blocks unmixing until it's fixed.
     tab.table.item(other, 2).setText("FITC")
+    wait_idle()
     assert tab.unmixer is None and not tab.export_btn.isEnabled()
     assert "Two single-stain controls for FITC" in tab.status.text()
     tab.table.item(other, 2).setText("PE")
+    wait_idle()
     assert tab.unmixer is not None
 
 
@@ -274,8 +278,10 @@ def test_per_cell_autofluorescence_in_the_tab(qtbot):
     view = tab.af_view
     assert view.file_combo.count() == 2  # PBMC and dead-cell unstained cells
     view.file_combo.setCurrentText("PBMC_unstained.fcs")
+    wait_idle()
     assert view.spec.path.name == "PBMC_unstained.fcs" and view.draw_btn.isEnabled()
     view.draw_btn.setChecked(True)
+    wait_idle()
     vb = view.plot.getViewBox()
     (x0, x1), (y0, y1) = vb.viewRange()
     corners = [(x0 + (x1 - x0) * fx, y0 + (y1 - y0) * fy) for fx, fy in ((0.5, 0.5), (0.95, 0.5), (0.95, 0.95))]
@@ -283,12 +289,14 @@ def test_per_cell_autofluorescence_in_the_tab(qtbot):
         pos = view.plot.mapFromScene(vb.mapViewToScene(QtCore.QPointF(cx, cy)))
         qtbot.mouseClick(view.plot.viewport(), QtCore.Qt.LeftButton, pos=pos)
     qtbot.mouseClick(view.plot.viewport(), QtCore.Qt.RightButton, pos=pos)
+    wait_idle()
     assert len(view.spec.af_gates) == 1 and not view.draw_btn.isChecked()
     assert view.gate_list.count() == 1
     assert any(f["af_gates"] for f in tab.ws.experiments[0]["files"])
 
     # Only the drawn population (the dead-cell unstained has no gates, so it keeps its median).
     tab.af_auto.setChecked(False)
+    wait_idle()
     assert len(tab.unmixer.af_library) == 2 < n_lib
 
     tab.tabs.setCurrentWidget(tab.af_check_view)
@@ -296,9 +304,12 @@ def test_per_cell_autofluorescence_in_the_tab(qtbot):
     assert "less spread" in tab.af_check_view.summary.text()
 
     tab.af_mode.setCurrentIndex(tab.af_mode.findData("fluors"))
+    wait_idle()
     assert not tab.unmixer.per_cell_af and tab.af_count.isVisibleTo(tab)
     tab.af_mode.setCurrentIndex(tab.af_mode.findData("per_cell"))
+    wait_idle()
     tab.af_auto.setChecked(True)
+    wait_idle()
     with qtbot.waitSignal(tab.unmixed, timeout=120000) as unmixed:
         tab.unmix_into_workspace()
     ids = unmixed.args[0]
@@ -315,6 +326,7 @@ def test_smart_control_cleanup_and_spectrum_check(qtbot):
     assert all(r.cleanup is not None for r in tab.results)
     assert "condition number" in tab.status.text()
     tab.next_btn.click()
+    wait_idle()
     row = next(r for r in tab.rows if r.spec.name == "BV605")
     assert "positive events used" in row.subtitle.text()
     assert "passed" in row.check_label.text() and not row.use_anyway.isVisibleTo(tab)
@@ -322,10 +334,12 @@ def test_smart_control_cleanup_and_spectrum_check(qtbot):
     # A control labelled as the wrong fluor is flagged, and can be accepted anyway.
     row.spec.name = "BV421"
     tab.recalculate(rebuild_rows=False)
+    wait_idle()
     result = next(r for r in tab.results if r.spec is row.spec)
     assert result.flagged and "failed" in row.check_label.text()
     assert "BV421" in tab.status.text()
     row.use_anyway.click()
+    wait_idle()
     qtbot.waitUntil(lambda: row.spec.signature_choice == "accepted")
     qtbot.wait(20)
     assert not next(r for r in tab.results if r.spec is row.spec).flagged
@@ -333,7 +347,9 @@ def test_smart_control_cleanup_and_spectrum_check(qtbot):
     # Saving a control makes it the reference for later checks.
     row.spec.name, row.spec.signature_choice = "BV605", "auto"
     tab.recalculate(rebuild_rows=False)
+    wait_idle()
     row.save_btn.click()
+    wait_idle()
     result = next(r for r in tab.results if r.spec is row.spec)
     assert result.check.kind == "saved" and result.check.cosine > 0.9999
     assert tab.library.path.exists()
@@ -341,14 +357,18 @@ def test_smart_control_cleanup_and_spectrum_check(qtbot):
     # Reset to auto forgets the drawn ranges.
     row.spec.positive_range = (1000.0, 5000.0)
     tab.recalculate(rebuild_rows=False)
+    wait_idle()
     assert row.reset_btn.isEnabled()
     row.reset_btn.click()
+    wait_idle()
     qtbot.waitUntil(lambda: row.spec.positive_range is None)
 
     tab.next_btn.click()
+    wait_idle()
     assert tab.signatures.extras and "before control clean-up" in tab.signatures.extras_hint.text()
 
     tab.smart_check.setChecked(False)
+    wait_idle()
     assert all(r.cleanup is None for r in tab.results)
     assert not tab.smart_btn.isEnabled()
 
@@ -361,11 +381,14 @@ def test_per_cell_fluor_variation_and_hotspots(qtbot):
     assert not tab.setup.variation.enabled and not tab.unmixer.per_cell_variants
     assert tab.hot_table.rowCount() == len([r for r in tab.unmixer.references if not r.is_autofluorescence])
     tab.variation_check.setChecked(True)
+    wait_idle()
     assert tab.unmixer.per_cell_variants and tab.setup.to_dict()["variation"]["enabled"]
     assert "is on" in tab.hot_hint.text()
     tab.preview_sample.setCurrentIndex(0)
+    wait_idle()
     tab._draw_preview()
     tab.smart_check.setChecked(False)
+    wait_idle()
     assert tab.smart_btn.isEnabled()   # still has the variation settings
 
 
@@ -379,9 +402,11 @@ def test_autospectral_files_in_the_tab(qtbot, tmp_path):
     written = tab.export_autospectral(tmp_path / "as")
     assert len(written) == 3
     assert tab.import_spectra(str(written[0]))
+    wait_idle()
     assert tab.setup.imported is not None and tab.stop_import.isEnabled()
     assert "Imported AutoSpectral spectra" in tab.status.text()
     assert all(r.signature_source == "imported" for r in tab.results)
     tab.clear_imported()
+    wait_idle()
     assert tab.setup.imported is None
     assert all(r.signature_source != "imported" for r in tab.results)
