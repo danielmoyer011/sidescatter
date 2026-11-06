@@ -190,3 +190,72 @@ def test_default_name(demo_files):
     specs = unmixing.guess_files(demo_files)
     assert experiment.default_name(specs) == "PBMC full panel"
     assert experiment.safe_name('a/b:c*?') == "a_b_c__"
+
+
+def test_editing_one_control_rebuilds_only_that_control(demo_files, monkeypatch):
+    """Unchanged controls come from the cache, and give the same signatures."""
+    samples = {}
+    specs = unmixing.guess_files(demo_files, samples)
+    first, _ = unmixing.build_unmixer(specs, samples=samples)
+    calls = []
+    real = unmixing._pick_events
+    monkeypatch.setattr(unmixing, "_pick_events", lambda spec, *a: calls.append(spec.path) or real(spec, *a))
+
+    again, _ = unmixing.build_unmixer(specs, samples=samples)
+    assert calls == [] and np.allclose(again.matrix, first.matrix)
+
+    stain = next(s for s in specs if s.role == "single_stain")
+    stain.positive_range = (1e4, 1e7)
+    edited, results = unmixing.build_unmixer(specs, samples=samples)
+    assert calls == [stain.path]
+    i = edited.names.index(stain.name)
+    others = [k for k in range(len(first.names)) if k != i]
+    assert np.allclose(edited.matrix[others], first.matrix[others])
+
+    stain.name = stain.name + " renamed"  # names aren't part of the cached work
+    renamed, _ = unmixing.build_unmixer(specs, samples=samples)
+    assert calls == [stain.path] and stain.name in renamed.names
+
+
+def test_reopening_reads_unmixed_samples_instead_of_unmixing_again(demo_files, tmp_path, monkeypatch):
+    import flowkit as fk
+    from sidescatter.core.workspace import ROOT
+
+    samples = {}
+    specs = unmixing.guess_files(demo_files, samples)
+    unmixer, _ = unmixing.build_unmixer(specs, samples=samples)
+    raw = tmp_path / "raw" / "PBMC_full_panel.fcs"
+    raw.parent.mkdir()
+    shutil.copy(demo_files[-1], raw)
+    ws = Workspace()
+    ws.add_unmixer("Exp", unmixer)
+    sid = ws.unmix_file(raw, "Exp")
+    ch = unmixer.names[0] + "-A"
+    ws.add_gate(fk.gates.RectangleGate("Pos", [ws.make_dimension(sid, ch, 0.5, None)]))
+    count = ws.count(sid, "Pos", ROOT)
+    path = tmp_path / "ws.ssw"
+    ws.save(path)
+    cached = tmp_path / "ws files" / "unmixed" / f"{sid}.fcs"
+    assert cached.exists()
+
+    def no_unmixing(*a, **k):
+        raise AssertionError("unmixed again")
+
+    monkeypatch.setattr(unmixing, "unmix_sample", no_unmixing)
+    back = Workspace.load(path)
+    assert back.count(sid, "Pos", ROOT) == count
+    assert np.array_equal(back.samples[sid].get_events(source="raw"), ws.samples[sid].get_events(source="raw"))
+    back.save(path)  # nothing changed: the cache file isn't rewritten
+    mtime = cached.stat().st_mtime_ns
+    back.save(path)
+    assert cached.stat().st_mtime_ns == mtime
+
+    monkeypatch.undo()
+    raw.write_bytes(raw.read_bytes())  # the raw file changed (new date): unmix it again
+    import os
+    os.utime(raw, ns=(mtime + 10**9, mtime + 10**9))
+    calls = []
+    real = unmixing.unmix_sample
+    monkeypatch.setattr(unmixing, "unmix_sample", lambda *a, **k: calls.append(1) or real(*a, **k))
+    again = Workspace.load(path)
+    assert calls and again.count(sid, "Pos", ROOT) == count

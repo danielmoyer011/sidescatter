@@ -118,6 +118,7 @@ def test_unmixing_tab_cleans_controls_and_exports_report(qtbot, tmp_path, monkey
     tab = w.unmix_tab
     plain = tab.unmixer.matrix.copy()
     tab.clean_check.setChecked(True)
+    wait_idle()
     assert tab.setup.clean_controls and tab.unmixer is not None
     assert "Cleaned 15 control(s)" in tab.status.text()
     assert tab.unmixer.matrix.shape == plain.shape

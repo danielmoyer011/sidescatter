@@ -123,3 +123,41 @@ def test_flowjo_import_counts_close_to_flowjo(eight_color):
             assert abs(ours - fj) <= tolerance, (sid, parent, name, ours, fj)
             checked += 1
     assert checked >= 40
+
+
+def test_flowjo_import_survives_save_and_reopen(eight_color, tmp_path):
+    """The imported gates' compensation matrix and per-sample gates are saved too."""
+    ws = Workspace.from_flowjo(eight_color / "8_color_ICS.wsp", eight_color / "fcs_files")
+    custom = {(n, p): set(ws.strategy._get_gate_node(n, p).custom_gates)
+              for n, p in ws.population_paths()}
+    assert any(custom.values())  # this workspace has gates edited for single samples
+    before = {(s, n, p): ws.count(s, n, p) for s in ws.samples for n, p in ws.population_paths()}
+
+    ws.save(tmp_path / "imported.ssw")
+    back = Workspace.load(tmp_path / "imported.ssw", search_dirs=[eight_color / "fcs_files"])
+    assert set(back.strategy.comp_matrices) == set(ws.strategy.comp_matrices)
+    assert {(n, p): set(back.strategy._get_gate_node(n, p).custom_gates)
+            for n, p in back.population_paths()} == custom
+    assert {(s, n, p): back.count(s, n, p) for s in back.samples
+            for n, p in back.population_paths()} == before
+
+
+def test_column_gating_matches_flowkit(eight_color):
+    """Sidescatter's faster event preparation gives FlowKit's own results, compensated or not."""
+    ws = Workspace.from_flowjo(eight_color / "8_color_ICS.wsp", eight_color / "fcs_files")
+    sid = next(iter(ws.samples))
+    plain = fk.GatingStrategy()
+    for name, xform in ws.strategy.transformations.items():
+        plain.add_transform(name, xform)
+    for name, matrix in ws.strategy.comp_matrices.items():
+        plain.add_comp_matrix(name, matrix)
+    for name, parent in ws.population_paths():
+        node = ws.strategy._get_gate_node(name, parent)
+        if not isinstance(node.gate, fk.gates.Quadrant):
+            plain.add_gate(node.gate, parent)
+            for s, custom in node.custom_gates.items():
+                plain.add_gate(custom, parent, sample_id=s)
+    ours, theirs = ws.results(sid), plain.gate_sample(ws.samples[sid])
+    for name, parent in ws.population_paths():
+        assert np.array_equal(ours.get_gate_membership(name, gate_path=parent),
+                              theirs.get_gate_membership(name, gate_path=parent)), name

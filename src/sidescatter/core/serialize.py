@@ -118,16 +118,6 @@ def gate_from_dict(d):
     raise ValueError(f"unknown gate type {t}")
 
 
-def matrix_to_dict(m):
-    """A compensation matrix a gate names (GatingML spectrumMatrix / spillover)."""
-    return {"detectors": list(m.detectors), "fluorochromes": list(m.fluorochromes),
-            "matrix": _num(np.asarray(m.matrix))}
-
-
-def matrix_from_dict(d):
-    return fk.Matrix(np.array(d["matrix"], dtype=float), d["detectors"], d["fluorochromes"])
-
-
 def same_gate(a, b):
     try:
         return gate_to_dict(a, ()) == gate_to_dict(b, ())
