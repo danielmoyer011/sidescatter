@@ -1,0 +1,40 @@
+name: Speed test
+
+# 5 million events x 64 detectors: open, unmix, gate, clean, export.
+# Too slow for every pull request, so it runs on merges to main and on demand
+# (Actions > Speed test > Run workflow), plus on pull requests that change it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      record:
+        description: "Save these times as the new baseline (download benchmarks/baseline.json from the run)"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - scripts/benchmark.py
+      - benchmarks/**
+      - .github/workflows/benchmark.yml
+
+jobs:
+  speed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e . psutil
+      - name: Speed test
+        run: python scripts/benchmark.py --json results.json ${{ inputs.record && '--record' || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: speed-test
+          path: |
+            results.json
+            benchmarks/baseline.json
+          if-no-files-found: ignore
