@@ -22,7 +22,7 @@ from ..core.experiment import Setup
 from ..core.workspace import default_tops
 from . import theme
 from .control_rows import ControlRow
-from .jobs import manager as jobs, run_job
+from .jobs import JobCancelled, manager as jobs, run_job
 from .graph_view import BINS, CLOSE_PEN, DRAW_PEN, GATE_PEN, PSEUDOCOLOR, SNAP_FILL, SNAP_RADIUS_PX
 from .spectrum_plot import SignaturesView
 from . import qc_report
@@ -70,6 +70,7 @@ class UnmixingTab(QtWidgets.QWidget):
         self.results = []
         self.problems = []
         self._preview_cache = {}
+        self._preview_result = {}
         self._control_qc = {}      # (path, settings) -> (keep mask, cleaning.Result)
         self.library = spectra_library.SpectraLibrary()   # spectra you saved from good controls
         self.rows = []
@@ -412,8 +413,10 @@ class UnmixingTab(QtWidgets.QWidget):
                 job.progress(i / len(to_read), f"Reading {Path(path).name}")
                 try:
                     loaded[path] = fcs.load_sample(path)
-                except (OSError, ValueError):
-                    pass
+                except MemoryError:
+                    raise
+                except Exception:
+                    pass  # reported below as missing
             return loaded
 
         def done(loaded):
@@ -655,7 +658,7 @@ class UnmixingTab(QtWidgets.QWidget):
             spec.marker = text
         else:
             return
-        self.recalculate()
+        self.recalculate(rebuild_rows=False)  # same controls: the rows only need new titles
         self._mark_changed()
 
     def _table_menu(self, pos):
@@ -684,7 +687,7 @@ class UnmixingTab(QtWidgets.QWidget):
         self._show_af_options()
         if mode_changed:
             self._fill_table()  # the samples' AF source choice depends on the mode
-        self.recalculate()
+        self.recalculate(rebuild_rows=False)  # same controls, so the Identify rows stay
         self._mark_changed()
 
     def _mark_changed(self):
@@ -712,49 +715,105 @@ class UnmixingTab(QtWidgets.QWidget):
 
     # ----- computing -------------------------------------------------------
 
-    def control_cleaning(self):
-        """{path: (keep mask, cleaning.Result)} for the reference controls, when they are cleaned."""
+    def control_cleaning(self, specs=None, samples=None, progress=None):
+        """{path: (keep mask, cleaning.Result)} for the reference controls, when they are cleaned.
+
+        Safe on a worker given its own specs and samples; results are remembered in
+        self._control_qc, which only the (one) matrix build job fills."""
         if not self.setup.clean_controls:
             return {}
+        specs = self.specs if specs is None else specs
+        samples = self.samples if samples is None else samples
         settings = self.ws.qc_settings
         key = repr(sorted(settings.to_dict().items()))
         out = {}
-        for spec in self.specs:
-            if spec.is_reference and spec.path in self.samples:
+        for spec in specs:
+            if spec.is_reference and spec.path in samples:
                 if (spec.path, key) not in self._control_qc:
+                    if progress:
+                        progress(f"Cleaning {spec.path.name}")
                     self._control_qc[(spec.path, key)] = unmixing.control_keep(
-                        self.samples[spec.path], cleaning.Settings.from_dict(
+                        samples[spec.path], cleaning.Settings.from_dict(
                             {**settings.to_dict(), "channels": None}))
                 out[spec.path] = self._control_qc[(spec.path, key)]
         return out
 
-    def recalculate(self, rebuild_rows=True):
-        """Rebuild the matrix from the current files and gates.
+    BUILD_KEY = "unmix-build"
 
-        rebuild_rows False keeps the Identify rows (and whatever is being
-        dragged in them) and only redraws their histograms and spectra.
+    def recalculate(self, rebuild_rows=True):
+        """Rebuild the matrix from the current files and gates, in the background.
+
+        Controls whose files, gates and settings didn't change are reused, so an
+        edit to one control is quick; the first build of a big experiment takes a
+        while, and the window stays usable meanwhile. rebuild_rows False keeps the
+        Identify rows (and whatever is being dragged in them) and only redraws
+        their histograms and spectra. Returns the job (None when nothing to build).
         """
         self.problems = unmixing.check_specs(self.specs) if self.specs else []
         errors = [m for level, m in self.problems if level == "error"]
-        self.unmixer, self.results = None, []
-        cleaned = {}
-        if self.specs and not errors:
+        self._pending_rows = getattr(self, "_pending_rows", False) or rebuild_rows
+        key = (self.BUILD_KEY, id(self))
+        if not self.specs or errors:
+            for job in jobs().active(key=key):
+                job.cancel()
+            self._apply_build(None, [], {}, errors)
+            return None
+        setup = self.setup
+        specs = copy.deepcopy([s for s in self.specs if s.role != "exclude"])
+        samples = dict(self.samples)
+        options = dict(method=setup.method, n_autofluorescence=setup.n_autofluorescence,
+                       autofluorescence=setup.autofluorescence, af_mode=setup.af_mode,
+                       af_library_size=setup.af_library_size, af_auto=setup.af_auto,
+                       cleanup=copy.deepcopy(setup.cleanup), library=self.library,
+                       variation=copy.deepcopy(setup.variation), imported=setup.imported)
+
+        preview_path = self.preview_sample.currentData() or next(
+            (str(s.path) for s in self.specs if s.role == "sample"), None)
+        preview_af = self._preview_af_source(preview_path) if preview_path else None
+
+        def work(job):
+            cleaned = self.control_cleaning(specs, samples, lambda text: job.progress(None, text))
+            job.progress(None, "Building the unmixing matrix")
             try:
-                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-                try:
-                    cleaned = self.control_cleaning()
-                finally:
-                    QtWidgets.QApplication.restoreOverrideCursor()
-                self.unmixer, self.results = unmixing.build_unmixer(
-                    [s for s in self.specs if s.role != "exclude"], method=self.setup.method,
-                    n_autofluorescence=self.setup.n_autofluorescence,
-                    autofluorescence=self.setup.autofluorescence, samples=self.samples,
-                    af_mode=self.setup.af_mode, af_library_size=self.setup.af_library_size,
-                    af_auto=self.setup.af_auto, keep={p: k for p, (k, _) in cleaned.items()},
-                    cleanup=self.setup.cleanup, library=self.library, variation=self.setup.variation,
-                    imported=self.setup.imported)
+                unmixer, results = unmixing.build_unmixer(
+                    specs, samples=samples, keep={p: k for p, (k, _) in cleaned.items()},
+                    progress=lambda f, text: job.progress(f, text), **options)
+            except JobCancelled:
+                raise
             except Exception as exc:
-                errors.append(f"Couldn't build the unmixing matrix: {exc}")
+                return None, [], cleaned, [f"Couldn't build the unmixing matrix: {exc}"]
+            if preview_path is not None:  # the live preview's unmixing, off the window's thread
+                try:
+                    self._preview_unmixed(preview_path, unmixer, preview_af, samples)
+                except Exception:
+                    pass  # drawn (or reported) when the preview is shown
+            return unmixer, results, cleaned, []
+
+        def done(out):
+            if setup is not self.setup:
+                return
+            unmixer, results, cleaned, build_errors = out
+            live = {s.path: s for s in self.specs}
+            for r in results:  # point results at the rows' own controls, not the job's copies
+                r.spec = live.get(r.spec.path, r.spec)
+            self._apply_build(unmixer, results, cleaned, errors + build_errors)
+
+        self.status.setText("Calculating the unmixing matrix…")
+        self._busy_building = True
+        self._update_buttons()
+        job = run_job(f"Unmixing matrix: {setup.name}", work, on_done=done, key=key, quiet=True)
+        job.finished.connect(self._build_finished)
+        self.building = job
+        return job
+
+    def _build_finished(self):
+        self._busy_building = jobs().busy(key=(self.BUILD_KEY, id(self)))
+        self._update_buttons()
+
+    def _apply_build(self, unmixer, results, cleaned, errors):
+        """Show a finished matrix (or None, with the errors that stopped it)."""
+        self.unmixer, self.results = unmixer, results
+        rebuild_rows, self._pending_rows = self._pending_rows, False
         self._cleaned = cleaned
         ok = self.unmixer is not None
         self._update_buttons()
@@ -782,8 +841,15 @@ class UnmixingTab(QtWidgets.QWidget):
             if self.step == 1:
                 self._build_rows()
         else:
+            edited = getattr(self, "_edited_paths", set())
             for row in self.rows:
-                row.update_result(by_path.get(row.spec.path))
+                new = by_path.get(row.spec.path)
+                if row.spec.path in edited or not _same_result(row.result, new):
+                    row.update_result(new)
+                else:  # nothing to redraw: keep the plots, take the new result
+                    row.result = new
+                    row._update_titles()
+            self._edited_paths = set()
         self._af_check = self._af_check_for = None
         unstained = [s for s in self.specs if s.role == "unstained" and s.carrier == "cells"]
         self.af_view.set_data(unstained, self.samples, self.unmixer)
@@ -975,6 +1041,7 @@ class UnmixingTab(QtWidgets.QWidget):
             QtWidgets.QApplication.restoreOverrideCursor()
 
     def _gate_edited(self, spec):
+        self._edited_paths = getattr(self, "_edited_paths", set()) | {spec.path}
         self.recalculate(rebuild_rows=False)
         self._mark_changed()
 
@@ -1096,26 +1163,50 @@ class UnmixingTab(QtWidgets.QWidget):
             combo.blockSignals(False)
         self._draw_preview()
 
+    def _preview_events(self, path, detectors, samples=None):
+        """A fixed random subset of a sample's detector events for the live preview, or None."""
+        key = (path, tuple(detectors))
+        if key not in self._preview_cache:
+            sample = (samples or self.samples).get(Path(path))
+            if sample is None:
+                return None
+            try:
+                idx = unmixing._detector_index(sample, detectors)
+            except ValueError:
+                return None
+            raw = sample.get_events(source="raw")
+            rows = np.random.default_rng(0).choice(len(raw), min(len(raw), PREVIEW_EVENTS), replace=False)
+            self._preview_cache[key] = raw[np.sort(rows)][:, idx]
+        return self._preview_cache[key]
+
+    def _preview_unmixed(self, path, unmixer, af_source, samples=None):
+        """(abundances, residual RMS per detector) of the preview events; remembered per
+        matrix, so the matrix build job can work them out and redrawing stays quick."""
+        key = (path, id(unmixer), af_source)
+        if self._preview_result.get("key") != key:
+            Y = self._preview_events(path, unmixer.detectors, samples)
+            if Y is None:
+                return None
+            A = unmixer.unmix(Y, af_source)
+            R = unmixer.residuals(Y, A)
+            self._preview_result = {"key": key, "unmixer": unmixer,
+                                    "value": (A, np.sqrt((R ** 2).mean(axis=0)))}
+        return self._preview_result["value"]
+
+    def _preview_af_source(self, path):
+        spec = next((s for s in self.specs if str(s.path) == path), None)
+        return spec.af_source if spec is not None and spec.af_source != "shared" else None
+
     def _draw_preview(self):
         self.preview_plot.clear()
         self.resid_plot.clear()
         path = self.preview_sample.currentData()
         if self.unmixer is None or path is None:
             return
-        sample = self.samples[Path(path)]
-        key = (path, tuple(self.unmixer.detectors))
-        if key not in self._preview_cache:
-            try:
-                idx = unmixing._detector_index(sample, self.unmixer.detectors)
-            except ValueError:
-                return
-            raw = sample.get_events(source="raw")
-            rows = np.random.default_rng(0).choice(len(raw), min(len(raw), PREVIEW_EVENTS), replace=False)
-            self._preview_cache[key] = raw[np.sort(rows)][:, idx]
-        Y = self._preview_cache[key]
-        spec = next((s for s in self.specs if str(s.path) == path), None)
-        af_source = spec.af_source if spec is not None and spec.af_source != "shared" else None
-        A = self.unmixer.unmix(Y, af_source)
+        out = self._preview_unmixed(path, self.unmixer, self._preview_af_source(path))
+        if out is None:
+            return
+        A, rms = out
         xi, yi = self.preview_x.currentIndex(), self.preview_y.currentIndex()
         if xi < 0 or yi < 0:
             return
@@ -1132,8 +1223,6 @@ class UnmixingTab(QtWidgets.QWidget):
         self.preview_plot.addItem(img)
         self.preview_plot.setLabel("bottom", names[xi] if names[xi] == "AF Index" else f"{names[xi]} (asinh)")
         self.preview_plot.setLabel("left", names[yi] if names[yi] == "AF Index" else f"{names[yi]} (asinh)")
-        R = self.unmixer.residuals(Y, A)
-        rms = np.sqrt((R ** 2).mean(axis=0))
         self.resid_plot.addItem(pg.BarGraphItem(x=np.arange(len(rms)), height=rms, width=0.8,
                                                 brush=(242, 109, 91, 170)))
         self.resid_plot.getAxis("bottom").setTicks([_detector_ticks(self.unmixer.detectors), []])
@@ -1141,7 +1230,7 @@ class UnmixingTab(QtWidgets.QWidget):
     # ----- applying --------------------------------------------------------
 
     def _update_buttons(self):
-        ok = self.unmixer is not None
+        ok = self.unmixer is not None and not getattr(self, "_busy_building", False)
         self.unmix_btn.setEnabled(ok and not jobs().busy(key=("unmix", id(self), self.setup.name)))
         self.export_btn.setEnabled(ok and not jobs().busy(key=("export-experiment", id(self))))
         for b, what in ((self.unmix_btn, "unmixing"), (self.export_btn, "exporting")):
@@ -1381,6 +1470,17 @@ class ExportDialog(QtWidgets.QDialog):
 
 AF_COLORS = [(91, 91, 214), (20, 163, 163), (242, 109, 91), (214, 160, 20), (148, 103, 189),
              (44, 160, 44), (227, 119, 194), (140, 86, 75)]
+
+
+def _same_result(a, b):
+    """Whether two builds of a control's result would draw the same row."""
+    if a is None or b is None:
+        return a is b
+    def passed(r):
+        return None if r.check is None else (r.check.passed, r.check.kind)
+    return (a.positive_mask is b.positive_mask and a.used_mask is b.used_mask
+            and np.array_equal(a.signature, b.signature) and passed(a) == passed(b)
+            and a.spec.signature_choice == b.spec.signature_choice)
 
 
 def _detector_ticks(detectors, labels=14):

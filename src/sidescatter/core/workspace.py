@@ -6,9 +6,11 @@ transform registered under its channel name, as FlowJo workspaces do.
 """
 
 import copy
+import hashlib
 import itertools
 import json
 import os
+import re
 import tempfile
 import threading
 import zipfile
@@ -33,6 +35,7 @@ CONVENTIONAL_RANGE = 262144.0
 
 
 QC_GATE = "QC passed"
+CACHE_KEYWORD = "SIDESCATTER_CACHE_KEY"  # in each cached unmixed file: what it was made from
 
 
 class QCGate(Gate):
@@ -55,12 +58,62 @@ class QCGate(Gate):
 
 
 class Strategy(fk.GatingStrategy):
-    """FlowKit's gating strategy, minus copying every event to apply a QC gate."""
+    """FlowKit's gating strategy, minus copying every event for each gate.
+
+    FlowKit copies the whole event table (every channel) before transforming
+    the one or two channels a gate uses; with 64-detector files that copy was
+    most of the gating time. Here only the gate's own columns are copied.
+    """
 
     def _preprocess_sample_events(self, sample, gate, cache_events=False):
         if isinstance(gate, QCGate):
             return pd.DataFrame(index=pd.RangeIndex(sample.event_count))
+        fast = self._gate_columns(sample, gate)
+        if fast is not None:
+            return fast
         return super()._preprocess_sample_events(sample, gate, cache_events)
+
+    def _gate_columns(self, sample, gate):
+        """The gate's dimensions, compensated and transformed, as FlowKit would give them;
+        None for the rare cases left to FlowKit (ratio dimensions, fluorochrome labels)."""
+        pnn, pns = list(sample.pnn_labels), list(sample.pns_labels)
+        flowjo = [label.replace("/", "_") for label in pnn]
+        idx, ids, xforms, comps = [], [], [], set()
+        for dim in gate.dimensions:
+            if isinstance(dim, fk.RatioDimension):
+                return None
+            if dim.compensation_ref not in (None, "uncompensated"):
+                comps.add(dim.compensation_ref)
+            dim_id = dim.dimension_ref if isinstance(dim, fk.QuadrantDivider) else dim.id
+            for labels in (pnn, pns, flowjo):
+                if dim_id in labels:
+                    idx.append(labels.index(dim_id))
+                    break
+            else:
+                return None
+            ids.append(dim_id)
+            xforms.append(dim.transformation_ref)
+        if len(comps) > 1:
+            return None
+        if comps:
+            comp = next(iter(comps))
+            cached = self._cached_preprocessed_events.get(sample.id, {}).get((comp, None, None))
+            events = cached if cached is not None else self._compensate_sample(comps, sample)
+        else:
+            events = sample.get_events(source="raw")
+        cols = np.array(events[:, idx], dtype=np.float64)  # a copy of just these columns
+        cache = self._cached_preprocessed_events.setdefault(sample.id, {})
+        comp = next(iter(comps)) if comps else None
+        for k, ref in enumerate(xforms):
+            if ref is None:
+                continue
+            # Several gates often share a channel: transform each column once (until
+            # the gates or scales change, which clears the cache).
+            key = (comp, ref, idx[k])
+            if key not in cache:
+                cache[key] = self.transformations[ref].apply(cols[:, [k]])
+            cols[:, [k]] = cache[key]
+        return pd.DataFrame(cols, columns=ids)
 
 
 def default_transform(channel, top):
@@ -95,6 +148,7 @@ class Workspace:
         # found: {"id", "source", "compensation", "groups", "qc"}. Kept so saving
         # doesn't lose it, and so Locate files can bring it back.
         self.missing = {}
+        self._cache_files = set()  # (file, key) of unmixed cache files known to be current
         self.upgraded_from = None  # the older format version this was opened from
         self.revision = 0        # bumped whenever gating results may have changed
         self._results = {}       # sample_id -> fk GatingResults
@@ -960,7 +1014,77 @@ class Workspace:
     # ----- save / load -----------------------------------------------------
 
     def save(self, path):
+        writes = self.unmixed_cache(path)
+        write_unmixed_cache(writes)
         write_document(path, self.to_document(), self.analyses)
+
+    # Unmixed samples are kept as FCS files in "<workspace name> files/unmixed/" next to
+    # the workspace, so reopening reads them instead of unmixing every raw file again.
+    # Each remembers what it was made from (the matrix, the raw file's size and date,
+    # the AF source); anything different and the raw file is unmixed again.
+
+    def unmixed_cache(self, path):
+        """The unmixed samples whose cache file next to the workspace at path is missing
+        or out of date, as [(file, sample)] for write_unmixed_cache. Points each unmixed
+        sample's source at its cache file. Quick; call it on the UI thread before saving."""
+        path = Path(path)
+        folder = f"{path.stem} files"
+        writes = []
+        for sid, src in self.sources.items():
+            if "unmixer" not in src or sid not in self.samples:
+                continue
+            key = self._unmix_key(src)
+            if key is None:
+                src.pop("cache", None)
+                continue
+            entry = {"file": f"{folder}/unmixed/{_safe_name(sid)}.fcs", "key": key}
+            target = path.parent / entry["file"]
+            src["cache"] = entry
+            if (str(target), key) in self._cache_files and target.exists():
+                continue  # written (or read) this session, and nothing changed since
+            writes.append((target, self.samples[sid], key, self._cache_files))
+        return writes
+
+    def _unmix_key(self, src):
+        """What an unmixed sample was made from, hashed; None if that can't be told."""
+        unmixer = self.unmixers.get(src.get("unmixer"))
+        raw = src.get("unmixed_from_path") or self.sources.get(src.get("unmixed_from"), {}).get("path")
+        if unmixer is None or raw is None:
+            return None
+        try:
+            st = Path(raw).stat()
+        except OSError:
+            return None
+        text = json.dumps([unmixer.to_dict(), src.get("af_source"), st.st_size, st.st_mtime_ns],
+                          sort_keys=True)
+        return hashlib.blake2b(text.encode(), digest_size=16).hexdigest()
+
+    def _cached_unmixed(self, sample_id, src, search_dirs):
+        """The sample from its cache file, if it is there and still matches; else None."""
+        cache = src.get("cache")
+        if not cache or not search_dirs:
+            return None
+        target = Path(search_dirs[0]) / cache["file"]
+        if not target.exists():
+            return None
+        found = dict(src)
+        if "unmixed_from_path" in src:
+            try:
+                found["unmixed_from_path"] = str(_find_file(src["unmixed_from_path"], search_dirs))
+            except FileNotFoundError:
+                return None
+        elif src.get("unmixed_from") not in self.sources:
+            return None
+        if self._unmix_key(found) != cache["key"]:
+            return None
+        try:
+            sample = fcs.load_sample(target, sample_id=sample_id)
+        except Exception:
+            return None  # a damaged cache file: unmix again
+        if sample.get_metadata().get(CACHE_KEYWORD.lower()) != cache["key"]:
+            return None  # the file holds an older unmix
+        self._cache_files.add((str(target), cache["key"]))
+        return sample
 
     def to_document(self):
         """Everything a workspace file holds, as plain JSON-ready data. Quick, and a
@@ -985,6 +1109,10 @@ class Workspace:
             "transforms": {k: serialize.transform_to_dict(v)
                            for k, v in self.strategy.transformations.items()},
             "gates": [_gate_dict(self.get_gate(n, p), p) for n, p in self.population_paths()],
+            # Per-sample versions of a gate (FlowJo workspaces have them), and the
+            # compensation matrices imported gates refer to by name.
+            "custom_gates": self._custom_gate_dicts(),
+            "comp_matrices": {k: _matrix_dict(m) for k, m in self.strategy.comp_matrices.items()},
             "unmixers": {k: v.to_dict() for k, v in self.unmixers.items()},
             "layouts": [lay.to_dict() for lay in self.layouts],
             "experiments": self.experiments,
@@ -992,6 +1120,16 @@ class Workspace:
             "qc_settings": self.qc_settings.to_dict(),
             "analyses": [a.to_dict() for a in self.analyses],
         })
+
+    def _custom_gate_dicts(self):
+        out = []
+        for name, parent in self.population_paths():
+            node = self.strategy._get_gate_node(name, parent)
+            for sid, gate in node.custom_gates.items():
+                if isinstance(gate, (QCGate, fk.gates.Quadrant)):
+                    continue  # QC masks are rebuilt from ws.qc; quadrants go with their gate
+                out.append({"sample_id": sid, "gate": serialize.gate_to_dict(gate, parent)})
+        return out
 
     @classmethod
     def load(cls, path, search_dirs=(), progress=None):
@@ -1007,6 +1145,9 @@ class Workspace:
         ws.upgraded_from = saved_as if saved_as != doc["version"] else None
         for name, d in doc["transforms"].items():
             ws.strategy.add_transform(name, serialize.transform_from_dict(d))
+        for name, d in doc.get("comp_matrices", {}).items():
+            ws.strategy.add_comp_matrix(name, fk.Matrix(np.asarray(d["matrix"], dtype=float),
+                                                        d["detectors"], d.get("fluorochromes")))
         ws.unmixers = {k: Unmixer.from_dict(v) for k, v in doc["unmixers"].items()}
         dirs = [Path(path).parent, *map(Path, search_dirs)]
         groups = {k: list(v) for k, v in doc["groups"].items()}
@@ -1028,8 +1169,8 @@ class Workspace:
                          f"{'Loading' if 'path' in s['source'] else 'Unmixing'} {name}")
             try:
                 sample = ws._read_sample(s["id"], s["source"], dirs)
-            except (FileNotFoundError, KeyError):
-                lost(s)
+            except (FileNotFoundError, KeyError, fcs.UnreadableFCS):
+                lost(s)  # kept, and Locate files can bring it back
                 continue
             ws.add_sample(sample, ws._resolved(s["source"], dirs))
             ws.compensation[s["id"]] = s["compensation"]
@@ -1054,6 +1195,11 @@ class Workspace:
                 ws.strategy.add_gate(QCGate(g["name"]), ROOT)
             else:
                 ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]))
+        for c in doc.get("custom_gates", []):
+            g = c["gate"]
+            if c["sample_id"] in ws.samples or c["sample_id"] in ws.missing:
+                ws.strategy.add_gate(serialize.gate_from_dict(g), tuple(g["parent_path"]),
+                                     sample_id=c["sample_id"])
         ws.layouts = [Layout.from_dict(d) for d in doc.get("layouts", [])]
         ws.qc_settings = cleaning.Settings.from_dict(doc.get("qc_settings", {}))
         ws.qc = {sid: cleaning.Result.from_dict(r) for sid, r in qc.items() if sid in ws.samples}
@@ -1068,6 +1214,9 @@ class Workspace:
             return fcs.load_sample(_find_file(src["path"], search_dirs), sample_id=sample_id)
         from .unmixing import unmix_sample
 
+        cached = self._cached_unmixed(sample_id, src, search_dirs)
+        if cached is not None:
+            return cached
         if "unmixed_from" in src and raws and src["unmixed_from"] in raws:
             raw = raws[src["unmixed_from"]]
         else:
@@ -1211,6 +1360,11 @@ def _gate_dict(gate, parent_path):
     return serialize.gate_to_dict(gate, parent_path)
 
 
+def _matrix_dict(m):
+    return {"matrix": np.asarray(m.matrix, dtype=float).tolist(), "detectors": list(m.detectors),
+            "fluorochromes": list(m.fluorochromes) if m.fluorochromes is not None else None}
+
+
 def _move_layouts(layouts, old_prefix, new_prefix):
     """Point layout items at their populations' new paths after gates were nested or un-nested.
 
@@ -1315,6 +1469,40 @@ def _unique(name, taken):
         out, n = f"{name} ({n})", n + 1
     taken.add(out)
     return out
+
+
+def _safe_name(name):
+    """A sample id as a file name that works on every system."""
+    out = "".join(c if c.isalnum() or c in " ._-()+" else "_" for c in name).strip(" .")
+    return out[:150] or "sample"
+
+
+def write_unmixed_cache(writes, progress=None):
+    """Write unmixed samples (from Workspace.unmixed_cache) as FCS files. Each is
+    written to a temporary file and swapped in, so a cut-short write is never used.
+    Safe on a worker thread. Computed channels (UMAP...) are left out: they're saved
+    with their analysis."""
+    for i, (target, sample, key, written) in enumerate(writes):
+        if progress:
+            progress(i, len(writes), target.name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        keep = [i for i, n in enumerate(sample.pnn_labels) if fcs._channel_kind(n) != "derived"]
+        events = sample.get_events(source="raw")[:, keep]
+        meta = {k: v for k, v in fcs.keywords(sample).items() if not re.match(r"^p\d+[a-z]+$", k)}
+        meta[CACHE_KEYWORD] = key
+        tmp = target.with_name(f".{target.name}.tmp")
+        try:
+            fcs.write_fcs(tmp, events, [sample.pnn_labels[i] for i in keep],
+                          [sample.pns_labels[i] for i in keep], meta,
+                          [sample.channels.loc[i, "pnr"] for i in keep])
+            os.replace(tmp, target)
+            written.add((str(target), key))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def write_document(path, doc, analyses=()):
