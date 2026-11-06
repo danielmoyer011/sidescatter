@@ -1,0 +1,10 @@
+{
+ "events": 5000000,
+ "seconds": {
+  "Open the file": 7.7,
+  "Unmix": 4.0,
+  "Gate (10 nested gates)": 7.5,
+  "Clean data": 23.4,
+  "Export (cleaned events as FCS)": 0.3
+ }
+}
