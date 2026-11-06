@@ -187,6 +187,9 @@ def test_margins_only_count_pileups():
     mask, counts = cleaning.find_margins(raw, [262144, 262144], ["A", "B"])
     assert mask[:40].all() and mask[100:110].all()
     assert counts == {"A": 40, "B": 10} and mask.sum() == 50
+    # columns can come one by one (views into a big file), with the same result
+    mask2, counts2 = cleaning.find_margins([raw[:, 0], raw[:, 1]], [262144, 262144], ["A", "B"])
+    assert np.array_equal(mask, mask2) and counts2 == counts
 
 
 def test_result_round_trips_and_edits():

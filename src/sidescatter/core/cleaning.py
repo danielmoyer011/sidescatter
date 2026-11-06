@@ -160,14 +160,15 @@ def default_channels(chans):
 def find_margins(raw, ranges, names):
     """Events piled up on the bottom or top edge of any channel.
 
-    raw: (n, k) untransformed values; ranges: $PnR per column.
+    raw: (n, k) untransformed values, or a list of k columns; ranges: $PnR per column.
     Returns (mask, {channel: count}).
     """
-    n = raw.shape[0]
+    cols = list(raw) if isinstance(raw, (list, tuple)) else [raw[:, j] for j in range(raw.shape[1])]
+    n = len(cols[0]) if cols else raw.shape[0] if hasattr(raw, "shape") else 0
     mask = np.zeros(n, dtype=bool)
     counts = {}
     for j, name in enumerate(names):
-        col = raw[:, j]
+        col = np.asarray(cols[j])
         if n == 0:
             break
         lo, hi = np.nanmin(col), np.nanmax(col)
@@ -580,7 +581,8 @@ def clean(values, names, time=None, settings=None, margin_raw=None, margin_range
     order = time_order(time, n)
     margin = np.zeros(n, dtype=bool)
     if settings.margins and margin_raw is not None and n:
-        margin, res.margin_counts = find_margins(np.asarray(margin_raw), margin_ranges, margin_names)
+        margin, res.margin_counts = find_margins(margin_raw if isinstance(margin_raw, (list, tuple)) else np.asarray(margin_raw),
+                                                   margin_ranges, margin_names)
         if margin.mean() > 0.1:
             res.warnings.append(f"{100 * margin.mean():.1f}% of events are margin events. Check the "
                                 "detector voltages or the channel ranges.")
@@ -588,7 +590,7 @@ def clean(values, names, time=None, settings=None, margin_raw=None, margin_range
     res.removed_by["Margins"] = 100.0 * margin.sum() / max(n, 1)
 
     keep_pos = np.flatnonzero(~margin[order])     # positions (time order) of non-margin events
-    ordered = values[order][keep_pos]
+    ordered = values[order[keep_pos]]  # one copy, not two
     m = len(ordered)
     epb = int(settings.events_per_bin) or events_per_bin(m)
     breaks = make_breaks(m, epb) if m else np.zeros((0, 2), int)

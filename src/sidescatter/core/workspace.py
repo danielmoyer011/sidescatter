@@ -689,11 +689,13 @@ class Workspace:
         if raw is not None:
             if raw.event_count == sample.event_count:
                 chans = [c for c in fcs.channels(raw) if c.kind in ("scatter", "fluorescence")]
-                return (raw.get_events(source="raw")[:, [c.index for c in chans]],
+                ev = raw.get_events(source="raw")
+                return ([ev[:, c.index] for c in chans],  # column views: no copy of the file
                         [float(raw.channels.loc[c.index, "pnr"] or 0) for c in chans],
                         [c.pnn for c in chans])
         idx = [sample.get_channel_index(n) for n in names]
-        return (sample.get_events(source="raw")[:, idx],
+        ev = sample.get_events(source="raw")
+        return ([ev[:, i] for i in idx],
                 [float(sample.channels.loc[i, "pnr"] or 0) for i in idx], list(names))
 
     def clean(self, sample_ids, settings=None, progress=None, raw=None):
