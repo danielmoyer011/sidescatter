@@ -26,6 +26,9 @@ def _num(x):
 
 
 def transform_to_dict(t):
+    if type(t) is fk.transforms.RatioTransform:  # GatingML ratio of two channels
+        return {"type": "ratio", "dimensions": list(t.dimensions),
+                **{p: _num(getattr(t, p)) for p in ("param_a", "param_b", "param_c")}}
     for kind, (cls, params) in _TRANSFORMS.items():
         if type(t) is cls:
             return {"type": kind, **{p: _num(getattr(t, p)) for p in params}}
@@ -33,17 +36,26 @@ def transform_to_dict(t):
 
 
 def transform_from_dict(d):
+    if d["type"] == "ratio":
+        return fk.transforms.RatioTransform(list(d["dimensions"]), d["param_a"], d["param_b"], d["param_c"])
     cls, params = _TRANSFORMS[d["type"]]
     return cls(*[d[p] for p in params])
 
 
 def _dim_to_dict(dim):
+    if isinstance(dim, fk.RatioDimension):
+        return {"ratio_ref": dim.ratio_ref, "compensation_ref": dim.compensation_ref,
+                "transformation_ref": dim.transformation_ref, "min": _num(dim.min), "max": _num(dim.max)}
     return {"id": dim.id, "compensation_ref": dim.compensation_ref,
             "transformation_ref": dim.transformation_ref,
             "min": _num(dim.min), "max": _num(dim.max)}
 
 
 def _dim_from_dict(d):
+    if "ratio_ref" in d:
+        return fk.RatioDimension(d["ratio_ref"], compensation_ref=d["compensation_ref"] or "uncompensated",
+                                 transformation_ref=d["transformation_ref"],
+                                 range_min=d["min"], range_max=d["max"])
     return fk.Dimension(d["id"], compensation_ref=d["compensation_ref"] or "uncompensated",
                         transformation_ref=d["transformation_ref"],
                         range_min=d["min"], range_max=d["max"])
